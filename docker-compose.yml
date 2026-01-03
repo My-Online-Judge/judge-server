@@ -1,0 +1,15 @@
+services:
+  judge-server:
+    image: registry.cn-hangzhou.aliyuncs.com/onlinejudge/judge_server
+    container_name: judge-server
+    restart: always
+    privileged: true
+    environment:
+      - TOKEN=123456
+      - SERVICE_URL=http://localhost:8000
+      - BACKEND_URL=http://localhost:8000/api/judge_server_heartbeat/
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../judge-api/src/main/resources/test_cases:/test_case:ro
+      - ../judge-api/log:/log
