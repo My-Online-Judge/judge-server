@@ -1,6 +1,6 @@
 services:
   judge-server:
-    image: registry.cn-hangzhou.aliyuncs.com/onlinejudge/judge_server
+    image: qduoj/judge-server
     container_name: judge-server
     restart: always
     privileged: true
