@@ -160,6 +160,31 @@ docker compose down          # nếu container non-privileged kẹt -> xem Lưu 
 
 ---
 
+## 12. UI verdict (SSE) — judge-portal
+
+Frontend (`judge-portal`, nhánh `feature/sse-verdict-ui`) giờ tự cập nhật bảng Submissions theo thời gian thực qua SSE: `ProblemSubmit` emit submission vừa tạo → `ProblemDetailPage` chuyển tab và chèn dòng "Judging" lạc quan vào `ProblemSubmissions` (qua `addPendingSubmission`, `defineExpose`) → component mở stream (`useSubmissionStream().watch`) và cập nhật dòng tại chỗ khi verdict về, không cần reload.
+
+> **Chưa được chạy live trong phiên phát triển này** — môi trường đó không có backend/DB/Kafka/đăng nhập chạy sẵn. Mục này ghi lại quy trình + tiêu chí để người vận hành chạy tay sau khi đã dựng đủ stack theo mục 2–6. Đã verify tự động bằng `npm run type-check` (0 lỗi) và `npm run test` (Vitest, 9 test pass — xem mục "Đã tự động verify sẵn" bên dưới); phần tương tác trình duyệt dưới đây vẫn cần chạy tay.
+
+Chuẩn bị: dựng đủ stack theo mục 2–6 (kafka + judge-server + judge-worker + judge-api + Postgres + JWT hợp lệ), sau đó chạy judge-portal (`npm run dev`) với `VITE_API_BASE_URL` trỏ về judge-api (`http://localhost:8000/api/v1`).
+
+Quy trình:
+1. Đăng nhập vào judge-portal, mở một problem, vào tab **Submit**, nộp một bài AC.
+2. Xác nhận app tự chuyển sang tab **Submissions** và một dòng mới xuất hiện **ngay lập tức** với spinner + badge *Pending*/*Judging*.
+3. Trong vài giây, badge tự chuyển sang verdict cuối (AC/WA/…) kèm time/memory — **không cần reload thủ công**.
+4. Nộp lại lần nữa và theo dõi dòng mới ngay lập tức: xác nhận trường hợp chấm nhanh (verdict về trước khi stream kịp mở) vẫn ra kết quả đúng, nhờ backend replay verdict terminal tại thời điểm subscribe (mục 9).
+5. Mở DevTools → Network: request `/stream` phải **đóng lại ngay sau khi có verdict** (không có vòng lặp reconnect).
+
+✅ Tiêu chí thành công:
+- Dòng submission mới hiện ra ngay lập tức (optimistic, trước khi có verdict), có spinner khi trạng thái là PENDING/JUDGING.
+- Badge tự chuyển sang verdict cuối cùng mà không cần reload trang.
+- Request `/stream` đóng lại sau khi nhận verdict, không tự reconnect.
+- Trường hợp verdict về nhanh hơn thời điểm mở stream (race điều kiện) vẫn được xử lý đúng nhờ replay từ backend.
+
+Ghi lại kết quả (pass/fail + ghi chú) khi người vận hành thực hiện.
+
+---
+
 ## Checklist tiêu chí thành công
 
 - [ ] (7) `POST /submissions` trả PENDING ngay, không block.
@@ -167,9 +192,11 @@ docker compose down          # nếu container non-privileged kẹt -> xem Lưu 
 - [ ] (9) Verdict đẩy qua SSE.
 - [ ] (10) Replay `submission.judged` không ghi đè verdict đã finished (idempotency).
 - [ ] (2) Toàn stack `docker compose up` chạy được (kafka + judge-server + judge-worker) + judge-api + postgres.
+- [ ] (12) UI verdict SSE: dòng submission live-update đúng theo tiêu chí ở mục 12 (manual — chưa chạy trong phiên tự động).
 
 ## Đã tự động verify sẵn (không cần làm lại)
 
 - judge-worker: 18 unit test (verdict parity, dispatcher, handler, commit-after-publish ordering) — pass.
 - judge-api: unit test submit-publishes-PENDING, consumer idempotency (PENDING guard), SSE registry — pass. (`BackendServiceApplicationTests.contextLoads` cần Postgres — bỏ qua khi chạy offline.)
+- judge-portal: `npm run type-check` (vue-tsc --build, 0 lỗi) và `npm run test` (Vitest — `isTerminalStatus` + `useSubmissionStream`, 9 test pass). Verify live theo mục 12 vẫn cần chạy tay (browser + full stack).
 - Runtime: apache/kafka:3.9.0 Up healthy; judge-worker kết nối `kafka:29092`, join consumer group, không crash-loop.
