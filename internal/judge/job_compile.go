@@ -17,10 +17,11 @@ import (
 // compileStep is one compile: the submission's, or the checker's.
 type compileStep struct {
 	cfg     CompileConfig
-	uid     uint32 // the identity it runs as; gid is the same
-	dir     string // working directory, where the artifact is written
+	uid     uint32   // the identity it runs as; its gid is the job's slot gid
+	groups  []uint32 // its supplementary groups
+	dir     string   // working directory, where the artifact is written
 	vars    Vars
-	logPath string // stdout and stderr go here, in one file
+	logPath string // stdout and stderr go here, in one file; deleted once the compile is judged
 }
 
 func (j *job) userCompile() compileStep {
@@ -39,7 +40,10 @@ func (j *job) userCompile() compileStep {
 // It reserves CompileReservation from the shared budget (the whole budget when
 // the language sets no compile memory, which also leaves RLIMIT_AS off). A compile
 // whose env sets GOCACHE holds the shared Go cache for its duration and, once
-// that hold is released, trims the cache in the background.
+// that hold is released, trims the cache in the background. When the compile has
+// ended the slot's uid is swept, and the compile's output file is deleted as soon
+// as its message has been read (or at once when the compile passed), so it does not
+// stay on the work directory while the cases run.
 func (j *job) compile(ctx context.Context, c compileStep) (string, error) {
 	argv, err := Split(Expand(c.cfg.Command, c.vars))
 	if err != nil {
@@ -70,12 +74,14 @@ func (j *job) compile(ctx context.Context, c compileStep) (string, error) {
 		addressSpace = reserve
 	}
 
+	defer removeFile(c.logPath)
 	res, err := j.e.d.Runner(ctx, sandbox.Spec{
 		Argv:            argv,
 		Env:             j.env(c.cfg.Env, true),
 		Dir:             c.dir,
 		UID:             c.uid,
-		GID:             c.uid,
+		GID:             j.gid,
+		Groups:          c.groups,
 		Stdout:          c.logPath,
 		Stderr:          c.logPath,
 		MaxCPUTimeMs:    c.cfg.MaxCPUTimeMs,
@@ -86,6 +92,7 @@ func (j *job) compile(ctx context.Context, c compileStep) (string, error) {
 		MaxProcs:        maxProcs,
 		Seccomp:         sandbox.SeccompNone, // compilers fork and exec
 	})
+	j.sweep("compile")
 	if err != nil {
 		return "", runnerFailure(ctx, "compile", err)
 	}
@@ -125,6 +132,14 @@ func (j *job) compileMessage(logPath string, res sandbox.Result) (string, error)
 	// "?" replaces each run of invalid bytes (a rune cut at the cap, or bytes the
 	// compiler printed that are not UTF-8) and is never longer than what it replaces.
 	return strings.ToValidUTF8(string(msg), "?"), nil
+}
+
+// removeFile deletes path; a file that is already gone is not a problem, and
+// nothing else is either (the job directory removal takes what is left).
+func removeFile(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Debug("job: remove file", "path", path, "err", err)
+	}
 }
 
 // readHead returns the first limit bytes of the file at path; a file that does

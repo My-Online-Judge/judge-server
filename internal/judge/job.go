@@ -27,15 +27,28 @@ var (
 	ErrBundle = errors.New("test case bundle unusable")
 )
 
-// Identities the programs run as (uid == gid). They exist in the image.
+// The identities a job's programs run as (spec 5.1a). They exist in the image.
+//
+// The uid says what a program is, the gid which job it belongs to:
+//   - the submission runs as (SlotUIDBase+slot, SlotUIDBase+slot), the slot's own user
+//     code<slot>, so no other running job shares its uid or its group;
+//   - a compile runs as (uidCompiler, the slot's gid) and the checker, compiled and run,
+//     as (uidSPJ, the slot's gid) with the supplementary group uidSPJ (the bundles
+//     the worker installs belong to the group spj, and so does the checker cache dir).
 const (
-	uidCompiler uint32 = 12001 // compiles; owns the source dir
-	uidRun      uint32 = 12002 // runs the submission
-	uidSPJ      uint32 = 12003 // compiles and runs the checker
+	uidCompiler uint32 = 12001 // the image's user "compiler"
+	uidSPJ      uint32 = 12003 // the image's user "spj"; its group is also the bundles' and the checker cache's
+
+	// SlotUIDBase is the uid and gid of job slot 0; slot n is SlotUIDBase+n, up to
+	// MaxSlots slots. The image creates these users as code0..code7.
+	SlotUIDBase uint32 = 12100
+
+	// MaxSlots is the number of job slots, which is also MAX_JOBS' upper limit.
+	MaxSlots = config.MaxJobsLimit
 )
 
 const (
-	maxProcs  = 256       // RLIMIT_NPROC of every compile, run and checker (spec 5.3)
+	maxProcs  = 256       // RLIMIT_NPROC of every compile, run and checker (spec 5.3); per uid, so per slot for the runs
 	maxStack  = 128 << 20 // RLIMIT_STACK of every compile, run and checker
 	spjMemory = 1 << 30   // the checker's RLIMIT_AS, and what it reserves from the budget
 
@@ -91,8 +104,11 @@ type Checker struct {
 }
 
 // Request is one judge call: a submission, its limits and the cases to run.
-// Checker is nil when the problem compares output by md5.
+// Checker is nil when the problem compares output by md5. Slot is the job slot
+// the caller took for it, in [0, MaxSlots): the job runs under that slot's uid
+// and gid, so two jobs running at the same time must have different slots.
 type Request struct {
+	Slot         int
 	Src          string
 	Lang         LanguageConfig
 	MaxCPUTimeMs int64
@@ -123,12 +139,19 @@ type Outcome struct {
 }
 
 // Deps is what an Engine needs. A zero Runner runs sandbox.Run through
-// RunnerPath (default sandbox.DefaultRunnerPath), a zero Now is time.Now and a
-// nil Budget is a new one of Cfg.RunPoolBudget, which is only right when this
-// Engine is the one judging: the budget must be shared by every job. GoCache may
-// be nil (no shared Go build cache).
+// RunnerPath (default sandbox.DefaultRunnerPath), a zero Sweep is
+// sandbox.KillUID, a zero Now is time.Now and a nil Budget is a new one of
+// Cfg.RunPoolBudget, which is only right when this Engine is the one judging: the
+// budget must be shared by every job. GoCache may be nil (no shared Go build
+// cache). Cfg.TmpDir is where each job's run TMPDIR is made.
+//
+// Sweep kills the processes of a uid that no live run owns (see sandbox.KillUID)
+// and says how many it killed. The engine calls it with the slot's uid after
+// every run, compile and checker and when a job ends. A test that must not touch
+// the real processes of the machine passes its own.
 type Deps struct {
 	Runner     func(context.Context, sandbox.Spec) (sandbox.Result, error)
+	Sweep      func(uid uint32) (killed int, err error)
 	RunnerPath string
 	WorkDir    string
 	Budget     Budget
@@ -161,6 +184,9 @@ func NewEngine(d Deps) *Engine {
 			return sandbox.Run(ctx, path, s)
 		}
 	}
+	if d.Sweep == nil {
+		d.Sweep = sandbox.KillUID
+	}
 	if d.Budget == nil {
 		d.Budget = NewBudget(d.Cfg.RunPoolBudget)
 	}
@@ -170,7 +196,10 @@ func NewEngine(d Deps) *Engine {
 // Judge runs r in a private job directory (removed before it returns, however it
 // ends): it writes the source, compiles it, compiles the checker unless its
 // version is cached, then runs every case. jobID names the directory and must be
-// unique among running jobs.
+// unique among running jobs; r.Slot names the identity the job runs as and must
+// be unique among running jobs too. Whatever the job leaves running under its
+// slot's uid is killed after every run and when the job ends, before the
+// directories go.
 //
 // The error is ErrInvalidRequest (wrapping the reason), ErrBundle, ctx.Err() when
 // ctx ended the job, or an internal failure; never a judge outcome.
@@ -190,7 +219,7 @@ func (e *Engine) Judge(ctx context.Context, jobID string, r Request) (out Outcom
 	if err != nil {
 		return Outcome{}, err
 	}
-	defer j.remove()
+	defer j.finish()
 	defer func() {
 		slog.Info("job finished", "job", jobID, "bundle", j.bundleName(), "cases", len(r.Bundle.Cases),
 			"pool", j.pool, "compile_error", out.CompileError != "", "spj_compile_error", out.SPJCompileError != "",
@@ -212,6 +241,9 @@ func (e *Engine) Judge(ctx context.Context, jobID string, r Request) (out Outcom
 			return Outcome{SPJCompileError: msg}, err
 		}
 	}
+	if err := j.closeForRuns(); err != nil {
+		return Outcome{}, err
+	}
 	cases, err := j.runCases(ctx)
 	if err != nil {
 		return Outcome{}, err
@@ -228,6 +260,9 @@ func invalidf(format string, args ...any) error {
 func validate(jobID string, r *Request) error {
 	if !safeName(jobID) {
 		return invalidf("job id %q is not one path element of [A-Za-z0-9._-]", jobID)
+	}
+	if r.Slot < 0 || r.Slot >= MaxSlots {
+		return invalidf("job slot %d is outside [0, %d)", r.Slot, MaxSlots)
 	}
 	if r.Bundle == nil || len(r.Bundle.Cases) == 0 {
 		return invalidf("no test cases")
@@ -343,6 +378,23 @@ func (j *job) bundleName() string {
 		return "inline"
 	}
 	return filepath.Base(j.req.Bundle.Dir)
+}
+
+// slotID is the uid and the gid of the slot's user (code<slot>).
+func (j *job) slotID() uint32 { return SlotUIDBase + uint32(j.req.Slot) }
+
+// sweep kills what the job left running under its slot's uid (a process that
+// moved out of its run's session, which the run's own group kill cannot reach)
+// and logs it when it killed any. what says after which step it ran.
+func (j *job) sweep(what string) {
+	uid := j.slotID()
+	killed, err := j.e.d.Sweep(uid)
+	if killed > 0 {
+		slog.Warn("job: killed stray processes of the slot's uid", "job", j.id, "slot", j.req.Slot, "uid", uid, "after", what, "killed", killed)
+	}
+	if err != nil {
+		slog.Warn("job: sweep of the slot's uid", "job", j.id, "slot", j.req.Slot, "uid", uid, "after", what, "err", err)
+	}
 }
 
 // vars are the command placeholders every step of this job shares.

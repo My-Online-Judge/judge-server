@@ -21,6 +21,14 @@ func TestValidateAcceptsDefaults(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsAllEightJobs(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.MaxJobs = MaxJobsLimit // the image has run users code0..code7: eight is the most
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate(MaxJobs=%d) = %v", MaxJobsLimit, err)
+	}
+}
+
 func TestValidateAcceptsZeroQueue(t *testing.T) {
 	cfg := validConfig(t)
 	cfg.MaxQueue = 0 // no waiting room: a busy server answers RESOURCE_EXHAUSTED at once
@@ -37,6 +45,7 @@ func TestValidateRejects(t *testing.T) {
 	}{
 		{"zero jobs", func(c *Config) { c.MaxJobs = 0 }, "MAX_JOBS"},
 		{"negative jobs", func(c *Config) { c.MaxJobs = -1 }, "MAX_JOBS"},
+		{"nine jobs", func(c *Config) { c.MaxJobs = MaxJobsLimit + 1 }, "MAX_JOBS"},
 		{"negative queue", func(c *Config) { c.MaxQueue = -1 }, "MAX_QUEUE"},
 		{"zero run pool", func(c *Config) { c.RunPoolBudget = 0 }, "RUN_POOL_BUDGET_BYTES"},
 		{"negative run pool", func(c *Config) { c.RunPoolBudget = -5 }, "RUN_POOL_BUDGET_BYTES"},
@@ -49,6 +58,10 @@ func TestValidateRejects(t *testing.T) {
 		{"relative work dir", func(c *Config) { c.WorkDir = "work" }, "WORK_DIR"},
 		{"empty work dir", func(c *Config) { c.WorkDir = "" }, "WORK_DIR"},
 		{"work dir with a space", func(c *Config) { c.WorkDir = "/my work" }, "WORK_DIR"},
+		{"relative tmp dir", func(c *Config) { c.TmpDir = "tmp" }, "TMP_DIR"},
+		{"empty tmp dir", func(c *Config) { c.TmpDir = "" }, "TMP_DIR"},
+		{"tmp dir with a space", func(c *Config) { c.TmpDir = "/my tmp" }, "TMP_DIR"},
+		{"tmp dir is the work dir", func(c *Config) { c.TmpDir = c.WorkDir + "/" }, "TMP_DIR"},
 		{"relative test case dir", func(c *Config) { c.TestCaseDir = "test_case" }, "TEST_CASE_DIR"},
 		{"test case dir with a tab", func(c *Config) { c.TestCaseDir = "/test\tcase" }, "TEST_CASE_DIR"},
 		{"no allowed clients", func(c *Config) { c.AllowedClients = []string{} }, "JUDGE_ALLOWED_CLIENTS"},

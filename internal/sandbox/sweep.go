@@ -59,9 +59,10 @@ func endLive(pid int) {
 // left, zombies included, or until about a second has passed (then the error
 // says how many are still there). It returns how many distinct processes it
 // signalled (a zombie is not counted: there is nothing left to kill). It
-// refuses uid 0. The job pipeline is to call it with a job slot's run uid after
-// every run and when the job ends (spec 5.1a): a process that moved to a session
-// of its own (setsid) escaped the run's group kill, and this is what ends it.
+// refuses uid 0. The judge engine calls it with a job slot's run uid after every
+// compile, run and checker run, and when the job ends or is cancelled (spec 5.1a): a
+// process that moved to a session of its own (setsid) escaped the run's group kill,
+// and this is what ends it.
 //
 // A process is signalled through a descriptor of its /proc directory
 // (pidfd_send_signal), opened before its status is read, so a pid that is

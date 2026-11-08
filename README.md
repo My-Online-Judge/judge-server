@@ -13,6 +13,37 @@ HTTP service around QingdaoU's Judger). Callers are the Python `judge-worker` an
 One static binary, `judge-server`, runs as root in the container and starts every program through a small static C shim,
 `judge-runner` (`internal/sandbox/runner.c`): resource limits, uid switch, `oom_score_adj`, seccomp.
 
+## Isolation between jobs
+
+Up to `MAX_JOBS` jobs (at most 8) run on one sandbox, and a job must not be able to read, signal or fill what another one
+has (spec 5.1a). Each running job therefore holds a **slot** (`api.Admission` hands out a free number in `[0, MAX_JOBS)`), and
+the slot picks its identities:
+
+| Role | uid : gid | Notes |
+|---|---|---|
+| the submission | `12100+slot` : `12100+slot` | the image's users `code0`..`code7`; no supplementary group |
+| the compiler | `12001` : `12100+slot` | uid `compiler` |
+| the checker (compile and run) | `12003` : `12100+slot`, group `12003` | uid `spj`; group `spj` is the bundle's (the worker installs bundles as group 12003) |
+
+(The user `code`, 12002, is not used by the engine any more; the `internal/sandbox` tests still run programs as it.)
+
+What a job owns is closed to every other slot, with the slot's gid as the key (`internal/judge/jobdir.go` has the table):
+
+- `<WORK_DIR>/jobs/<id>/` is `root:<slotgid> 0710`; `src/` is `0770` while the compiles run and `0750` from the first run on,
+  `in/` and `out/` are `2750` (setgid, so the files the shim creates are in the slot group, mode `0640`), the compiler's
+  `TMPDIR`/`HOME` is `<job>/tmp` (`0770`, deleted before the first run), `compile.out` is deleted as soon as it is read, and
+  the source is `root:<slotgid> 0640`.
+- A run's and the checker's `TMPDIR` (and the checker's working directory) is `<TMP_DIR>/jobs/<id>` (`root:<slotgid> 0770`),
+  on the separate small tmpfs mounted at `TMP_DIR` (default `/tmp`, 64 MiB in the compose file), so a run that fills its
+  temporary files never fills `WORK_DIR`. At start-up the server wipes `<TMP_DIR>/jobs` and `<WORK_DIR>/jobs`, and sets
+  `WORK_DIR` to `0755` and `TMP_DIR` to `0711` (an emptyDir starts as `0777`).
+- After every compile, run and checker run, and when a job ends or is cancelled (before its directories are removed), the
+  server kills every process whose uid is the slot's (`sandbox.KillUID`, a `/proc` sweep): a child that left its run's
+  session with `setsid` dies with the job, and `RLIMIT_NPROC` is per slot. The sweep spares the sessions of runs still in
+  progress and needs an init in the container (`init: true`, `docker run --init`) to reap what it kills.
+- Residual, accepted (spec 5.1a): the uids 12001 and 12003 are shared by both sandbox containers and both slots; the slot
+  uids are the same numbers in both sandbox containers.
+
 ```
 judge-server [serve|healthcheck|mock]      serve (default); healthcheck pings itself over mTLS (the compose probe);
                                            mock is the scripted API of the development stack (internal/mock)
@@ -30,8 +61,9 @@ the three TLS files, or with an empty client list; it never listens in plaintext
 | `TOKEN` | empty | optional shared secret; when set, every call must carry `x-judge-server-token: <sha256 hex of TOKEN>` as well |
 | `JUDGE_ALLOWED_CLIENTS` | `judge-worker,run-worker` | client certificate CNs admitted to `Judge` (`Ping` admits any CA-signed client, for the healthcheck) |
 | `TEST_CASE_DIR` | `/test_case` | where `<slug>__<hash>` bundles are read from |
-| `WORK_DIR` | `/work` | job directories, the checker cache, the Go build cache; a tmpfs mounted `exec` |
-| `MAX_JOBS` | `2` | jobs judged at once |
+| `WORK_DIR` | `/work` | job directories, the checker cache, the Go build cache; a tmpfs mounted `exec`; absolute, no whitespace |
+| `TMP_DIR` | `/tmp` | the tmpfs of the programs' `TMPDIR` (`<TMP_DIR>/jobs/<id>`), apart from `WORK_DIR`; absolute, no whitespace, not `WORK_DIR`; the server sets it to `0711` |
+| `MAX_JOBS` | `2` | jobs judged at once, 1 to 8 (one run identity, `code0`..`code7`, per job) |
 | `MAX_QUEUE` | `4` | jobs waiting for a slot before `RESOURCE_EXHAUSTED` |
 | `RUN_POOL_BUDGET_BYTES` | `1073741824` (1 GiB) | memory handed to running programs, shared by all jobs; sizes each job's case pool |
 | `COMPILE_MAX_MEMORY_BYTES` | `536870912` (512 MiB) | ceiling over a request's compile memory limit |
@@ -67,7 +99,8 @@ tests too) with `-test.v`. With `JUDGE_REQUIRE_SANDBOX=1` a missing compiler, sh
 only (it builds a smaller image and can pick the base with `BASE=`); it is kept.
 
 The tests of the engine (`internal/judge/engine_sandbox_test.go`) build the real `Engine` as `api.Serve` does (the same
-`api.PrepareWorkDir`, a Go build cache warmed once, a 1 GiB budget, the default config) and judge the corpus below.
+`api.PrepareWorkDir` and `api.PrepareTmpDir`, a Go build cache warmed once, a 1 GiB budget, the default config) and judge the
+corpus below.
 
 ## The corpus
 
@@ -91,6 +124,17 @@ entry with a `note` and no `file` says why a verdict has no program.
 The tests also cover: output flood (truncation and `du /work` under 10 MiB afterwards), a bundle whose input file is gone,
 cancellation (the call returns in under a second, no process of the three users and no job directory is left).
 
+`testdata/corpus/isolation/` holds the programs of the regression tests of the per-slot isolation (`engine_sandbox_test.go`,
+judged through the real engine in the slots the test names; not listed in `corpus.json`):
+
+- `cleanup_detached.go|.php|.js` leave a `setsid` `sleep` behind; after the job, and after a cancelled job, no process of the
+  slot's uid is left (a control run with the sweep off shows the sleeper does outlive the job);
+- `perms_other_slot.c` (c_cpp) and `.go` (no filter) open paths of another slot's job directory tree, which the test made and
+  hands over as the input: EACCES or ENOENT, never the marker's content; the own slot's marker is readable;
+- `signal_other_slot.go`: `kill(-1, SIGKILL)` in slot 0 while a victim job runs in slot 1 (the victim is AC; the control, both
+  in one slot, is killed);
+- `tmp_fill.go` (ENOSPC inside `/tmp`, `/work` unchanged, a neighbour job unaffected).
+
 The language rows the tests judge with are copied from submission-service (`V2`, `V3`, `V9`, with `JudgeService`'s
 environments), as the table `languageRows`; the file says where it deviates: Python 3 uses the part-2 `V10` command, and
 Java's run command loses the security manager flags except in `TestEngineJavaWithPolicy`. The `javascript` row is
@@ -109,7 +153,8 @@ MIT); `internal/sandbox/seccomp_rules.md` has their provenance, every addition a
 plain `docker build .` can never produce the test image. Base `ubuntu:22.04` (glibc 2.35; it still packages Python 2.7).
 Toolchains, at the paths the language rows name: `gcc`/`g++` 11.4, `openjdk-17-jdk-headless` (17.0), `python2` 2.7.18 (with
 `/usr/bin/python`), `python3` 3.10, `golang-go` 1.18, `nodejs` 12.22, `php8.1-cli` 8.1. Users `compiler` 12001, `code` 12002,
-`spj` 12003 (no login, no home). No `HEALTHCHECK`: the compose file declares `judge-server healthcheck`.
+`spj` 12003 and the per-slot run users `code0`..`code7` (uids and gids 12100-12107); none has a login or a home. No
+`HEALTHCHECK`: the compose file declares `judge-server healthcheck`.
 
 Size of `judge-server:runtime` built on this machine (arm64): **1.71 GB** on disk, 435 MB compressed (Docker's content
 size); the largest parts are `golang-go` (315 MB), the JDK (258 MB) and the GCC toolchain (about 90 MB, plus `libstdc++`

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -14,6 +15,7 @@ const settleBound = 2 * time.Second
 
 // acquireResult is what one Acquire call returned.
 type acquireResult struct {
+	slot    int
 	release func()
 	err     error
 }
@@ -22,8 +24,8 @@ type acquireResult struct {
 func acquireAsync(a *Admission, ctx context.Context) <-chan acquireResult {
 	out := make(chan acquireResult, 1)
 	go func() {
-		release, err := a.Acquire(ctx)
-		out <- acquireResult{release: release, err: err}
+		slot, release, err := a.Acquire(ctx)
+		out <- acquireResult{slot: slot, release: release, err: err}
 	}()
 	return out
 }
@@ -43,11 +45,17 @@ func await(t *testing.T, ch <-chan acquireResult, what string) acquireResult {
 // mustAcquire acquires a slot that must be free, or fails the test.
 func mustAcquire(t *testing.T, a *Admission) func() {
 	t.Helper()
+	return mustAcquireSlot(t, a).release
+}
+
+// mustAcquireSlot is mustAcquire that also keeps the slot number.
+func mustAcquireSlot(t *testing.T, a *Admission) acquireResult {
+	t.Helper()
 	r := await(t, acquireAsync(a, context.Background()), "free slot")
 	if r.err != nil {
 		t.Fatalf("Acquire = %v, want a free slot", r.err)
 	}
-	return r.release
+	return r
 }
 
 // waitForWaiting blocks until the queue holds n waiters.
@@ -286,7 +294,7 @@ func TestAdmissionAbandonedHandOffGoesToNextWaiter(t *testing.T) {
 	releaseHolder := mustAcquire(t, a)
 
 	// Stand-in for a waiter whose Acquire already lost the race to its ctx.
-	abandoned := make(chan struct{}, 1)
+	abandoned := make(chan int, 1)
 	a.mu.Lock()
 	a.waiters = append(a.waiters, abandoned)
 	a.mu.Unlock()
@@ -294,16 +302,17 @@ func TestAdmissionAbandonedHandOffGoesToNextWaiter(t *testing.T) {
 	waitForWaiting(t, a, 2)
 
 	releaseHolder()
-	select {
-	case <-abandoned:
-	default:
+	if len(abandoned) != 1 {
 		t.Fatal("release did not hand the slot to the head waiter")
 	}
-	a.abandon(abandoned)
+	a.abandon(abandoned) // takes the slot out of the channel and passes it on
 
 	r := await(t, next, "next waiter")
 	if r.err != nil {
 		t.Fatalf("next waiter Acquire = %v, want the abandoned slot", r.err)
+	}
+	if r.slot != 0 {
+		t.Errorf("next waiter got slot %d, want the abandoned slot 0", r.slot)
 	}
 	expectCounts(t, a, 1, 0)
 	r.release()
@@ -314,7 +323,7 @@ func TestAdmissionAbandonedHandOffWithoutWaitersFreesSlot(t *testing.T) {
 	a := NewAdmission(1, 1)
 	releaseHolder := mustAcquire(t, a)
 
-	abandoned := make(chan struct{}, 1)
+	abandoned := make(chan int, 1)
 	a.mu.Lock()
 	a.waiters = append(a.waiters, abandoned)
 	a.mu.Unlock()
@@ -323,6 +332,72 @@ func TestAdmissionAbandonedHandOffWithoutWaitersFreesSlot(t *testing.T) {
 	a.abandon(abandoned)
 	expectCounts(t, a, 0, 0)
 	mustAcquire(t, a)
+}
+
+// Every running job has a slot of its own in [0, Max()): the lowest free one,
+// a slot that is released comes back, and a hand-over to a waiter keeps the number
+// the releasing job had (nobody else can hold it while it is handed over).
+func TestAdmissionSlotsAreUniqueAndReused(t *testing.T) {
+	a := NewAdmission(3, 2)
+	r0, r1, r2 := mustAcquireSlot(t, a), mustAcquireSlot(t, a), mustAcquireSlot(t, a)
+	if r0.slot != 0 || r1.slot != 1 || r2.slot != 2 {
+		t.Fatalf("slots = %d %d %d, want 0 1 2", r0.slot, r1.slot, r2.slot)
+	}
+
+	// Give the middle one back: the next job gets exactly that slot, not a fourth.
+	r1.release()
+	if again := mustAcquireSlot(t, a); again.slot != 1 {
+		t.Fatalf("after releasing slot 1 the next job got slot %d", again.slot)
+	}
+
+	// All three are taken again. A waiter is handed the slot of the job that releases.
+	waiter := acquireAsync(a, context.Background())
+	waitForWaiting(t, a, 1)
+	r2.release()
+	got := await(t, waiter, "waiter")
+	if got.err != nil || got.slot != 2 {
+		t.Fatalf("waiter = slot %d, err %v; want the released slot 2", got.slot, got.err)
+	}
+
+	// Release in a scrambled order: the free list stays sorted, the lowest comes first.
+	got.release()
+	r0.release()
+	if first, second := mustAcquireSlot(t, a), mustAcquireSlot(t, a); first.slot != 0 || second.slot != 2 {
+		t.Fatalf("after releasing 2 then 0 the next slots are %d then %d, want 0 then 2", first.slot, second.slot)
+	}
+}
+
+// Under load no two running jobs ever share a slot, and no slot is out of range.
+func TestAdmissionRunningJobsNeverShareASlot(t *testing.T) {
+	const jobs, perJob = 3, 40
+	a := NewAdmission(jobs, jobs*perJob)
+	var mu sync.Mutex
+	held := map[int]bool{}
+	var wg sync.WaitGroup
+	for i := 0; i < jobs*perJob; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slot, release, err := a.Acquire(context.Background())
+			if err != nil {
+				t.Errorf("Acquire: %v", err)
+				return
+			}
+			mu.Lock()
+			if slot < 0 || slot >= jobs || held[slot] {
+				t.Errorf("slot %d handed out while it is out of range or in use (%v)", slot, held)
+			}
+			held[slot] = true
+			mu.Unlock()
+			runtime.Gosched()
+			mu.Lock()
+			delete(held, slot)
+			mu.Unlock()
+			release()
+		}()
+	}
+	wg.Wait()
+	expectCounts(t, a, 0, 0)
 }
 
 // Cancel and release race on every iteration: whichever wins, no slot may leak

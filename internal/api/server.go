@@ -66,8 +66,10 @@ func (s *Server) Ping(context.Context, *judgev1.PingRequest) (*judgev1.PingRespo
 
 // Judge maps the request, takes a job slot (waiting in the admission queue when
 // none is free) and runs the engine under the call's context, so a client that
-// goes away or times out cancels the job. A judge outcome, compile errors
-// included, is a response; the errors are statusFor's.
+// goes away or times out cancels the job. The slot's number goes to the engine
+// (Request.Slot): the job runs under that slot's own uid and gid, which no other
+// running job has. A judge outcome, compile errors included, is a response; the
+// errors are statusFor's.
 func (s *Server) Judge(ctx context.Context, in *judgev1.JudgeRequest) (*judgev1.JudgeResponse, error) {
 	start := time.Now()
 	jobID, err := newJobID()
@@ -79,11 +81,12 @@ func (s *Server) Judge(ctx context.Context, in *judgev1.JudgeRequest) (*judgev1.
 	if err != nil {
 		return nil, s.fail(jobID, in, start, err)
 	}
-	release, err := s.adm.Acquire(ctx)
+	slot, release, err := s.adm.Acquire(ctx)
 	if err != nil {
 		return nil, s.fail(jobID, in, start, err)
 	}
 	defer release()
+	req.Slot = slot
 
 	out, err := s.eng.Judge(ctx, jobID, req)
 	if err != nil {

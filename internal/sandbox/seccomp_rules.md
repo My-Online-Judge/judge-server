@@ -76,9 +76,10 @@ exception described after the table below); `execve` killed when `arg0 != exe`; 
 
 ### Additions in this port
 
-Cases of one job run concurrently as the **same** uid (12002) in one container, so a program must not be able to
-reach another case's process, and a deny-list is only as good as the list: each of these is a sibling of something
-upstream already denies, and none is used by `python3 -c 'print(1)'` or by ordinary programs.
+Cases of one job run concurrently as the **same** uid (the job's slot user, 12100+slot, spec section 5.1a) in one
+container, so a program must not be able to reach another case's process, and a deny-list is only as good as the
+list: each of these is a sibling of something upstream already denies, and none is used by `python3 -c 'print(1)'`
+or by ordinary programs.
 
 | Added (killed) | Why |
 |---|---|
@@ -167,9 +168,10 @@ Not seccomp, but part of the same boundary, each with a test:
   of the process's `/proc` directory (`pidfd_send_signal`, `kill` where that is refused), every process whose real
   uid is `uid` and whose session is not the pid of a live shim (`Run` keeps that registry; a pass holds its lock, so a
   process of a run that is just starting is never seen unregistered), and repeats until none is left, zombies
-  included, or about a second has passed. It refuses uid 0. The job pipeline is to call it with a job slot's uid after
-  each run (spec section 5.1a); a run of the same uid still going is not touched, so two concurrent runs of one uid are
-  protected from each other's sweep, not from each other's processes. `TestKillUIDEndsStrayProcesses`,
+  included, or about a second has passed. It refuses uid 0. The judge engine calls it with a job slot's uid after every
+  compile, run and checker run and when the job ends or is cancelled (spec section 5.1a); a run of the same uid still going
+  is not touched, so two concurrent runs of one uid are protected from each other's sweep, not from each other's processes.
+  Every job has a uid of its own (`code0`..`code7`), so in practice only the cases of one job share one. `TestKillUIDEndsStrayProcesses`,
   `TestKillUIDSparesLiveRuns`, `TestKillUIDRefusesRoot`, `TestReadProc`.
 - **The program dies with the runner** (`PR_SET_PDEATHSIG` SIGKILL, set after `setuid` because a credential change
   clears it, before the filter is loaded, with a `getppid()` check against the race). Under `""` a program may leave the

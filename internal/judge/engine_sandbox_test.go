@@ -6,7 +6,8 @@ package judge_test
 // corpus in testdata/corpus: "read two ints, print the sum", three cases, every
 // language of the runtime image. It needs what the image has (the shim at
 // /usr/local/bin/judge-runner, the eight toolchains at the paths the language rows
-// name, users 12001-12003, root with the six capabilities, a writable /work) and
+// name, users 12001-12003 and the slot users code0..code7 (12100-12107), root with the
+// six capabilities, a writable /work and a /tmp) and
 // otherwise skips; with JUDGE_REQUIRE_SANDBOX=1 a missing prerequisite fails
 // instead, so a run that must prove the sandbox cannot pass by skipping.
 // scripts/sandbox-test.sh builds that image and runs these tests in it.
@@ -55,8 +56,8 @@ const (
 	runnerPath = sandbox.DefaultRunnerPath // /usr/local/bin/judge-runner
 	policyPath = "/opt/oj/java.policy"     // mounted by scripts/sandbox-test.sh for TestEngineJavaWithPolicy
 	uidCompile = 12001
-	uidRunUser = 12002
 	uidSPJ     = 12003
+	slot0UID   = int(judge.SlotUIDBase) // the user of job slot 0 (code0); slot n is slot0UID+n
 
 	cpuLimitMs      = 1000      // the problem's CPU time limit; the real-time limit is 3x
 	memoryLimit     = 128 << 20 // the problem's memory limit
@@ -213,8 +214,10 @@ func checkerFor(version, src string) *judge.Checker {
 // Go build cache (warmed once), one memory budget, like the server's.
 type sandboxEnv struct {
 	eng     *judge.Engine
+	deps    judge.Deps // what eng was built from, for a second engine that differs in one thing
 	cfg     config.Config
 	work    string // WorkDir, under /work
+	tmp     string // TMP_DIR, under /tmp: the run's TMPDIR is <tmp>/jobs/<id>
 	bundles string // test case root
 	seq     atomic.Int64
 }
@@ -263,7 +266,7 @@ func buildEnv() (env *sandboxEnv, skip, fail string) {
 	}
 	switch {
 	case os.Geteuid() != 0:
-		return nil, "needs root: the shim switches to uid 12001/12002/12003", ""
+		return nil, "needs root: the shim switches to uid 12001/12003 and 12100-12107", ""
 	case !isDir("/work"):
 		return nil, "/work is not a directory: the tests build their work directory there (a tmpfs mounted exec)", ""
 	}
@@ -286,11 +289,21 @@ func buildEnv() (env *sandboxEnv, skip, fail string) {
 	if err := api.PrepareWorkDir(work); err != nil { // exactly what Serve does
 		return nil, "", err.Error()
 	}
+	// TMP_DIR is a directory of its own under /tmp (the 64 MiB tmpfs of scripts/sandbox-test.sh), not /tmp
+	// itself: this binary's other tests use /tmp, and PrepareTmpDir closes its directory to 0711.
+	tmp, err := os.MkdirTemp("/tmp", "judge-engine-tmp-")
+	if err != nil {
+		return nil, "", err.Error()
+	}
+	if err := api.PrepareTmpDir(tmp); err != nil {
+		return nil, "", err.Error()
+	}
 	bundles := filepath.Join(work, "bundles") // world-readable: a checker opens the input as uid 12003
 	if err := os.Mkdir(bundles, 0o755); err != nil {
 		return nil, "", err.Error()
 	}
 	cfg.WorkDir = work
+	cfg.TmpDir = tmp
 
 	runner := func(ctx context.Context, s sandbox.Spec) (sandbox.Result, error) {
 		return sandbox.Run(ctx, runnerPath, s)
@@ -301,15 +314,15 @@ func buildEnv() (env *sandboxEnv, skip, fail string) {
 	if err := cache.Warm(ctx); err != nil {
 		return nil, "", "warm the Go build cache: " + err.Error()
 	}
-	eng := judge.NewEngine(judge.Deps{
+	deps := judge.Deps{
 		Runner:     runner,
 		RunnerPath: runnerPath,
 		WorkDir:    work,
 		Budget:     judge.NewBudget(budgetBytes),
 		Cfg:        cfg,
 		GoCache:    cache,
-	})
-	return &sandboxEnv{eng: eng, cfg: cfg, work: work, bundles: bundles}, "", ""
+	}
+	return &sandboxEnv{eng: judge.NewEngine(deps), deps: deps, cfg: cfg, work: work, tmp: tmp, bundles: bundles}, "", ""
 }
 
 func isDir(p string) bool {
@@ -335,7 +348,9 @@ func (env *sandboxEnv) bundle(t testing.TB, spj string) *bundle.Bundle {
 // jobID is unique among the jobs of this binary.
 func (env *sandboxEnv) jobID() string { return "job" + strconv.FormatInt(env.seq.Add(1), 10) }
 
-// request is a judge request for src in row, with the corpus limits.
+// request is a judge request for src in row, with the corpus limits, in job slot 0. A
+// test that runs two jobs at once gives the second another slot (see inSlot): two
+// running jobs must never share one.
 func (env *sandboxEnv) request(row languageRow, src string, b *bundle.Bundle, ck *judge.Checker) judge.Request {
 	return judge.Request{
 		Src:          src,
@@ -346,6 +361,12 @@ func (env *sandboxEnv) request(row languageRow, src string, b *bundle.Bundle, ck
 		Bundle:       b,
 		Checker:      ck,
 	}
+}
+
+// inSlot is req made to run in job slot n.
+func inSlot(req judge.Request, n int) judge.Request {
+	req.Slot = n
+	return req
 }
 
 // judge runs one request to its end and returns the outcome and how long it took.
@@ -361,19 +382,22 @@ func (env *sandboxEnv) judge(t *testing.T, req judge.Request) (judge.Outcome, ti
 	return out, time.Since(start)
 }
 
-// assertNoJobs fails when a job directory or a stray process of the run user outlived its Judge call.
+// assertNoJobs fails when a job directory, a run TMPDIR or a stray process of the run
+// users outlived its Judge call.
 func (env *sandboxEnv) assertNoJobs(t *testing.T) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(env.work, "jobs"))
-	if err != nil {
-		t.Fatalf("read jobs dir: %v", err)
-	}
-	if len(entries) != 0 {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
+	for _, dir := range []string{filepath.Join(env.work, "jobs"), filepath.Join(env.tmp, "jobs")} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
 		}
-		t.Errorf("%s/jobs is not empty after the call: %v", env.work, names)
+		if len(entries) != 0 {
+			names := make([]string, len(entries))
+			for i, e := range entries {
+				names[i] = e.Name()
+			}
+			t.Errorf("%s is not empty after the call: %v", dir, names)
+		}
 	}
 }
 
@@ -764,7 +788,7 @@ func TestEngineCancel(t *testing.T) {
 		if took > time.Second {
 			t.Errorf("Judge took %v to return after the cancel, want under 1 s", took)
 		}
-		for _, uid := range []int{uidCompile, uidRunUser, uidSPJ} {
+		for _, uid := range []int{uidCompile, slot0UID, uidSPJ} {
 			// A SIGKILLed process is gone once the kernel has torn it down and init has reaped it,
 			// a moment after Judge returns: give it a second, no more.
 			deadline := time.Now().Add(time.Second)
@@ -789,7 +813,7 @@ func TestEngineCancel(t *testing.T) {
 	})
 	t.Run("go program running as the run user", func(t *testing.T) {
 		took, err := judgeUntilCancel(t, "go", sleepProgram, func() bool {
-			return waitForProcess(t, uidRunUser)
+			return waitForProcess(t, slot0UID)
 		})
 		check(t, took, err)
 	})
@@ -906,4 +930,494 @@ func TestEngineCheckerCorpus(t *testing.T) {
 			t.Errorf("the cached checker's mtime changed from %v to %v: it was written again", before.ModTime(), after.ModTime())
 		}
 	})
+}
+
+// ---- isolation between jobs (spec 5.1a) ----
+//
+// The tests below are the project's own regression tests of the per-slot identities, the
+// permissions of the job directories and the clean-up after a job. Their programs live in
+// testdata/corpus/isolation and are judged through the real engine, in the job slots the
+// test names (two jobs that run at once must not share one).
+
+// procEntry is one process as /proc/<pid>/status shows it.
+type procEntry struct {
+	pid    int
+	comm   string
+	zombie bool
+}
+
+// procsOfUID lists every process whose real uid is uid, zombies included (they count against
+// RLIMIT_NPROC as well).
+func procsOfUID(t testing.TB, uid int) []procEntry {
+	t.Helper()
+	dirs, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatalf("read /proc: %v", err)
+	}
+	var out []procEntry
+	for _, d := range dirs {
+		pid, err := strconv.Atoi(d.Name())
+		if err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join("/proc", d.Name(), "status"))
+		if err != nil {
+			continue // gone
+		}
+		e := procEntry{pid: pid}
+		match := false
+		for _, line := range strings.Split(string(raw), "\n") {
+			switch {
+			case strings.HasPrefix(line, "Name:"):
+				e.comm = strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
+			case strings.HasPrefix(line, "State:"):
+				e.zombie = strings.Contains(line, "Z")
+			case strings.HasPrefix(line, "Uid:"):
+				if f := strings.Fields(strings.TrimPrefix(line, "Uid:")); len(f) > 0 {
+					match = f[0] == strconv.Itoa(uid)
+				}
+			}
+		}
+		if match {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func describeProcs(ps []procEntry) string {
+	parts := make([]string, len(ps))
+	for i, p := range ps {
+		parts[i] = fmt.Sprintf("%d(%s)", p.pid, p.comm)
+	}
+	return strings.Join(parts, " ")
+}
+
+// waitNoProcsOfUID waits (up to grace, for init to reap what was killed) until no process of uid is
+// left and returns what still is.
+func waitNoProcsOfUID(t testing.TB, uid int, grace time.Duration) []procEntry {
+	t.Helper()
+	deadline := time.Now().Add(grace)
+	for {
+		ps := procsOfUID(t, uid)
+		if len(ps) == 0 || time.Now().After(deadline) {
+			return ps
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitForSleeper waits (up to 60 s) until a process named sleep of uid exists: the one the
+// cleanup_detached programs leave behind.
+func waitForSleeper(t testing.TB, uid int) bool {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range procsOfUID(t, uid) {
+			if p.comm == "sleep" && !p.zombie {
+				return true
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// engineWith is a second Engine over the same work dir, budget and Go cache as env's, with one
+// dependency changed by edit.
+func (env *sandboxEnv) engineWith(edit func(*judge.Deps)) *judge.Engine {
+	d := env.deps
+	edit(&d)
+	return judge.NewEngine(d)
+}
+
+// bundleOf writes a bundle whose cases have the given inputs (their expected output is "x", which no
+// test program here prints: the tests read the response output, not the verdict).
+func (env *sandboxEnv) bundleOf(t testing.TB, inputs ...string) *bundle.Bundle {
+	t.Helper()
+	cases := make([]struct{ Name, In, Out string }, len(inputs))
+	for i, in := range inputs {
+		cases[i] = struct{ Name, In, Out string }{strconv.Itoa(i + 1), in, "x\n"}
+	}
+	return testutil.WriteBundle(t, env.bundles, fmt.Sprintf("iso__%08x", env.seq.Add(1)), cases, "")
+}
+
+// Whatever a program leaves running under its slot's uid, however it detaches (setsid in Go and PHP,
+// a detached spawn in Node), is gone when the job is over, and also when the job was cancelled while
+// the program ran. A control run with the sweep switched off shows that the programs really leave
+// the process behind.
+func TestEngineCleanupDetached(t *testing.T) {
+	env := engineEnv(t)
+	for _, tc := range []struct{ lang, file string }{
+		{"go", "cleanup_detached.go"}, {"php", "cleanup_detached.php"}, {"javascript", "cleanup_detached.js"},
+	} {
+		src, row := readSource(t, "isolation", tc.file), rowFor(t, tc.lang)
+
+		t.Run(tc.lang+"/the job ends", func(t *testing.T) {
+			out, _ := env.judge(t, env.request(row, src, env.bundle(t, ""), nil))
+			if fail := firstFailure(out.Cases); fail != nil || len(out.Cases) != len(sumCases) {
+				t.Fatalf("want every case AC: %s", describe(out))
+			}
+			if left := waitNoProcsOfUID(t, slot0UID, 2*time.Second); len(left) != 0 {
+				t.Errorf("processes of the slot's uid %d outlived the job: %s", slot0UID, describeProcs(left))
+			}
+			env.assertNoJobs(t)
+		})
+
+		t.Run(tc.lang+"/control without the sweep", func(t *testing.T) {
+			noSweep := env.engineWith(func(d *judge.Deps) { d.Sweep = func(uint32) (int, error) { return 0, nil } })
+			t.Cleanup(func() { _, _ = sandbox.KillUID(uint32(slot0UID)) })
+			ctx, cancel := context.WithTimeout(context.Background(), judgeTimeout)
+			defer cancel()
+			out, err := noSweep.Judge(ctx, env.jobID(), env.request(row, src, env.bundle(t, ""), nil))
+			if err != nil || firstFailure(out.Cases) != nil {
+				t.Fatalf("Judge = %s, %v", describe(out), err)
+			}
+			left := procsOfUID(t, slot0UID)
+			if len(left) == 0 {
+				t.Fatal("the program left no process behind, so the test above proves nothing")
+			}
+			t.Logf("without the sweep: %s outlived the job", describeProcs(left))
+			if _, err := sandbox.KillUID(uint32(slot0UID)); err != nil {
+				t.Errorf("KillUID: %v", err)
+			}
+		})
+
+		t.Run(tc.lang+"/the job is cancelled", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req := env.request(row, src, env.bundleOf(t, "hang\n"), nil)
+			done := make(chan error, 1)
+			go func() {
+				_, err := env.eng.Judge(ctx, env.jobID(), req)
+				done <- err
+			}()
+			if !waitForSleeper(t, slot0UID) {
+				cancel()
+				<-done
+				t.Fatal("the program never started its detached sleeper")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("Judge returned %v, want context.Canceled", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("Judge did not return 10 s after the cancel")
+			}
+			if left := waitNoProcsOfUID(t, slot0UID, 2*time.Second); len(left) != 0 {
+				t.Errorf("processes of the slot's uid %d outlived the cancelled job: %s", slot0UID, describeProcs(left))
+			}
+			env.assertNoJobs(t)
+		})
+	}
+}
+
+// slotTree builds a job's directory tree as the engine does for slot n (root:<slot gid>, the job
+// directory 0710) with a marker file in src/ and in the run's tmp dir, under the names of a job
+// that is not running, and returns the paths. It stands for the other job of a sandbox.
+func (env *sandboxEnv) slotTree(t *testing.T, name string, slot int, secret string) (dir, srcMarker, tmpDir, tmpMarker string) {
+	t.Helper()
+	gid := int(judge.SlotUIDBase) + slot
+	dir = filepath.Join(env.work, "jobs", name)
+	tmpDir = filepath.Join(env.tmp, "jobs", name)
+	srcDir := filepath.Join(dir, "src")
+	for _, d := range []struct {
+		path string
+		mode os.FileMode
+	}{{dir, 0o710}, {srcDir, 0o750}, {tmpDir, 0o770}} {
+		if err := os.Mkdir(d.path, d.mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(d.path, d.mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Lchown(d.path, 0, gid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srcMarker, tmpMarker = filepath.Join(srcDir, "marker"), filepath.Join(tmpDir, "marker")
+	for _, f := range []string{srcMarker, tmpMarker} {
+		if err := os.WriteFile(f, []byte(secret), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(f, 0, gid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir); _ = os.RemoveAll(tmpDir) })
+	return dir, srcMarker, tmpDir, tmpMarker
+}
+
+// A program of one slot cannot open anything of another slot's job: its directory, its source, its
+// tmp dir, nor list the directory of all jobs. It can read what is its own slot's. The other slot's
+// tree is made by the test and its paths come in as the program's input (a real submission finds
+// the paths of a running job in /proc/<pid>/cmdline). One program runs under the c_cpp filter, one
+// with no filter at all, where file permissions are all there is.
+func TestEnginePermsOtherSlot(t *testing.T) {
+	env := engineEnv(t)
+	for _, tc := range []struct{ lang, file string }{
+		{"c", "perms_other_slot.c"}, {"go", "perms_other_slot.go"},
+	} {
+		t.Run(tc.lang, func(t *testing.T) {
+			const secretOther, secretOwn = "SECRET-OF-SLOT-ONE", "OWN-SLOT-MARKER"
+			other, otherMarker, otherTmp, otherTmpMarker := env.slotTree(t, "other-slot1-"+tc.lang, 1, secretOther)
+			_, ownMarker, _, _ := env.slotTree(t, "own-slot0-"+tc.lang, 0, secretOwn)
+			jobs := filepath.Join(env.work, "jobs")
+			paths := []string{otherMarker, other, otherTmpMarker, otherTmp, jobs, ownMarker}
+			expect := []string{"EACCES", "EACCES", "EACCES", "EACCES", "EACCES", "OK " + secretOwn}
+
+			b := env.bundleOf(t, strings.Join(paths, "\n")+"\n")
+			out, _ := env.judge(t, env.request(rowFor(t, tc.lang), readSource(t, "isolation", tc.file), b, nil))
+			if len(out.Cases) != 1 || out.Cases[0].Error != 0 {
+				t.Fatalf("unexpected outcome: %s", describe(out))
+			}
+			got := string(out.Cases[0].Output)
+			t.Logf("program output:\n%s", got)
+			if strings.Contains(got, secretOther) {
+				t.Fatalf("the program read the other slot's marker:\n%s", got)
+			}
+			lines := strings.Split(strings.TrimSpace(got), "\n")
+			if len(lines) != len(paths) {
+				t.Fatalf("%d output lines, want %d:\n%s", len(lines), len(paths), got)
+			}
+			for i, p := range paths {
+				want := p + " " + expect[i]
+				ok := lines[i] == want
+				if expect[i] == "EACCES" && lines[i] == p+" ENOENT" {
+					ok = true // nothing to read is as good as no right to read it
+				}
+				if !ok {
+					t.Errorf("line %d = %q, want %q", i+1, lines[i], want)
+				}
+			}
+		})
+	}
+}
+
+// kill(-1, SIGKILL) in one job reaches every process the caller may signal: with one uid for all
+// programs that was every program of the sandbox, now it is only the caller's own slot. A victim job in
+// another slot finishes AC; the control, a victim in the same slot, does not (it shows the kill works).
+func TestEngineSignalOtherSlot(t *testing.T) {
+	env := engineEnv(t)
+	row := rowFor(t, "go")
+	killer := readSource(t, "isolation", "signal_other_slot.go")
+
+	run := func(t *testing.T, killerSlot, victimSlot int) (killerOut, victimOut judge.Outcome) {
+		t.Helper()
+		type result struct {
+			out judge.Outcome
+			err error
+		}
+		victimDone, killerDone := make(chan result, 1), make(chan result, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), judgeTimeout)
+		defer cancel()
+		victimReq := inSlot(env.request(row, killer, env.bundle(t, ""), nil), victimSlot)
+		killerReq := inSlot(env.request(row, killer, env.bundleOf(t, "kill\n"), nil), killerSlot)
+		victimID, killerID := env.jobID(), env.jobID()
+		go func() { // the victim: three cases that each sleep two seconds, then answer
+			out, err := env.eng.Judge(ctx, victimID, victimReq)
+			victimDone <- result{out, err}
+		}()
+		if !waitForProcess(t, int(judge.SlotUIDBase)+victimSlot) {
+			t.Fatal("the victim job never started a program")
+		}
+		go func() { // the killer: one case, kill(-1, SIGKILL) half a second after it starts
+			out, err := env.eng.Judge(ctx, killerID, killerReq)
+			killerDone <- result{out, err}
+		}()
+		k, v := <-killerDone, <-victimDone
+		if k.err != nil || v.err != nil {
+			t.Fatalf("Judge: killer %v, victim %v", k.err, v.err)
+		}
+		return k.out, v.out
+	}
+
+	t.Run("another slot is not reached", func(t *testing.T) {
+		k, v := run(t, 0, 1)
+		if len(k.Cases) != 1 || k.Cases[0].Signal != int32(syscall.SIGKILL) {
+			t.Errorf("the killer was not ended by its own SIGKILL: %s", describe(k))
+		}
+		if len(v.Cases) != len(sumCases) || firstFailure(v.Cases) != nil {
+			t.Errorf("the victim in another slot must be AC on every case: %s", describe(v))
+		}
+	})
+	t.Run("control: the same slot is reached", func(t *testing.T) {
+		_, v := run(t, 0, 0) // two jobs in one slot: the contract forbids it, which is the point
+		if len(v.Cases) == 0 || firstFailure(v.Cases) == nil {
+			t.Errorf("the victim sharing the killer's uid survived kill(-1): the test proves nothing: %s", describe(v))
+		}
+	})
+}
+
+// duKiB is the size of everything under dir, in KiB.
+func duKiB(dir string) (int64, error) {
+	out, err := exec.Command("du", "-sk", dir).Output()
+	if err != nil {
+		return 0, fmt.Errorf("du %s: %w", dir, err)
+	}
+	f := strings.Fields(string(out))
+	if len(f) == 0 {
+		return 0, fmt.Errorf("du %s printed nothing", dir)
+	}
+	return strconv.ParseInt(f[0], 10, 64)
+}
+
+// A program that fills its TMPDIR (a run under seccomp "" may create files there) hits ENOSPC inside
+// /tmp, which is a tmpfs of its own: /work, where the other jobs' sources, outputs and artifacts live, is
+// not touched, a job running next to it is AC, and the files are gone with the job.
+func TestEngineTmpFill(t *testing.T) {
+	env := engineEnv(t)
+	var st syscall.Statfs_t
+	if err := syscall.Statfs("/tmp", &st); err != nil {
+		t.Fatalf("statfs /tmp: %v", err)
+	}
+	if total := int64(st.Blocks) * int64(st.Bsize); total > 256<<20 {
+		skipOrFail(t, "/tmp is %d MiB: the test needs the small tmpfs of scripts/sandbox-test.sh (--tmpfs /tmp:size=64m), a program would write 160 MiB", total>>20)
+	}
+
+	workBefore := workUsageKiB(t)
+	type result struct {
+		out judge.Outcome
+		err error
+	}
+	fillDone, neighbourDone := make(chan result, 1), make(chan result, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*judgeTimeout)
+	defer cancel()
+	fillReq := inSlot(env.request(rowFor(t, "go"), readSource(t, "isolation", "tmp_fill.go"), env.bundleOf(t, "1 2\n"), nil), 0)
+	neighbourReq := inSlot(env.request(rowFor(t, "cpp"), readSource(t, "cpp", "ac.cpp"), env.bundle(t, ""), nil), 1)
+	fillID, neighbourID := env.jobID(), env.jobID()
+	go func() {
+		out, err := env.eng.Judge(ctx, fillID, fillReq)
+		fillDone <- result{out, err}
+	}()
+	go func() {
+		out, err := env.eng.Judge(ctx, neighbourID, neighbourReq)
+		neighbourDone <- result{out, err}
+	}()
+	fill, neighbour := <-fillDone, <-neighbourDone
+	if fill.err != nil || neighbour.err != nil {
+		t.Fatalf("Judge: filler %v, neighbour %v", fill.err, neighbour.err)
+	}
+
+	if len(fill.out.Cases) != 1 {
+		t.Fatalf("filler outcome: %s", describe(fill.out))
+	}
+	c := fill.out.Cases[0]
+	if c.Result != 4 && c.Result != -1 { // RE (exit 3) or WA: anything but AC
+		t.Errorf("the filler's verdict is %s, want RE or WA: %s", resultName(c.Result), describe(fill.out))
+	}
+	if got := strings.TrimSpace(string(c.Output)); got != "ENOSPC" {
+		t.Errorf("the filler printed %q, want ENOSPC: it must have run out of room in /tmp (%s)", got, describe(fill.out))
+	}
+	if len(neighbour.out.Cases) != len(sumCases) || firstFailure(neighbour.out.Cases) != nil {
+		t.Errorf("the job next to the filler must be AC: %s", describe(neighbour.out))
+	}
+	if after := workUsageKiB(t); after > workBefore+1024 {
+		t.Errorf("du /work grew from %d to %d KiB while a program filled its TMPDIR", workBefore, after)
+	}
+	if kib, err := duKiB(env.tmp); err != nil || kib > 64 {
+		t.Errorf("the filler's files are still in %s after the job (%d KiB, %v)", env.tmp, kib, err)
+	}
+	env.assertNoJobs(t)
+}
+
+// What the engine builds, with the server's six capabilities and nothing more (so no CAP_FSETID): the
+// modes and owners of spec 5.1a, the setgid bit of in/ and out/ among them, seen while the compile runs
+// and while the first case runs, and the file the shim creates for the output.
+func TestEngineJobDirLayout(t *testing.T) {
+	env := engineEnv(t)
+	type entry struct {
+		mode     os.FileMode
+		uid, gid uint32
+		ok       bool
+	}
+	statOf := func(path string) entry {
+		fi, err := os.Lstat(path)
+		if err != nil {
+			return entry{}
+		}
+		st := fi.Sys().(*syscall.Stat_t)
+		return entry{fi.Mode(), st.Uid, st.Gid, true}
+	}
+	var mu sync.Mutex
+	var atCompile, atRun map[string]entry
+	var output entry
+	var compileOut bool
+	snapshot := func(jobDir, runTmp string) map[string]entry {
+		m := map[string]entry{"runtmp": statOf(runTmp)}
+		for _, name := range []string{"", "src", "in", "out", "tmp", "src/main.cpp"} {
+			m[name] = statOf(filepath.Join(jobDir, name))
+		}
+		return m
+	}
+	eng := env.engineWith(func(d *judge.Deps) {
+		d.Runner = func(ctx context.Context, s sandbox.Spec) (sandbox.Result, error) {
+			jobDir := filepath.Dir(s.Dir)
+			runTmp := filepath.Join(env.tmp, "jobs", filepath.Base(jobDir))
+			mu.Lock()
+			isCompile := s.Argv[0] == "/usr/bin/g++"
+			first := atRun == nil && !isCompile
+			switch {
+			case isCompile:
+				atCompile = snapshot(jobDir, runTmp)
+			case first:
+				atRun = snapshot(jobDir, runTmp)
+				compileOut = statOf(filepath.Join(jobDir, "compile.out")).ok
+			}
+			mu.Unlock()
+			res, err := env.deps.Runner(ctx, s)
+			if first {
+				mu.Lock()
+				output = statOf(s.Stdout)
+				mu.Unlock()
+			}
+			return res, err
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), judgeTimeout)
+	defer cancel()
+	out, err := eng.Judge(ctx, env.jobID(), env.request(rowFor(t, "cpp"), readSource(t, "cpp", "ac.cpp"), env.bundle(t, ""), nil))
+	if err != nil || firstFailure(out.Cases) != nil {
+		t.Fatalf("Judge = %s, %v", describe(out), err)
+	}
+
+	slotGID := uint32(judge.SlotUIDBase) // slot 0
+	check := func(when string, m map[string]entry, want map[string]os.FileMode) {
+		t.Helper()
+		for name, mode := range want {
+			e := m[name]
+			if !e.ok {
+				t.Errorf("%s: %q does not exist", when, name)
+				continue
+			}
+			if e.mode != mode {
+				t.Errorf("%s: mode of %q = %v, want %v", when, name, e.mode, mode)
+			}
+			if e.uid != 0 || e.gid != slotGID {
+				t.Errorf("%s: owner of %q = %d:%d, want 0:%d", when, name, e.uid, e.gid, slotGID)
+			}
+		}
+	}
+	d := os.ModeDir
+	check("compile", atCompile, map[string]os.FileMode{
+		"": d | 0o710, "src": d | 0o770, "in": d | os.ModeSetgid | 0o750, "out": d | os.ModeSetgid | 0o750,
+		"tmp": d | 0o770, "runtmp": d | 0o770, "src/main.cpp": 0o640,
+	})
+	check("first run", atRun, map[string]os.FileMode{
+		"": d | 0o710, "src": d | 0o750, "in": d | os.ModeSetgid | 0o750, "out": d | os.ModeSetgid | 0o750,
+		"runtmp": d | 0o770, "src/main.cpp": 0o640,
+	})
+	if atRun["tmp"].ok {
+		t.Error("the compile's tmp dir exists when the first case runs")
+	}
+	if compileOut {
+		t.Error("compile.out exists when the first case runs")
+	}
+	// The output the shim made: root, the slot's group (the directory is setgid), 0640.
+	if !output.ok || output.mode != 0o640 || output.uid != 0 || output.gid != slotGID {
+		t.Errorf("the shim's output file = %+v, want root:%d 0640", output, slotGID)
+	}
+	env.assertNoJobs(t)
 }

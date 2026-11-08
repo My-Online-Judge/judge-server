@@ -227,6 +227,65 @@ func TestPrepareWorkDir(t *testing.T) {
 	})
 }
 
+func TestPrepareTmpDir(t *testing.T) {
+	t.Run("creates the layout", func(t *testing.T) {
+		tmp := filepath.Join(t.TempDir(), "a", "tmp")
+		if err := PrepareTmpDir(tmp); err != nil {
+			t.Fatalf("PrepareTmpDir: %v", err)
+		}
+		for name, mode := range map[string]os.FileMode{"": 0o711, "jobs": 0o711} {
+			fi, err := os.Stat(filepath.Join(tmp, name))
+			if err != nil || !fi.IsDir() || fi.Mode().Perm() != mode {
+				t.Errorf("%q: %v, %v; want a dir with mode %v", name, fi, err, mode)
+			}
+		}
+	})
+	t.Run("wipes stale jobs, keeps the rest, tightens a 0777 root", func(t *testing.T) {
+		tmp := t.TempDir()
+		for _, p := range []string{"jobs/j1/scratch", "other/file"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(tmp, p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tmp, p), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chmod(tmp, 0o777); err != nil { // what a k3s emptyDir starts as
+			t.Fatal(err)
+		}
+		if err := PrepareTmpDir(tmp); err != nil {
+			t.Fatalf("PrepareTmpDir: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(tmp, "jobs", "j1")); err == nil {
+			t.Error("jobs/j1 survived the start-up wipe")
+		}
+		if _, err := os.Stat(filepath.Join(tmp, "other", "file")); err != nil {
+			t.Errorf("a file outside jobs/ was wiped: %v", err)
+		}
+		if fi, _ := os.Stat(tmp); fi.Mode().Perm() != 0o711 {
+			t.Errorf("tmp dir mode = %v, want 0711 (only root writes there)", fi.Mode().Perm())
+		}
+	})
+	t.Run("never follows a symlink out of the tmp dir", func(t *testing.T) {
+		tmp, outside := t.TempDir(), t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "keep"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(tmp, "jobs")); err != nil {
+			t.Fatal(err)
+		}
+		if err := PrepareTmpDir(tmp); err != nil {
+			t.Fatalf("PrepareTmpDir: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
+			t.Errorf("the symlink target was wiped: %v", err)
+		}
+		if fi, err := os.Lstat(filepath.Join(tmp, "jobs")); err != nil || !fi.IsDir() {
+			t.Errorf("jobs = %v, %v; want a real directory", fi, err)
+		}
+	})
+}
+
 // A bounded graceful stop: a call that finishes in time is answered, one that
 // does not is cut when the grace ends.
 func TestRunGRPCGracefulStop(t *testing.T) {

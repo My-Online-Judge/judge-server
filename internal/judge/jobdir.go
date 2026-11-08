@@ -10,39 +10,48 @@ import (
 	"strings"
 )
 
-// job is one Judge call's state: its directory and the paths inside it.
+// job is one Judge call's state: its directories and the paths inside them.
 //
-// The job directory <WorkDir>/jobs/<id> is built so that the three unprivileged
-// users can do exactly what each needs and nothing more (the server runs as root
-// and chowns what it creates):
+// The job directory <WorkDir>/jobs/<id> is built so that no process of another job
+// can enter it, and so that the job's own users can do exactly what each needs and
+// nothing more (the server runs as root and chowns what it creates). The group of
+// everything below is the job's slot group (gid SlotUIDBase+slot, see slotID): the
+// compiler, the program and the checker of this job all have it, and no other job
+// does. <slot> stands for that gid.
 //
-//	<id>/          0711 root          passable by the run users, not listable, not writable
-//	<id>/src/      0775 root:compiler the source and the compiled artifact; the compiler
-//	                                  writes here, everyone else only reads and enters it
-//	                                  (a program's working directory)
-//	<id>/in/       0755 root          inline inputs N.in (0644), written after the compile;
-//	                                  unlike src/ the compiler cannot touch them
-//	<id>/out/      2755 root:spj      per-case N.out / N.err (and the checker's streams),
-//	                                  created by the shim as root (0640) and, the directory being
-//	                                  setgid, in group spj: the checker (gid 12003) reads N.out,
-//	                                  the run user cannot. Never writable by the run user, so the
-//	                                  shim's root opens cannot be redirected
-//	<id>/tmp/      1777               TMPDIR of every compile, run and checker run, and
-//	                                  HOME of every compile
+//	<id>/          0710 root:<slot>   the job's users pass through; no one else can enter
+//	<id>/src/      0770 root:<slot>   the source and the compiled artifact. The compilers write
+//	                                  here (their group is <slot>); closeForRuns closes it to 0750
+//	                                  before the first run, so a program cannot create or change
+//	                                  anything in its working directory
+//	<id>/in/       2750 root:<slot>   inline inputs N.in (0640), written after the compile
+//	<id>/out/      2750 root:<slot>   per-case N.out and the checker's streams N.chk.out and
+//	                                  N.chk.err, created by the shim as root (0640) and, the
+//	                                  directory being setgid, in group <slot>: the job's checker
+//	                                  reads N.out through that group; nobody can write here
+//	<id>/tmp/      0770 root:<slot>   TMPDIR and HOME of the compiles; deleted before the first run
 //	<id>/compile.out, spj-compile.out
-//	               0644 root          compile output, written by the shim as root
+//	               0640 root:root     the compile's output, written by the shim as root (the job
+//	                                  directory is not setgid); deleted once read
+//	<TMP_DIR>/jobs/<id>/
+//	               0770 root:<slot>   TMPDIR of every run and of the checker (runTmp): on the
+//	                                  tmpfs of its own, so a run that fills it never fills the
+//	                                  work directory; removed with the job
 //
-// The source file is root-owned 0644: py_compile gives its .pyc the source's mode,
-// and the run user must read that file.
+// The source file is root:<slot> 0640; py_compile gives its .pyc the source's mode, which
+// the group still reads.
 //
-// WorkDir itself must be root-owned, not writable by the run users, and
-// searchable (o+x); the caller creates it.
+// WorkDir and the TMP_DIR must be root-owned and not writable by any job user, and
+// searchable (o+x); the caller creates them (api.PrepareWorkDir, api.PrepareTmpDir).
 type job struct {
 	e   *Engine
 	id  string
 	req *Request
 
+	gid uint32 // the slot's gid, and the group of every directory above
+
 	dir, srcDir, inDir, outDir, tmpDir string
+	runTmp                             string // <TMP_DIR>/jobs/<id>
 	srcPath, exePath                   string
 
 	pool int // cases run at once, set by runCases
@@ -50,18 +59,31 @@ type job struct {
 	spjDir, spjExe string // set by ensureChecker
 }
 
-// newJob creates the job directory. A directory that already exists means the
+// Modes of the directories above that more than one step names.
+const (
+	srcDirOpen   fs.FileMode = 0o770 // while the compiles run
+	srcDirClosed fs.FileMode = 0o750 // from the first run on
+)
+
+// newJob creates the job's directories. A directory that already exists means the
 // job id is in use, which is an error (and the other job's directory is left alone).
 func (e *Engine) newJob(id string, r *Request) (*job, error) {
-	jobs := filepath.Join(e.d.WorkDir, "jobs")
-	if err := os.MkdirAll(jobs, 0o711); err != nil {
-		return nil, fmt.Errorf("create %s: %w", jobs, err)
+	if e.d.Cfg.TmpDir == "" {
+		return nil, errors.New("the engine has no TMP_DIR (Cfg.TmpDir) for the programs' TMPDIR")
 	}
-	if err := os.Chmod(jobs, 0o711); err != nil {
-		return nil, fmt.Errorf("chmod %s: %w", jobs, err)
+	jobs := filepath.Join(e.d.WorkDir, "jobs")
+	tmpJobs := filepath.Join(e.d.Cfg.TmpDir, "jobs")
+	for _, d := range []string{jobs, tmpJobs} {
+		if err := os.MkdirAll(d, 0o711); err != nil {
+			return nil, fmt.Errorf("create %s: %w", d, err)
+		}
+		if err := os.Chmod(d, 0o711); err != nil {
+			return nil, fmt.Errorf("chmod %s: %w", d, err)
+		}
 	}
 
-	j := &job{e: e, id: id, req: r, dir: filepath.Join(jobs, id)}
+	j := &job{e: e, id: id, req: r, dir: filepath.Join(jobs, id), runTmp: filepath.Join(tmpJobs, id)}
+	j.gid = j.slotID()
 	j.srcDir = filepath.Join(j.dir, "src")
 	j.inDir = filepath.Join(j.dir, "in")
 	j.outDir = filepath.Join(j.dir, "out")
@@ -69,7 +91,7 @@ func (e *Engine) newJob(id string, r *Request) (*job, error) {
 	j.srcPath = filepath.Join(j.srcDir, r.Lang.Compile.SrcName)
 	j.exePath = filepath.Join(j.srcDir, r.Lang.Compile.ExeName)
 
-	if err := os.Mkdir(j.dir, 0o711); err != nil {
+	if err := os.Mkdir(j.dir, 0o710); err != nil {
 		return nil, fmt.Errorf("create job dir (is job id %q in use?): %w", id, err)
 	}
 	if err := j.prepareDirs(); err != nil {
@@ -79,17 +101,26 @@ func (e *Engine) newJob(id string, r *Request) (*job, error) {
 	return j, nil
 }
 
+// prepareDirs sets the mode and the group of every directory of the job.
+//
+// For a directory, chmod comes BEFORE chown, and that order is not a style choice:
+// the container has no CAP_FSETID, so a chmod that sets the setgid bit (in/ and out/)
+// on a directory whose group is not the caller's own (root's, gid 0) silently drops
+// the bit. Done first, while the group is still root's, the bit is set; the chown
+// that follows leaves the bit of a directory alone. The same order is used for all
+// of them, and the test that runs with the server's six capabilities checks the
+// bit.
 func (j *job) prepareDirs() error {
 	dirs := []struct {
 		path string
 		mode fs.FileMode
-		gid  int // -1 leaves root's group
 	}{
-		{j.dir, 0o711, -1},
-		{j.srcDir, 0o775, int(uidCompiler)},
-		{j.inDir, 0o755, -1},
-		{j.outDir, os.ModeSetgid | 0o755, int(uidSPJ)},
-		{j.tmpDir, os.ModeSticky | 0o777, -1},
+		{j.dir, 0o710},
+		{j.srcDir, srcDirOpen},
+		{j.inDir, os.ModeSetgid | 0o750},
+		{j.outDir, os.ModeSetgid | 0o750},
+		{j.tmpDir, 0o770},
+		{j.runTmp, 0o770},
 	}
 	for _, d := range dirs {
 		if d.path != j.dir {
@@ -102,10 +133,8 @@ func (j *job) prepareDirs() error {
 		if err := os.Chmod(d.path, d.mode); err != nil {
 			return fmt.Errorf("chmod %s: %w", d.path, err)
 		}
-		if d.gid >= 0 {
-			if err := ignorePermission(os.Lchown(d.path, 0, d.gid), d.path); err != nil {
-				return fmt.Errorf("chown %s: %w", d.path, err)
-			}
+		if err := ignorePermission(os.Lchown(d.path, 0, int(j.gid)), d.path); err != nil {
+			return fmt.Errorf("chown %s: %w", d.path, err)
 		}
 	}
 	return nil
@@ -122,31 +151,63 @@ func ignorePermission(err error, path string) error {
 	return err
 }
 
-// remove deletes the job directory and everything in it. It never follows a
-// symlink a compile left behind.
+// remove deletes the job's directories, the run TMPDIR included, and everything in
+// them. It never follows a symlink a program left behind.
 func (j *job) remove() {
-	if err := os.RemoveAll(j.dir); err != nil {
-		slog.Warn("job: remove job dir", "job", j.id, "dir", j.dir, "err", err)
+	for _, dir := range []string{j.dir, j.runTmp} {
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("job: remove job dir", "job", j.id, "dir", dir, "err", err)
+		}
 	}
 }
 
-// writeSource writes the submission where the compile (or the run command) finds it.
+// finish ends the job, however it ended: it kills what is still running under the
+// slot's uid and only then removes the directories, so nothing is left holding
+// files in a directory that is being deleted, or running when the slot goes to
+// another job.
+func (j *job) finish() {
+	j.sweep("job end")
+	j.remove()
+}
+
+// closeForRuns ends the compile phase: src/ is closed to 0750, so that a program,
+// which has the slot group, cannot create or change a file in its working
+// directory, and the compilers' TMPDIR is deleted, so nothing they left in it (a
+// run reads none of it) takes room on the work directory while the cases run.
+func (j *job) closeForRuns() error {
+	if err := os.Chmod(j.srcDir, srcDirClosed); err != nil {
+		return fmt.Errorf("close %s: %w", j.srcDir, err)
+	}
+	if err := os.RemoveAll(j.tmpDir); err != nil {
+		return fmt.Errorf("remove %s: %w", j.tmpDir, err)
+	}
+	return nil
+}
+
+// writeSource writes the submission where the compile (or the run command) finds it:
+// root:<slot> 0640.
 func (j *job) writeSource() error {
-	if err := os.MkdirAll(filepath.Dir(j.srcPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(j.srcPath), srcDirOpen); err != nil {
 		return fmt.Errorf("create source dir: %w", err)
 	}
-	if err := writeNew(j.srcPath, []byte(j.req.Src), 0o644); err != nil {
+	if err := writeNewGroup(j.srcPath, []byte(j.req.Src), 0o640, int(j.gid)); err != nil {
 		return fmt.Errorf("write source: %w", err)
 	}
 	return nil
 }
 
 // env builds a program's whole environment from the request's entries: an entry
-// whose value is exactly /tmp moves to the job's tmp dir, every GOCACHE entry,
-// whatever its value, moves to the shared Go cache (or to the job's tmp dir when
+// whose value is exactly /tmp moves to the program's own tmp dir, every GOCACHE
+// entry, whatever its value, moves to the shared Go cache (or to the tmp dir when
 // there is none), and the server's own TMPDIR, PATH and, for a compile, HOME
-// replace any the request carries.
+// replace any the request carries. The tmp dir of a compile is <job>/tmp (on the
+// work directory, deleted before the runs); that of a run is the job's directory
+// under TMP_DIR.
 func (j *job) env(entries []string, compile bool) []string {
+	tmp := j.runTmp
+	if compile {
+		tmp = j.tmpDir
+	}
 	out := make([]string, 0, len(entries)+3)
 	for _, kv := range entries {
 		key, val, _ := strings.Cut(kv, "=")
@@ -154,19 +215,19 @@ func (j *job) env(entries []string, compile bool) []string {
 		case key == "TMPDIR" || key == "PATH" || (compile && key == "HOME"):
 			continue
 		case key == "GOCACHE":
-			val = j.tmpDir
+			val = tmp
 			if j.e.d.GoCache != nil {
 				val = j.e.d.GoCache.Dir()
 			}
 			kv = key + "=" + val
 		case val == "/tmp":
-			kv = key + "=" + j.tmpDir
+			kv = key + "=" + tmp
 		}
 		out = append(out, kv)
 	}
-	out = append(out, "TMPDIR="+j.tmpDir, envPath)
+	out = append(out, "TMPDIR="+tmp, envPath)
 	if compile {
-		out = append(out, "HOME="+j.tmpDir)
+		out = append(out, "HOME="+tmp)
 	}
 	return out
 }

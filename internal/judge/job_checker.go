@@ -80,6 +80,7 @@ func (j *job) ensureChecker(ctx context.Context) (string, error) {
 	msg, err := j.compile(ctx, compileStep{
 		cfg:     ck.Compile,
 		uid:     uidSPJ,
+		groups:  []uint32{uidSPJ}, // the version dir is root:spj 0775 while it compiles
 		dir:     j.spjDir,
 		vars:    Vars{SrcPath: src, ExePath: tmp, ExeDir: j.spjDir, SPJVersion: ck.Version},
 		logPath: filepath.Join(j.dir, "spj-compile.out"),
@@ -215,8 +216,12 @@ func (j *job) lockSPJDir() error {
 // runChecker runs the checker on case n (the 1-based position) and returns the
 // case's result and error code: exit 0 is accepted, exit 1 wrong answer, anything
 // else (another exit code, a signal, a sandbox error) is a system error with
-// error -11. The checker's own output goes to files in the job's out dir that
-// nobody reads. Its 1 GiB reservation is taken after the program's was given back.
+// error -11. The checker runs as (spj, the slot's gid) with the group spj, so it
+// reads the bundle's input (group spj) and the program's output (group <slot>, see
+// the job layout); its working directory and TMPDIR are the job's run tmp dir. Its own
+// output goes to files in the job's out dir that nobody reads and that are deleted
+// as soon as it has run. Its 1 GiB reservation is taken after the program's was
+// given back; the slot's uid is swept when it has run.
 func (j *job) runChecker(ctx context.Context, n, name, in, userOut string) (result, errCode int32, err error) {
 	ck := j.req.Checker
 	cfg := j.e.d.Cfg
@@ -238,14 +243,18 @@ func (j *job) runChecker(ctx context.Context, n, name, in, userOut string) (resu
 	defer release()
 
 	cpu := timeFactor * j.req.MaxCPUTimeMs
+	chkOut, chkErr := filepath.Join(j.outDir, n+".chk.out"), filepath.Join(j.outDir, n+".chk.err")
+	defer removeFile(chkOut)
+	defer removeFile(chkErr)
 	res, err := j.e.d.Runner(ctx, sandbox.Spec{
 		Argv:            argv,
-		Env:             []string{"TMPDIR=" + j.tmpDir, envPath},
-		Dir:             j.tmpDir,
+		Env:             []string{"TMPDIR=" + j.runTmp, envPath},
+		Dir:             j.runTmp,
 		UID:             uidSPJ,
-		GID:             uidSPJ,
-		Stdout:          filepath.Join(j.outDir, n+".chk.out"),
-		Stderr:          filepath.Join(j.outDir, n+".chk.err"),
+		GID:             j.gid,
+		Groups:          []uint32{uidSPJ},
+		Stdout:          chkOut,
+		Stderr:          chkErr,
 		MaxCPUTimeMs:    cpu,
 		MaxRealTimeMs:   timeFactor * cpu,
 		MaxAddressSpace: spjMemory,
@@ -254,6 +263,7 @@ func (j *job) runChecker(ctx context.Context, n, name, in, userOut string) (resu
 		MaxProcs:        maxProcs,
 		Seccomp:         ck.SeccompRule,
 	})
+	j.sweep("checker of case " + name)
 	if err != nil {
 		return 0, 0, runnerFailure(ctx, "run checker for case "+name, err)
 	}

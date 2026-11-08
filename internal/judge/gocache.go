@@ -178,6 +178,9 @@ func (g *GoCache) warm(ctx context.Context) error {
 			"GOCACHE=" + g.dir,
 			"GOPATH=" + gopath,
 			"HOME=" + home,
+			// go build makes its work dir under TMPDIR, and the default /tmp is not
+			// writable by the compiler user (the server closes it to 0711).
+			"TMPDIR=" + home,
 			"PATH=/usr/local/bin:/usr/bin:/bin",
 		},
 		Dir:             warmDir,
@@ -266,6 +269,14 @@ func mkdirOpen(dir string, perm fs.FileMode) (*os.File, error) {
 // set explicitly because the umask may have narrowed it. It is shared with the
 // job pipeline (sources, inline inputs), so its errors carry no package prefix.
 func writeNew(path string, data []byte, perm fs.FileMode) error {
+	return writeNewGroup(path, data, perm, -1)
+}
+
+// writeNewGroup is writeNew that also hands the file to group gid (owner root)
+// when gid >= 0: the job's source file is root:<slot group> 0640. The chown acts on
+// the descriptor just opened, and a permission error from it is dropped like
+// everywhere that a test runs without root (see ignorePermission).
+func writeNewGroup(path string, data []byte, perm fs.FileMode, gid int) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("remove %s: %w", path, err)
 	}
@@ -273,9 +284,13 @@ func writeNew(path string, data []byte, perm fs.FileMode) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
 	}
+	var cherr error
+	if gid >= 0 {
+		cherr = ignorePermission(f.Chown(0, gid), path)
+	}
 	_, werr := f.Write(data)
 	cerr := f.Chmod(perm)
-	if err := errors.Join(werr, cerr, f.Close()); err != nil {
+	if err := errors.Join(cherr, werr, cerr, f.Close()); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil

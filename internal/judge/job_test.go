@@ -55,14 +55,21 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// fixture is an Engine over a fake runner, a temp work dir and a 1 GiB budget.
+// fixture is an Engine over a fake runner, a temp work dir, a temp TMP_DIR, a
+// 1 GiB budget and a sweep that only records which uid it was asked to kill (a
+// unit test never kills the processes of the machine it runs on).
 type fixture struct {
 	t    *testing.T
 	fake *testutil.FakeRunner
 	deps Deps
 	eng  *Engine
 	work string
+	tmp  string // TMP_DIR
 	root string // the test case root
+
+	sweepMu sync.Mutex
+	sweeps  []uint32         // the uid of every sweep, in call order
+	onSweep func(uid uint32) // called by every sweep, before it is recorded
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -70,21 +77,46 @@ func newFixture(t *testing.T) *fixture {
 	quietLogs(t)
 	fake := testutil.NewFakeRunner()
 	work := t.TempDir()
-	return &fixture{
-		t: t, fake: fake, work: work, root: t.TempDir(),
-		deps: Deps{
-			Runner:  fake.Run,
-			WorkDir: work,
-			Budget:  NewBudget(gib),
-			Cfg: config.Config{
-				RunPoolBudget:     gib,
-				CompileMaxMemory:  512 * mib,
-				OutputFileCap:     32 * mib,
-				OutputResponseCap: 64 << 10,
-				CompileMessageCap: 64 << 10,
-			},
+	f := &fixture{t: t, fake: fake, work: work, tmp: t.TempDir(), root: t.TempDir()}
+	f.deps = Deps{
+		Runner:  fake.Run,
+		Sweep:   f.sweep,
+		WorkDir: work,
+		Budget:  NewBudget(gib),
+		Cfg: config.Config{
+			TmpDir:            f.tmp,
+			RunPoolBudget:     gib,
+			CompileMaxMemory:  512 * mib,
+			OutputFileCap:     32 * mib,
+			OutputResponseCap: 64 << 10,
+			CompileMessageCap: 64 << 10,
 		},
 	}
+	return f
+}
+
+// sweep is the fixture's Deps.Sweep: it records uid and kills nothing.
+func (f *fixture) sweep(uid uint32) (int, error) {
+	if f.onSweep != nil {
+		f.onSweep(uid)
+	}
+	f.sweepMu.Lock()
+	defer f.sweepMu.Unlock()
+	f.sweeps = append(f.sweeps, uid)
+	return 0, nil
+}
+
+// sweepsOf is how many sweeps asked for uid so far.
+func (f *fixture) sweepsOf(uid uint32) int {
+	f.sweepMu.Lock()
+	defer f.sweepMu.Unlock()
+	n := 0
+	for _, u := range f.sweeps {
+		if u == uid {
+			n++
+		}
+	}
+	return n
 }
 
 // engine builds the Engine once, so a later Judge call shares its checker cache.
@@ -105,13 +137,17 @@ func (f *fixture) bundle(cases []bundleCase, spjVersion string) *bundle.Bundle {
 }
 
 func (f *fixture) jobDir(id string) string { return filepath.Join(f.work, "jobs", id) }
+func (f *fixture) runTmp(id string) string { return filepath.Join(f.tmp, "jobs", id) }
 func (f *fixture) exe(id string) string    { return filepath.Join(f.jobDir(id), "src", "main") }
 func (f *fixture) spjDir(v string) string  { return filepath.Join(f.work, "spj", v) }
 
+// assertJobDirGone checks that the job's directory and its run TMPDIR are both gone.
 func (f *fixture) assertJobDirGone(id string) {
 	f.t.Helper()
-	if _, err := os.Stat(f.jobDir(id)); !errors.Is(err, fs.ErrNotExist) {
-		f.t.Errorf("job dir %s still there (stat err %v)", f.jobDir(id), err)
+	for _, dir := range []string{f.jobDir(id), f.runTmp(id)} {
+		if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
+			f.t.Errorf("job dir %s still there (stat err %v)", dir, err)
+		}
 	}
 }
 
@@ -262,10 +298,12 @@ func TestJudgeCompileThenRunsEveryCase(t *testing.T) {
 		t.Fatalf("runner got %d calls, want 1 compile + 3 runs", len(calls))
 	}
 	jobDir, tmp, src := f.jobDir("job1"), filepath.Join(f.jobDir("job1"), "tmp"), filepath.Join(f.jobDir("job1"), "src")
+	runTmp := f.runTmp("job1")
 
+	// Slot 0: the compiler is (12001, 12100), the program (12100, 12100). No supplementary group.
 	c := calls[0]
-	if c.Argv[0] != gpp || c.UID != 12001 || c.GID != 12001 {
-		t.Errorf("compile argv0=%q uid=%d gid=%d, want %s as 12001", c.Argv[0], c.UID, c.GID, gpp)
+	if c.Argv[0] != gpp || c.UID != 12001 || c.GID != 12100 || len(c.Groups) != 0 {
+		t.Errorf("compile argv0=%q uid=%d gid=%d groups=%v, want %s as 12001:12100, no groups", c.Argv[0], c.UID, c.GID, c.Groups, gpp)
 	}
 	if want := []string{gpp, "-O2", filepath.Join(src, "main.cpp"), "-o", exe}; !slices.Equal(c.Argv, want) {
 		t.Errorf("compile argv = %v, want %v", c.Argv, want)
@@ -290,8 +328,8 @@ func TestJudgeCompileThenRunsEveryCase(t *testing.T) {
 	}
 	for _, cs := range b.Cases {
 		s := specByStdin(t, runs, cs.InputPath)
-		if s.UID != 12002 || s.GID != 12002 || s.Seccomp != "c_cpp" {
-			t.Errorf("run %s: uid=%d gid=%d seccomp=%q", cs.Name, s.UID, s.GID, s.Seccomp)
+		if s.UID != 12100 || s.GID != 12100 || len(s.Groups) != 0 || s.Seccomp != "c_cpp" {
+			t.Errorf("run %s: uid=%d gid=%d groups=%v seccomp=%q, want the slot's own 12100:12100 and no groups", cs.Name, s.UID, s.GID, s.Groups, s.Seccomp)
 		}
 		if s.MaxCPUTimeMs != 1000 || s.MaxRealTimeMs != 3*s.MaxCPUTimeMs {
 			t.Errorf("run %s: cpu=%d real=%d, want real == 3*cpu", cs.Name, s.MaxCPUTimeMs, s.MaxRealTimeMs)
@@ -302,8 +340,8 @@ func TestJudgeCompileThenRunsEveryCase(t *testing.T) {
 		if s.Dir != src || s.Stdout != filepath.Join(jobDir, "out", cs.Name+".out") || s.Stderr != filepath.Join(jobDir, "out", cs.Name+".err") {
 			t.Errorf("run %s: dir=%q stdout=%q stderr=%q", cs.Name, s.Dir, s.Stdout, s.Stderr)
 		}
-		if !slices.Contains(s.Env, "TMPDIR="+tmp) || !slices.Contains(s.Env, "PATH=/usr/local/bin:/usr/bin:/bin") {
-			t.Errorf("run %s: env = %v", cs.Name, s.Env)
+		if !slices.Contains(s.Env, "TMPDIR="+runTmp) || !slices.Contains(s.Env, "PATH=/usr/local/bin:/usr/bin:/bin") {
+			t.Errorf("run %s: env = %v, want TMPDIR=%s (the job's directory under TMP_DIR, not the compile's)", cs.Name, s.Env, runTmp)
 		}
 		if envCount(s.Env, "HOME=") != 0 {
 			t.Errorf("run %s: env sets HOME: %v", cs.Name, s.Env)
@@ -311,6 +349,28 @@ func TestJudgeCompileThenRunsEveryCase(t *testing.T) {
 	}
 	f.assertJobDirGone("job1")
 	f.assertBudgetFree()
+}
+
+// The slot picks the identity: slot n runs its program as (12100+n, 12100+n) and its
+// compiler as (12001, 12100+n), and nothing of slot 0's identity is left in it.
+func TestJudgeSlotSelectsTheIdentity(t *testing.T) {
+	for _, slot := range []int{0, 1, 5, MaxSlots - 1} {
+		f := newFixture(t)
+		exe := f.exe("job1")
+		f.fake.Script(exe, prints("1\n"))
+		req := cppRequest(f.bundle(threeCases[:1], ""))
+		req.Slot = slot
+		if _, err := f.judge("job1", req); err != nil {
+			t.Fatalf("slot %d: Judge: %v", slot, err)
+		}
+		id := uint32(12100 + slot)
+		if c := f.fake.CallsFor(gpp)[0]; c.UID != 12001 || c.GID != id {
+			t.Errorf("slot %d: compile as %d:%d, want 12001:%d", slot, c.UID, c.GID, id)
+		}
+		if r := f.fake.CallsFor(exe)[0]; r.UID != id || r.GID != id {
+			t.Errorf("slot %d: run as %d:%d, want %d:%d", slot, r.UID, r.GID, id, id)
+		}
+	}
 }
 
 func TestJudgeCompileMaxAddressSpaceIsCappedByConfig(t *testing.T) {
@@ -641,8 +701,8 @@ func TestJudgeCheckerFlow(t *testing.T) {
 	}
 	c := calls[1]
 	wantArgv := []string{gcc, "-O2", filepath.Join(f.spjDir("v1"), "spj-v1.c"), "-o", tmpExe(spjExe, "job1")}
-	if !slices.Equal(c.Argv, wantArgv) || c.UID != 12003 || c.GID != 12003 {
-		t.Errorf("checker compile = %v as %d:%d, want %v as 12003:12003", c.Argv, c.UID, c.GID, wantArgv)
+	if !slices.Equal(c.Argv, wantArgv) || c.UID != 12003 || c.GID != 12100 || !slices.Equal(c.Groups, []uint32{12003}) {
+		t.Errorf("checker compile = %v as %d:%d groups %v, want %v as 12003:12100 with group 12003 (the version dir is root:spj)", c.Argv, c.UID, c.GID, c.Groups, wantArgv)
 	}
 	if spjSource != "int main() { return 0; }" {
 		t.Errorf("checker source on disk during the compile = %q", spjSource)
@@ -661,8 +721,11 @@ func TestJudgeCheckerFlow(t *testing.T) {
 		if want := []string{spjExe, cs.InputPath, userOut}; !slices.Equal(s.Argv, want) {
 			t.Errorf("case %d checker argv = %v, want %v", i, s.Argv, want)
 		}
-		if s.Seccomp != "c_cpp" || s.UID != 12003 || s.GID != 12003 {
-			t.Errorf("case %d checker seccomp=%q uid=%d gid=%d", i, s.Seccomp, s.UID, s.GID)
+		if s.Seccomp != "c_cpp" || s.UID != 12003 || s.GID != 12100 || !slices.Equal(s.Groups, []uint32{12003}) {
+			t.Errorf("case %d checker seccomp=%q uid=%d gid=%d groups=%v, want 12003:12100 with group 12003 (the bundle's, and the program's output through the slot group)", i, s.Seccomp, s.UID, s.GID, s.Groups)
+		}
+		if runTmp := f.runTmp("job1"); s.Dir != runTmp || !slices.Contains(s.Env, "TMPDIR="+runTmp) {
+			t.Errorf("case %d checker dir=%q env=%v, want the job's run tmp dir %s", i, s.Dir, s.Env, runTmp)
 		}
 		if s.MaxCPUTimeMs != 3*req.MaxCPUTimeMs || s.MaxRealTimeMs != 3*s.MaxCPUTimeMs || s.MaxAddressSpace != gib {
 			t.Errorf("case %d checker cpu=%d real=%d as=%d, want 3x case cpu, 3x that, 1 GiB", i, s.MaxCPUTimeMs, s.MaxRealTimeMs, s.MaxAddressSpace)
@@ -1117,7 +1180,7 @@ func TestJudgeGoEnvRewrite(t *testing.T) {
 		if _, err := f.judge("job1", setup(f)); err != nil {
 			t.Fatalf("Judge: %v", err)
 		}
-		tmp := filepath.Join(f.jobDir("job1"), "tmp")
+		tmp, runTmp := filepath.Join(f.jobDir("job1"), "tmp"), f.runTmp("job1")
 		compile := f.fake.CallsFor(gpp)[0].Env
 		for _, want := range []string{"GOCACHE=" + cache.Dir(), "FOO=" + tmp, "KEEP=/tmpx", "TMPDIR=" + tmp, "HOME=" + tmp, "PATH=/usr/local/bin:/usr/bin:/bin"} {
 			if !slices.Contains(compile, want) {
@@ -1130,7 +1193,7 @@ func TestJudgeGoEnvRewrite(t *testing.T) {
 			}
 		}
 		run := f.fake.CallsFor(f.exe("job1"))[0].Env
-		for _, want := range []string{"GODEBUG=madvdontneed=1", "BAR=" + tmp, "GOCACHE=" + cache.Dir(), "TMPDIR=" + tmp} {
+		for _, want := range []string{"GODEBUG=madvdontneed=1", "BAR=" + runTmp, "GOCACHE=" + cache.Dir(), "TMPDIR=" + runTmp} {
 			if !slices.Contains(run, want) {
 				t.Errorf("run env %v lacks %q", run, want)
 			}
@@ -1142,13 +1205,13 @@ func TestJudgeGoEnvRewrite(t *testing.T) {
 		if _, err := f.judge("job1", setup(f)); err != nil {
 			t.Fatalf("Judge: %v", err)
 		}
-		tmp := filepath.Join(f.jobDir("job1"), "tmp")
+		tmp, runTmp := filepath.Join(f.jobDir("job1"), "tmp"), f.runTmp("job1")
 		env := f.fake.CallsFor(gpp)[0].Env
 		if !slices.Contains(env, "GOCACHE="+tmp) || envCount(env, "GOCACHE=") != 1 {
-			t.Errorf("compile env %v, want GOCACHE in the job's tmp when there is no shared cache", env)
+			t.Errorf("compile env %v, want GOCACHE in the compile's tmp when there is no shared cache", env)
 		}
-		if run := f.fake.CallsFor(f.exe("job1"))[0].Env; !slices.Contains(run, "GOCACHE="+tmp) {
-			t.Errorf("run env %v, want GOCACHE in the job's tmp too", run)
+		if run := f.fake.CallsFor(f.exe("job1"))[0].Env; !slices.Contains(run, "GOCACHE="+runTmp) {
+			t.Errorf("run env %v, want GOCACHE in the run's tmp too", run)
 		}
 	})
 }
@@ -1246,9 +1309,9 @@ func TestJudgeInlineCases(t *testing.T) {
 	}
 	in := filepath.Join(f.jobDir("job1"), "in") // root-only, not the compiler-writable src/
 	wantRead := map[string]string{
-		filepath.Join(in, "1.in"): "a\n|-rw-r--r--",
-		filepath.Join(in, "2.in"): "|-rw-r--r--",
-		filepath.Join(in, "3.in"): "c\n|-rw-r--r--",
+		filepath.Join(in, "1.in"): "a\n|-rw-r-----",
+		filepath.Join(in, "2.in"): "|-rw-r-----",
+		filepath.Join(in, "3.in"): "c\n|-rw-r-----",
 	}
 	for path, want := range wantRead {
 		if read[path] != want {
@@ -1376,6 +1439,8 @@ func TestJudgeRejectsInvalidRequests(t *testing.T) {
 		{"src name has a newline", func(r *Request) { r.Lang.Compile.SrcName = "main.cpp\n" }},
 		{"exe name has a space", func(r *Request) { r.Lang.Compile.ExeName = "my main" }},
 		{"exe name has a no-break space", func(r *Request) { r.Lang.Compile.ExeName = "my\u00a0main" }},
+		{"negative slot", func(r *Request) { r.Slot = -1 }},
+		{"slot past the last user", func(r *Request) { r.Slot = MaxSlots }},
 		{"zero cpu limit", func(r *Request) { r.MaxCPUTimeMs = 0 }},
 		{"negative cpu limit", func(r *Request) { r.MaxCPUTimeMs = -5 }},
 		{"absurd cpu limit", func(r *Request) { r.MaxCPUTimeMs = 1 << 40 }},
@@ -1462,60 +1527,306 @@ func TestJudgeRejectsInvalidRequests(t *testing.T) {
 	})
 }
 
+// dirEntry is the mode and the owner of one path, as the test sees it at one moment.
+type dirEntry struct {
+	mode     fs.FileMode
+	uid, gid uint32
+	ok       bool
+}
+
+func statEntry(path string) dirEntry {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return dirEntry{}
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	return dirEntry{fi.Mode(), st.Uid, st.Gid, true}
+}
+
+// The layout of spec 5.1a: every directory of a job is root:<slot gid> and closed to
+// everyone else; src/ is 0770 while the compiles run and 0750 from the first run on, in/
+// and out/ are setgid 2750, the compile's tmp dir is deleted before the runs, and the
+// run's TMPDIR is a directory of its own under TMP_DIR.
 func TestJudgeJobDirLayout(t *testing.T) {
 	f := newFixture(t)
-	jobDir := f.jobDir("job1")
-	type entry struct {
-		mode     fs.FileMode
-		uid, gid uint32
-	}
-	seen := map[string]entry{}
-	f.fake.Script(gpp, testutil.Step{Inspect: func(sandbox.Spec) {
-		for _, name := range []string{"", "src", "in", "out", "tmp"} {
-			fi, err := os.Stat(filepath.Join(jobDir, name))
-			if err != nil {
-				t.Errorf("stat %q: %v", name, err)
-				continue
-			}
-			st := fi.Sys().(*syscall.Stat_t)
-			seen[name] = entry{fi.Mode(), st.Uid, st.Gid}
+	jobDir, runTmp := f.jobDir("job1"), f.runTmp("job1")
+	names := []string{"", "src", "in", "out", "tmp"}
+	snapshot := func() (seen map[string]dirEntry) {
+		seen = map[string]dirEntry{"runtmp": statEntry(runTmp)}
+		for _, name := range names {
+			seen[name] = statEntry(filepath.Join(jobDir, name))
 		}
+		seen["source"] = statEntry(filepath.Join(jobDir, "src", "main.cpp"))
+		return seen
+	}
+	var duringCompile, duringRun map[string]dirEntry
+	var compileOutDuringRun bool
+	f.fake.Script(gpp, testutil.Step{Inspect: func(sandbox.Spec) {
+		duringCompile = snapshot()
 		raw, err := os.ReadFile(filepath.Join(jobDir, "src", "main.cpp"))
 		if err != nil || string(raw) != "int main() {}" {
 			t.Errorf("source on disk = %q, %v", raw, err)
 		}
-		if fi, err := os.Stat(filepath.Join(jobDir, "src", "main.cpp")); err == nil && fi.Mode().Perm()&0o022 != 0 {
-			t.Errorf("source mode %v is writable by group or others", fi.Mode().Perm())
-		}
 	}})
+	f.fake.Handle(f.exe("job1"), func(sandbox.Spec) testutil.Step {
+		return testutil.Step{Inspect: func(sandbox.Spec) {
+			if duringRun == nil {
+				duringRun = snapshot()
+				compileOutDuringRun = statEntry(filepath.Join(jobDir, "compile.out")).ok
+			}
+		}}
+	})
 
 	if _, err := f.judge("job1", cppRequest(f.bundle(threeCases[:1], ""))); err != nil {
 		t.Fatalf("Judge: %v", err)
 	}
-	wantMode := map[string]fs.FileMode{
-		"":    fs.ModeDir | 0o711,
-		"src": fs.ModeDir | 0o775,
-		"in":  fs.ModeDir | 0o755,
-		"out": fs.ModeDir | fs.ModeSetgid | 0o755,
-		"tmp": fs.ModeDir | fs.ModeSticky | 0o777,
-	}
-	for name, want := range wantMode {
-		if got := seen[name].mode; got != want {
-			t.Errorf("mode of %q = %v, want %v", name, got, want)
-		}
-	}
-	if os.Geteuid() == 0 { // ownership can only be checked when chown is allowed
-		if e := seen["src"]; e.uid != 0 || e.gid != 12001 {
-			t.Errorf("src owner = %d:%d, want 0:12001", e.uid, e.gid)
-		}
-		for _, name := range []string{"", "in", "out", "tmp"} {
-			if e := seen[name]; e.uid != 0 {
-				t.Errorf("%q owner uid = %d, want root", name, e.uid)
+
+	dir := fs.ModeDir
+	check := func(when string, seen map[string]dirEntry, want map[string]fs.FileMode) {
+		t.Helper()
+		for name, mode := range want {
+			if e := seen[name]; !e.ok || e.mode != mode {
+				t.Errorf("%s: mode of %q = %v (exists %v), want %v", when, name, e.mode, e.ok, mode)
 			}
 		}
-		if e := seen["out"]; e.gid != 12003 {
-			t.Errorf("out group = %d, want 12003 (the checker reads the shim's 0640 N.out through it)", e.gid)
+	}
+	check("during the compile", duringCompile, map[string]fs.FileMode{
+		"":       dir | 0o710,
+		"src":    dir | 0o770,
+		"in":     dir | fs.ModeSetgid | 0o750,
+		"out":    dir | fs.ModeSetgid | 0o750,
+		"tmp":    dir | 0o770,
+		"runtmp": dir | 0o770,
+		"source": 0o640,
+	})
+	check("during a run", duringRun, map[string]fs.FileMode{
+		"":       dir | 0o710,
+		"src":    dir | 0o750, // closed: the program, which has the slot group, writes nothing there
+		"in":     dir | fs.ModeSetgid | 0o750,
+		"out":    dir | fs.ModeSetgid | 0o750,
+		"runtmp": dir | 0o770,
+		"source": 0o640,
+	})
+	if duringRun["tmp"].ok {
+		t.Error("the compile's tmp dir still exists when the first run starts")
+	}
+	if compileOutDuringRun {
+		t.Error("compile.out still exists when the first run starts: it is deleted once read")
+	}
+	if os.Geteuid() == 0 { // ownership can only be checked when chown is allowed
+		for when, seen := range map[string]map[string]dirEntry{"compile": duringCompile, "run": duringRun} {
+			for name, e := range seen {
+				if !e.ok {
+					continue
+				}
+				if e.uid != 0 || e.gid != 12100 {
+					t.Errorf("%s: owner of %q = %d:%d, want root:12100 (slot 0)", when, name, e.uid, e.gid)
+				}
+			}
 		}
+	}
+	f.assertJobDirGone("job1")
+}
+
+// The layout belongs to the slot: slot 3's directories are root:12103, and nothing in
+// them carries another slot's group.
+func TestJudgeJobDirGroupFollowsTheSlot(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("chown needs root")
+	}
+	f := newFixture(t)
+	var seen map[string]dirEntry
+	f.fake.Script(gpp, testutil.Step{Inspect: func(sandbox.Spec) {
+		seen = map[string]dirEntry{"runtmp": statEntry(f.runTmp("job1"))}
+		for _, name := range []string{"", "src", "in", "out", "tmp", "src/main.cpp"} {
+			seen[name] = statEntry(filepath.Join(f.jobDir("job1"), name))
+		}
+	}})
+	req := cppRequest(f.bundle(threeCases[:1], ""))
+	req.Slot = 3
+	if _, err := f.judge("job1", req); err != nil {
+		t.Fatalf("Judge: %v", err)
+	}
+	for name, e := range seen {
+		if !e.ok || e.uid != 0 || e.gid != 12103 {
+			t.Errorf("%q = %+v, want root:12103", name, e)
+		}
+	}
+}
+
+// Inline inputs are root:<slot gid> 0640, written into the setgid in/ directory.
+func TestJudgeInlineInputIsGroupReadable(t *testing.T) {
+	f := newFixture(t)
+	var in dirEntry
+	f.fake.Handle(f.exe("job1"), func(s sandbox.Spec) testutil.Step {
+		return testutil.Step{Stdout: []byte("1\n"), Inspect: func(s sandbox.Spec) { in = statEntry(s.Stdin) }}
+	})
+	req := cppRequest(bundle.Inline([]bundle.InlineCase{{Input: []byte("7\n"), Output: []byte("1\n")}}))
+	if _, err := f.judge("job1", req); err != nil {
+		t.Fatalf("Judge: %v", err)
+	}
+	if !in.ok || in.mode != 0o640 {
+		t.Errorf("inline input = %+v, want mode 0640", in)
+	}
+}
+
+// The slot's uid is swept after the compile, after every run, after every checker run and
+// when the job ends, whichever way it ends; another slot's uid never is.
+func TestJudgeSweepsTheSlotsUID(t *testing.T) {
+	const slot = 2
+	const uid = uint32(12100 + slot)
+
+	t.Run("compile, runs, job end", func(t *testing.T) {
+		f := newFixture(t)
+		f.fake.Script(f.exe("job1"), prints("1\n"))
+		req := cppRequest(f.bundle(threeCases, ""))
+		req.Slot = slot
+		if _, err := f.judge("job1", req); err != nil {
+			t.Fatalf("Judge: %v", err)
+		}
+		if want := 1 + 3 + 1; len(f.sweeps) != want {
+			t.Errorf("%d sweeps, want %d (1 compile + 3 runs + job end)", len(f.sweeps), want)
+		}
+		for _, got := range f.sweeps {
+			if got != uid {
+				t.Errorf("swept uid %d, want only the slot's %d", got, uid)
+			}
+		}
+	})
+
+	t.Run("checker compile and checker runs", func(t *testing.T) {
+		f := newFixture(t)
+		spjExe := filepath.Join(f.spjDir("v1"), "spj-v1")
+		f.fake.Script(f.exe("job1"), prints("1\n"))
+		f.fake.Script(spjExe, testutil.Step{})
+		req := cppRequest(f.bundle(threeCases, "v1"))
+		req.Checker = testChecker("v1")
+		req.Slot = slot
+		f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{tmpExe(spjExe, "job1"): []byte("binary")}})
+		if _, err := f.judge("job1", req); err != nil {
+			t.Fatalf("Judge: %v", err)
+		}
+		// user compile + checker compile + 3 runs + 3 checker runs + job end
+		if want := 1 + 1 + 3 + 3 + 1; len(f.sweeps) != want {
+			t.Errorf("%d sweeps, want %d", len(f.sweeps), want)
+		}
+		if n := f.sweepsOf(uid); n != len(f.sweeps) {
+			t.Errorf("%d of %d sweeps were of the slot's uid", n, len(f.sweeps))
+		}
+	})
+
+	t.Run("every sweep runs while the job directories still exist", func(t *testing.T) {
+		f := newFixture(t)
+		f.fake.Script(f.exe("job1"), prints("1\n"))
+		var mu sync.Mutex
+		var dirsAtSweep []bool
+		f.onSweep = func(uint32) {
+			_, jerr := os.Stat(f.jobDir("job1"))
+			_, terr := os.Stat(f.runTmp("job1"))
+			mu.Lock()
+			defer mu.Unlock()
+			dirsAtSweep = append(dirsAtSweep, jerr == nil && terr == nil)
+		}
+		if _, err := f.judge("job1", cppRequest(f.bundle(threeCases[:1], ""))); err != nil {
+			t.Fatalf("Judge: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for i, there := range dirsAtSweep {
+			if !there {
+				t.Errorf("sweep %d ran after the job's directories were removed", i)
+			}
+		}
+	})
+
+	t.Run("compile error", func(t *testing.T) {
+		f := newFixture(t)
+		f.fake.Script(gpp, testutil.Step{Result: sandbox.Result{ExitCode: 1}, Stdout: []byte("boom\n")})
+		req := cppRequest(f.bundle(threeCases, ""))
+		req.Slot = slot
+		out, err := f.judge("job1", req)
+		if err != nil || out.CompileError == "" {
+			t.Fatalf("Judge = %+v, %v, want a compile error", out, err)
+		}
+		if want := 1 + 1; len(f.sweeps) != want { // the compile and the job end
+			t.Errorf("%d sweeps, want %d", len(f.sweeps), want)
+		}
+	})
+
+	t.Run("cancelled job", func(t *testing.T) {
+		f := newFixture(t)
+		exe := f.exe("job1")
+		f.fake.Script(exe, testutil.Step{Block: make(chan struct{})})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var mu sync.Mutex
+		var dirsAtLastSweep bool
+		f.onSweep = func(uint32) {
+			_, jerr := os.Stat(f.jobDir("job1"))
+			_, terr := os.Stat(f.runTmp("job1"))
+			mu.Lock()
+			defer mu.Unlock()
+			dirsAtLastSweep = jerr == nil && terr == nil
+		}
+		req := cppRequest(f.bundle(threeCases, ""))
+		req.Slot = slot
+		done := f.judgeAsync(ctx, "job1", req)
+		waitFor(t, "runs in flight", func() bool { return f.fake.InFlight(exe) > 0 })
+		before := f.sweepsOf(uid)
+		cancel()
+		if j := receive(t, done); !errors.Is(j.err, context.Canceled) {
+			t.Fatalf("Judge error = %v, want context.Canceled", j.err)
+		}
+		if f.sweepsOf(uid) <= before {
+			t.Error("a cancelled job swept nothing after the cancel")
+		}
+		mu.Lock()
+		if !dirsAtLastSweep {
+			t.Error("the last sweep of a cancelled job ran after its directories were removed")
+		}
+		mu.Unlock()
+		f.assertJobDirGone("job1")
+	})
+
+	t.Run("a sweep that fails does not fail the job", func(t *testing.T) {
+		f := newFixture(t)
+		f.deps.Sweep = func(uint32) (int, error) { return 3, errors.New("2 processes of uid still there") }
+		f.fake.Script(f.exe("job1"), prints("1\n"))
+		out, err := f.judge("job1", cppRequest(f.bundle(threeCases[:1], "")))
+		if err != nil || len(out.Cases) != 1 || out.Cases[0].Result != 0 {
+			t.Fatalf("Judge = %+v, %v; a failed sweep is a log line, not a verdict", out, err)
+		}
+	})
+}
+
+// compile.out (and the checker's spj-compile.out) is deleted once the compile has been
+// read, a failed one included: a flood of compiler output must not stay on the work dir.
+func TestJudgeCompileOutputFileIsDeletedOnceRead(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		result sandbox.Result
+		stdout string
+		msg    bool
+	}{
+		{"passing compile", sandbox.Result{}, "warning: x\n", false},
+		{"failing compile", sandbox.Result{ExitCode: 1}, "error: y\n", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.fake.Script(gpp, testutil.Step{Result: tt.result, Stdout: []byte(tt.stdout)})
+			var atJobEnd bool
+			f.onSweep = func(uint32) { atJobEnd = statEntry(filepath.Join(f.jobDir("job1"), "compile.out")).ok }
+			out, err := f.judge("job1", cppRequest(f.bundle(threeCases[:1], "")))
+			if err != nil {
+				t.Fatalf("Judge: %v", err)
+			}
+			if (out.CompileError != "") != tt.msg || (tt.msg && out.CompileError != tt.stdout) {
+				t.Errorf("compile error = %q, want it to be the compiler's output %v", out.CompileError, tt.msg)
+			}
+			if atJobEnd {
+				t.Error("compile.out is still there at job end: it must be deleted as soon as it is read")
+			}
+		})
 	}
 }
 

@@ -60,6 +60,7 @@ func testConfig(t testing.TB, mat *testutil.TLSMaterial) config.Config {
 		AllowedClients:    []string{testutil.WorkerCN},
 		TestCaseDir:       t.TempDir(),
 		WorkDir:           t.TempDir(),
+		TmpDir:            t.TempDir(),
 		MaxJobs:           2,
 		MaxQueue:          4,
 		RunPoolBudget:     1 << 30,

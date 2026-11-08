@@ -44,7 +44,7 @@ func TestPingFields(t *testing.T) {
 
 func TestPingReportsRunningJobs(t *testing.T) {
 	r := startRig(t, rigOptions{maxJobs: 2, maxQueue: 0})
-	release, err := r.adm.Acquire(context.Background())
+	_, release, err := r.adm.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,6 +22,7 @@ func TestLoadDefaults(t *testing.T) {
 		AllowedClients:    []string{"judge-worker", "run-worker"},
 		TestCaseDir:       "/test_case",
 		WorkDir:           "/work",
+		TmpDir:            "/tmp",
 		MaxJobs:           2,
 		MaxQueue:          4,
 		RunPoolBudget:     1073741824,
@@ -42,9 +43,13 @@ func TestLoadParsesBytesAndInts(t *testing.T) {
 	got, err := Load(envOf(map[string]string{
 		"MAX_JOBS":              "3",
 		"RUN_POOL_BUDGET_BYTES": "1000",
+		"TMP_DIR":               "/scratch",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
+	}
+	if got.TmpDir != "/scratch" {
+		t.Errorf("TmpDir = %q, want /scratch", got.TmpDir)
 	}
 	if got.MaxJobs != 3 {
 		t.Errorf("MaxJobs = %d, want 3", got.MaxJobs)

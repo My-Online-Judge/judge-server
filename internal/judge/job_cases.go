@@ -60,7 +60,7 @@ func (j *job) runCase(ctx context.Context, i int, c bundle.Case) (CaseResult, er
 	in := c.InputPath
 	if in == "" { // an inline case
 		in = filepath.Join(j.inDir, n+".in")
-		if err := writeNew(in, c.InputBytes, 0o644); err != nil {
+		if err := writeNewGroup(in, c.InputBytes, 0o640, int(j.gid)); err != nil {
 			return CaseResult{}, fmt.Errorf("write input of case %s: %w", c.Name, err)
 		}
 	}
@@ -154,8 +154,8 @@ func (j *job) runProgram(ctx context.Context, name, in, outPath, errPath string)
 		Argv:            argv,
 		Env:             j.env(r.Lang.Run.Env, false),
 		Dir:             j.srcDir,
-		UID:             uidRun,
-		GID:             uidRun,
+		UID:             j.slotID(),
+		GID:             j.slotID(),
 		Stdin:           in,
 		Stdout:          outPath,
 		Stderr:          errPath,
@@ -167,6 +167,7 @@ func (j *job) runProgram(ctx context.Context, name, in, outPath, errPath string)
 		MaxProcs:        maxProcs,
 		Seccomp:         r.Lang.Run.SeccompRule,
 	})
+	j.sweep("run of case " + name)
 	if err != nil {
 		return sandbox.Result{}, runnerFailure(ctx, "run case "+name, err)
 	}

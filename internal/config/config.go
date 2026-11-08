@@ -7,6 +7,11 @@ import (
 	"strings"
 )
 
+// MaxJobsLimit is the most jobs one sandbox runs at once: each running job has
+// its own run identity (the image's users code0..code7, uids and gids 12100-12107),
+// so there are exactly this many. Validate refuses a larger MAX_JOBS.
+const MaxJobsLimit = 8
+
 // Config holds every setting of the judge-server. Byte fields are int64 and
 // count bytes; MaxJobs and MaxQueue count jobs.
 type Config struct {
@@ -17,6 +22,7 @@ type Config struct {
 
 	TestCaseDir string
 	WorkDir     string
+	TmpDir      string // the tmpfs a run's TMPDIR lives on (<TmpDir>/jobs/<id>), apart from WorkDir
 
 	MaxJobs  int
 	MaxQueue int
@@ -50,6 +56,7 @@ func Load(getenv func(string) string) (Config, error) {
 		AllowedClients: splitList(str("JUDGE_ALLOWED_CLIENTS", "judge-worker,run-worker")),
 		TestCaseDir:    str("TEST_CASE_DIR", "/test_case"),
 		WorkDir:        str("WORK_DIR", "/work"),
+		TmpDir:         str("TMP_DIR", "/tmp"),
 		LogFormat:      str("LOG_FORMAT", "json"),
 	}
 

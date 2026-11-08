@@ -73,7 +73,7 @@ type Spec struct {
 	MaxAddressSpace int64 // RLIMIT_AS; 0 = unlimited
 	MaxStack        int64 // RLIMIT_STACK; must be > 0
 	MaxOutputBytes  int64 // RLIMIT_FSIZE, the most any file the program writes can grow to; must be > 0
-	MaxProcs        int64 // RLIMIT_NPROC, counted over every process of UID (host-wide), not just this run; must be > 0
+	MaxProcs        int64 // RLIMIT_NPROC, counted over every process and thread of UID (host-wide), not just this run: per job slot for a submission; must be > 0
 
 	// Seccomp is the syscall filter: SeccompCCpp ("c_cpp"), SeccompGen
 	// ("general") or "" for none.

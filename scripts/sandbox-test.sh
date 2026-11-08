@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the test image and runs every sandbox-tagged test in it, in a container with exactly the judge-server
 # container's privileges: the six capabilities (CHOWN DAC_OVERRIDE FOWNER SETGID SETUID KILL), no-new-privileges,
-# a read-only root, /work as an exec tmpfs, 1.5 GiB and 2 CPUs. JUDGE_REQUIRE_SANDBOX=1 turns every skip into a
+# a read-only root, /work as an exec tmpfs, /tmp as a 64 MiB tmpfs (where the programs' TMPDIR lives, and what the
+# tmp-fill test fills), 1.5 GiB and 2 CPUs. JUDGE_REQUIRE_SANDBOX=1 turns every skip into a
 # failure. The Java policy of judge-deployment is mounted at /opt/oj/java.policy for TestEngineJavaWithPolicy.
 #
 #   scripts/sandbox-test.sh                       # whole run

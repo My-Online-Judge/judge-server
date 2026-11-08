@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -436,4 +437,48 @@ func TestEachJudgeGetsItsOwnJobID(t *testing.T) {
 		}
 		seen[id] = true
 	}
+}
+
+// The engine runs a job under the uid and gid of the slot the server took for it,
+// so two jobs running at once must be handed different slots, each in [0, MaxJobs).
+func TestConcurrentJudgesGetDifferentSlots(t *testing.T) {
+	const jobs = 3
+	r := startRig(t, rigOptions{maxJobs: jobs, maxQueue: 0})
+	var mu sync.Mutex
+	slots := map[int]bool{}
+	allIn, release := make(chan struct{}), make(chan struct{})
+	r.fake.fn = func(ctx context.Context, _ string, q judge.Request) (judge.Outcome, error) {
+		mu.Lock()
+		if q.Slot < 0 || q.Slot >= jobs || slots[q.Slot] {
+			t.Errorf("job got slot %d while slots %v are in use", q.Slot, slots)
+		}
+		slots[q.Slot] = true
+		if len(slots) == jobs {
+			close(allIn)
+		}
+		mu.Unlock()
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return judge.Outcome{Cases: []judge.CaseResult{{Name: "1"}}}, nil
+	}
+
+	var wg sync.WaitGroup
+	for range jobs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := r.judge(t, validRequest()); err != nil {
+				t.Errorf("Judge: %v", err)
+			}
+		}()
+	}
+	select {
+	case <-allIn:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the three jobs never ran at once")
+	}
+	close(release)
+	wg.Wait()
 }

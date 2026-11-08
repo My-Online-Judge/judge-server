@@ -49,10 +49,15 @@ RUN test -x /usr/bin/gcc && test -x /usr/bin/g++ \
  && test -x /usr/bin/javac && test -x /usr/bin/java \
  && test -x /usr/bin/python && test -x /usr/bin/python2 && test -x /usr/bin/python3 \
  && test -x /usr/bin/go && test -x /usr/bin/node && test -x /usr/bin/php
-# The identities the programs run as (spec 5.1): no login, no home.
+# The identities the programs run as (spec 5.1, 5.1a): no login, no home. compiler, code and spj are the roles
+# (12001-12003); code0..code7 (uids and gids 12100-12107, one per job slot, so config.Validate's MAX_JOBS limit is
+# eight) are what a job's submission runs as: no two running jobs share a uid or a group.
 RUN groupadd -g 12001 compiler && useradd -u 12001 -g 12001 -M -s /usr/sbin/nologin compiler \
  && groupadd -g 12002 code && useradd -u 12002 -g 12002 -M -s /usr/sbin/nologin code \
  && groupadd -g 12003 spj && useradd -u 12003 -g 12003 -M -s /usr/sbin/nologin spj \
+ && for i in 0 1 2 3 4 5 6 7; do \
+      groupadd -g $((12100 + i)) code$i && useradd -u $((12100 + i)) -g $((12100 + i)) -M -s /usr/sbin/nologin code$i; \
+    done \
  && mkdir -p /work /test_case /etc/oj/tls
 COPY --from=builder-go --chmod=0755 /out/judge-server /usr/local/bin/judge-server
 COPY --from=builder-c --chmod=0755 /src/judge-runner /usr/local/bin/judge-runner

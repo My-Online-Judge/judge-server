@@ -24,6 +24,10 @@ func Validate(c Config) error {
 	}
 
 	min1("MAX_JOBS", int64(c.MaxJobs))
+	if c.MaxJobs > MaxJobsLimit {
+		errs = append(errs, fmt.Errorf("MAX_JOBS must be at most %d (one run identity per job, users code0..code%d), got %d",
+			MaxJobsLimit, MaxJobsLimit-1, c.MaxJobs))
+	}
 	if c.MaxQueue < 0 {
 		errs = append(errs, fmt.Errorf("MAX_QUEUE must not be negative, got %d", c.MaxQueue))
 	}
@@ -35,14 +39,22 @@ func Validate(c Config) error {
 	min1("COMPILE_MESSAGE_CAP_BYTES", c.CompileMessageCap)
 	min1("INLINE_INPUT_CAP_BYTES", c.InlineInputCap)
 
-	// Both directories end up inside command lines that are split at spaces.
-	for _, d := range []struct{ env, path string }{{"WORK_DIR", c.WorkDir}, {"TEST_CASE_DIR", c.TestCaseDir}} {
+	// WORK_DIR and TEST_CASE_DIR end up inside command lines that are split at spaces;
+	// TMP_DIR (the run's TMPDIR and its checker's working directory) is held to the
+	// same rule, so no path the server hands a program ever needs quoting.
+	for _, d := range []struct{ env, path string }{{"WORK_DIR", c.WorkDir}, {"TEST_CASE_DIR", c.TestCaseDir}, {"TMP_DIR", c.TmpDir}} {
 		switch {
 		case !filepath.IsAbs(d.path):
 			errs = append(errs, fmt.Errorf("%s must be an absolute path, got %q", d.env, d.path))
 		case strings.ContainsFunc(d.path, unicode.IsSpace):
 			errs = append(errs, fmt.Errorf("%s must not contain whitespace, got %q", d.env, d.path))
 		}
+	}
+
+	// Both hold a jobs/ directory the server wipes and fills; one directory for both
+	// would put a job's directory and its TMPDIR on top of each other.
+	if filepath.IsAbs(c.WorkDir) && filepath.IsAbs(c.TmpDir) && filepath.Clean(c.WorkDir) == filepath.Clean(c.TmpDir) {
+		errs = append(errs, fmt.Errorf("TMP_DIR must not be the same directory as WORK_DIR (%q): both hold a jobs/ directory", c.TmpDir))
 	}
 
 	if len(c.AllowedClients) == 0 {

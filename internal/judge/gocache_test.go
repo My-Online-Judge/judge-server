@@ -117,7 +117,7 @@ func TestWarmRunsGoBuildAsCompiler(t *testing.T) {
 	warm := dir + "-warm" // root-owned sibling: main.go and build.log
 	want := sandbox.Spec{
 		Argv:            []string{gc.goPath, "build", "-o", filepath.Join(dir, ".warm-bin", "hello"), filepath.Join(warm, "main.go")},
-		Env:             []string{"GOCACHE=" + dir, "GOPATH=" + dir + "/.gopath", "HOME=" + dir + "/.home", "PATH=/usr/local/bin:/usr/bin:/bin"},
+		Env:             []string{"GOCACHE=" + dir, "GOPATH=" + dir + "/.gopath", "HOME=" + dir + "/.home", "TMPDIR=" + dir + "/.home", "PATH=/usr/local/bin:/usr/bin:/bin"},
 		Dir:             warm,
 		UID:             testCompilerUID,
 		GID:             testCompilerGID,
