@@ -362,10 +362,26 @@ int main(int argc, char **argv)
         /* read another process's limit: pid 1 is not the caller */
         struct rlimit old;
         r = syscall(SYS_prlimit64, 1, RLIMIT_CPU, NULL, &old);
-    } else if (!strcmp(what, "prlimit_set")) {
-        /* set a limit, even the caller's own: a new_limit is not allowed */
+    } else if (!strcmp(what, "prlimit_other_set")) {
+        /* set a limit of another process: pid 1 is not the caller */
         struct rlimit lim = { 0, 0 };
-        r = syscall(SYS_prlimit64, 0, RLIMIT_CORE, &lim, NULL);
+        r = syscall(SYS_prlimit64, 1, RLIMIT_CORE, &lim, NULL);
+    } else if (!strcmp(what, "setrlimit_lower")) {
+        /* the program's own setrlimit, as a C++ contest solution does for the stack */
+        struct rlimit lim;
+        if (getrlimit(RLIMIT_STACK, &lim) != 0) return 1;
+        lim.rlim_cur = lim.rlim_max = lim.rlim_cur / 2;
+        if (setrlimit(RLIMIT_STACK, &lim) != 0) return 1;
+        if (getrlimit(RLIMIT_STACK, &lim) != 0) return 1;
+        printf("%llu\n", (unsigned long long)lim.rlim_cur);
+        return 0;
+    } else if (!strcmp(what, "setrlimit_raise")) {
+        /* raising the hard limit needs CAP_SYS_RESOURCE, which the program does not have */
+        struct rlimit lim;
+        if (getrlimit(RLIMIT_STACK, &lim) != 0) return 1;
+        lim.rlim_max = RLIM_INFINITY;
+        printf("%d\n", setrlimit(RLIMIT_STACK, &lim));
+        return 0;
     } else if (!strcmp(what, "getrlimit")) {
         struct rlimit lim;
         if (getrlimit(RLIMIT_STACK, &lim) != 0) return 1;
@@ -870,7 +886,7 @@ func TestRunSeccompDenyTable(t *testing.T) {
 	denied := []string{
 		"socket", "fork", "clone3", "creat", "openat2", "ptrace", "kill", "tgkill_other", "exec_other",
 		"io_uring_setup", "io_uring_enter", "io_uring_register", "unshare", "setns", "userfaultfd", "bpf",
-		"prlimit_other", "prlimit_set",
+		"prlimit_other", "prlimit_other_set",
 	}
 	for _, what := range denied {
 		t.Run(what, func(t *testing.T) {
@@ -1123,18 +1139,28 @@ func TestRunStreamSymlinksAreNotFollowed(t *testing.T) {
 	}
 }
 
-// getrlimit is prlimit64(0, res, NULL, &old); naming another process or passing a new limit is not.
-func TestRunPrlimitOnlyReadsOwnLimits(t *testing.T) {
+// getrlimit and setrlimit are prlimit64(0, ...): the caller's own limits. Naming any other
+// process is not allowed (TestRunSeccompDenyTable/prlimit_other*).
+func TestRunPrlimitOnOwnLimitsIsAllowed(t *testing.T) {
 	needRoot(t)
 	dir := newDir(t)
 	for _, rule := range []string{SeccompGen, SeccompCCpp} {
-		s := execSpec(dir, probe(t), rule, "getrlimit")
-		res := run(t, s)
-		if res.Signal != 0 || res.ExitCode != 0 || res.Error != 0 {
-			t.Fatalf("getrlimit under %s: %+v", rule, res)
-		}
-		if got := readFile(t, s.Stdout); got != fmt.Sprint(64<<20)+"\n" {
-			t.Fatalf("getrlimit under %s printed %q, want the 64 MiB stack limit", rule, got)
+		for _, c := range []struct{ probe, want string }{
+			{"getrlimit", fmt.Sprint(64<<20) + "\n"},
+			// lowering a limit of its own works: a C++ solution may setrlimit(RLIMIT_STACK)
+			{"setrlimit_lower", fmt.Sprint(32<<20) + "\n"},
+			// raising the hard limit still fails (no CAP_SYS_RESOURCE): the call is let through
+			// to the kernel, which refuses it
+			{"setrlimit_raise", "-1\n"},
+		} {
+			s := execSpec(dir, probe(t), rule, c.probe)
+			res := run(t, s)
+			if res.Signal != 0 || res.ExitCode != 0 || res.Error != 0 {
+				t.Fatalf("%s under %s: %+v", c.probe, rule, res)
+			}
+			if got := readFile(t, s.Stdout); got != c.want {
+				t.Fatalf("%s under %s printed %q, want %q", c.probe, rule, got, c.want)
+			}
 		}
 	}
 }

@@ -247,9 +247,10 @@ static int add_simple(scmp_filter_ctx ctx, uint32_t action, const char *name)
 }
 
 /* prlimit64 reads or sets the limits of any process of the same uid, including
- * other cases running concurrently. Only prlimit64(0, res, NULL, &old) is allowed,
- * which is what glibc's getrlimit and its start-up do: the caller itself (arg0 == 0)
- * and no new limit (arg2 == NULL). Anything else is killed. */
+ * other cases running concurrently. Only the caller itself (arg0 == 0, which is
+ * what glibc's getrlimit and setrlimit pass) is allowed; any other pid is killed.
+ * The new limit is not looked at: every limit was set with soft == hard by this shim
+ * and the program has no CAP_SYS_RESOURCE, so a program can only lower its own. */
 static int add_prlimit_rules(scmp_filter_ctx ctx, int allow_list)
 {
     int nr = resolve("prlimit64");
@@ -257,11 +258,8 @@ static int add_prlimit_rules(scmp_filter_ctx ctx, int allow_list)
     if (nr == __NR_SCMP_ERROR)
         return allow_list ? 0 : -1;
     if (allow_list)
-        return seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 2,
-                                SCMP_CMP(0, SCMP_CMP_EQ, 0), SCMP_CMP(2, SCMP_CMP_EQ, 0));
-    if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1, SCMP_CMP(0, SCMP_CMP_NE, 0)) != 0)
-        return -1;
-    return seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1, SCMP_CMP(2, SCMP_CMP_NE, 0));
+        return seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 1, SCMP_CMP(0, SCMP_CMP_EQ, 0));
+    return seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1, SCMP_CMP(0, SCMP_CMP_NE, 0));
 }
 
 /* The one execve the program may do, to its own executable: the pointer is

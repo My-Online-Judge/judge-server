@@ -58,7 +58,7 @@ run of the tagged tests on an x86_64 host is the first real check.
 |---|---|
 | `mremap` | `realloc` of a block above the mmap threshold (128 KiB) calls it; a C program that grows an array by doubling dies without it. `strace` of the doubling loop shows 8 calls. |
 | `readlinkat` | what glibc uses where `readlink` does not exist (aarch64), and in static programs. Read-only. |
-| `prlimit64` only when `arg0 == 0` and `arg2 == 0` | upstream allows it unconditionally, which lets a program read or shrink the `RLIMIT_CPU`/`AS`/`FSIZE` of another process of the same uid (the concurrent cases). `prlimit64(0, res, NULL, &old)`, the self-and-read-only form, is what glibc's `getrlimit` and start-up use, so this still works. The cost: a program's own `setrlimit` (for example Python's `resource.setrlimit`) is killed too. `TestRunPrlimitOnlyReadsOwnLimits`, `TestRunSeccompDenyTable/prlimit_*`. |
+| `prlimit64` only when `arg0 == 0` | upstream allows it unconditionally, which lets a program read or shrink the `RLIMIT_CPU`/`AS`/`FSIZE` of another process of the same uid (the concurrent cases). `arg0 == 0` is the caller itself, which is what glibc's `getrlimit` and `setrlimit` pass, so both keep working, including a C++ solution's `setrlimit(RLIMIT_STACK, ...)`. The new limit is not checked: the shim sets soft = hard for every limit and the program has no `CAP_SYS_RESOURCE`, so it can only lower its own limits (the kernel refuses a raise, `setrlimit_raise` in the tests). `TestRunPrlimitOnOwnLimitsIsAllowed`, `TestRunSeccompDenyTable/prlimit_other*`. |
 | `ioctl` only when `arg1 == TCGETS` | glibc calls `ioctl(fd, TCGETS)` to decide on line buffering when a stream is a character device, which `/dev/null` (the default for a stream with no path) is. `TCGETS` only reads the terminal attributes. Without it a program with stdin or stdout on `/dev/null` dies on its first `getchar` or `puts`. `TestRunDevNullStreamsUnderCCpp`. |
 
 Not added although a program may use it: `uname` (static glibc start-up only), `getpid`/`gettid`, `rt_sigaction`/
@@ -88,7 +88,7 @@ upstream already denies, and none is used by `python3 -c 'print(1)'` or by ordin
 | `openat2` | its flags are inside a struct, so the `O_WRONLY|O_RDWR` check cannot see them. |
 | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | io_uring can open files (`IORING_OP_OPENAT`) and create sockets (`IORING_OP_SOCKET`) without ever making the calls denied above, bypassing both the `socket` kill and the write-flag check. |
 | `unshare`, `setns`, `userfaultfd`, `bpf` | defense in depth: kernel attack surface (namespaces, page-fault handling, eBPF) that no program needs. |
-| `prlimit64` unless `arg0 == 0` and `arg2 == 0` | same as under `c_cpp`: only the caller's own limits, only to read them. |
+| `prlimit64` unless `arg0 == 0` | same as under `c_cpp`: only the caller's own limits. |
 
 `TestRunSeccompDenyTable` runs each of these as a probe program: with no seccomp the probe must not be stopped (the
 control), under `general` and `c_cpp` it must die with `SIGSYS`. The io_uring probes skip only when the C library
