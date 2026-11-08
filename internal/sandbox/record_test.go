@@ -6,17 +6,17 @@ import (
 )
 
 func TestParseRecord(t *testing.T) {
-	got, ok := parseRecord([]byte("0 0 1500 500 2048 123456789\n"))
-	want := record{status: 0, utimeUs: 1500, stimeUs: 500, maxRSSKB: 2048, wallNs: 123456789}
+	got, ok := parseRecord([]byte("0 0 1500 2048 123456789\n"))
+	want := record{status: 0, utimeUs: 1500, maxRSSKB: 2048, wallNs: 123456789}
 	if !ok || got != want {
 		t.Fatalf("parseRecord = %+v, %v; want %+v", got, ok, want)
 	}
-	got, ok = parseRecord([]byte("-9 0 0 0 0 0\n"))
+	got, ok = parseRecord([]byte("-9 0 0 0 0\n"))
 	if !ok || got.err != -9 {
 		t.Fatalf("parseRecord(error line) = %+v, %v", got, ok)
 	}
 	for _, bad := range []string{
-		"", "\n", "0 0 1 2 3 4", "0 0 1 2 3\n", "0 0 1 2 3 4 5\n", "0 0 1 2 3 x\n", "0 0 1 2 3 4\n0 0 1 2 3 4\n", "9999999999999999999 0 0 0 0 0\n",
+		"", "\n", "0 0 1 2 3", "0 0 1 2\n", "0 0 1 2 3 4\n", "0 0 1 2 x\n", "0 0 1 2 3\n0 0 1 2 3\n", "9999999999999999999 0 0 0 0\n",
 	} {
 		if r, ok := parseRecord([]byte(bad)); ok {
 			t.Errorf("parseRecord(%q) = %+v, want not ok", bad, r)
@@ -31,8 +31,9 @@ func TestRecordResult(t *testing.T) {
 		rec  record
 		want Result
 	}{
-		{"clean exit", record{status: 0, utimeUs: 400, stimeUs: 100, maxRSSKB: 1024, wallNs: 2_400_000},
+		{"clean exit", record{status: 0, utimeUs: 500, maxRSSKB: 1024, wallNs: 2_400_000},
 			Result{CPUTimeMs: 1, RealTimeMs: 2, MemoryBytes: 1 << 20}},
+		{"user time under half a millisecond rounds down", record{status: 0, utimeUs: 499}, Result{}},
 		{"exit code", record{status: 3 << 8}, Result{ExitCode: 3}},
 		{"killed by signal", record{status: int(syscall.SIGSEGV)}, Result{Signal: int(syscall.SIGSEGV)}},
 		{"core dumped", record{status: int(syscall.SIGABRT) | 0x80}, Result{Signal: int(syscall.SIGABRT)}},

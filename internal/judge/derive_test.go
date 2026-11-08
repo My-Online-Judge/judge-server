@@ -38,26 +38,30 @@ func TestDerive(t *testing.T) {
 		{"real over", sandbox.Result{CPUTimeMs: 10, RealTimeMs: 3001}, 2},
 		{"real at the limit", sandbox.Result{RealTimeMs: 3000}, 0},
 
-		// a later rule overrides an earlier one: real TLE > CPU TLE > MLE > RE > AC
-		{"exit code and memory over", sandbox.Result{ExitCode: 1, MemoryBytes: memOver}, 3},
-		{"exit code and cpu over", sandbox.Result{ExitCode: 1, CPUTimeMs: 1500}, 1},
-		{"exit code and real over", sandbox.Result{ExitCode: 1, RealTimeMs: 3500}, 2},
+		// a later assignment overrides an earlier one: CPU TLE > real TLE > MLE > RE > AC
+		{"exit 1 and memory over", sandbox.Result{ExitCode: 1, MemoryBytes: memOver}, 3},
+		{"exit 1 and cpu over", sandbox.Result{ExitCode: 1, CPUTimeMs: 1500}, 1},
+		{"exit 1 and real over only", sandbox.Result{ExitCode: 1, CPUTimeMs: 10, RealTimeMs: 3500}, 2},
 		{"other signal and memory over", sandbox.Result{Signal: abrt, MemoryBytes: memOver}, 3},
-		{"memory over and cpu over", sandbox.Result{MemoryBytes: memOver, CPUTimeMs: 1500}, 1},
 		{"memory over and real over", sandbox.Result{MemoryBytes: memOver, RealTimeMs: 3500}, 2},
-		{"cpu over and real over", sandbox.Result{CPUTimeMs: 1500, RealTimeMs: 3500}, 2},
-		{"exit code, memory, cpu and real over", sandbox.Result{ExitCode: 1, MemoryBytes: memOver, CPUTimeMs: 1500, RealTimeMs: 3500}, 2},
+		{"memory over and cpu over", sandbox.Result{MemoryBytes: memOver, CPUTimeMs: 1500}, 1},
+		{"cpu over and real over: CPU wins", sandbox.Result{CPUTimeMs: 1500, RealTimeMs: 3500}, 1},
+		{"exit 1, memory, real and cpu over", sandbox.Result{ExitCode: 1, MemoryBytes: memOver, CPUTimeMs: 1500, RealTimeMs: 3500}, 1},
 
 		// the timer kills a program that outlives max_real_time with SIGKILL
 		{"SIGKILL and real over", sandbox.Result{Signal: kill, CPUTimeMs: 10, RealTimeMs: 3001}, 2},
-		{"SIGKILL, cpu over and real over", sandbox.Result{Signal: kill, CPUTimeMs: 1500, RealTimeMs: 3001}, 2},
+		{"SIGKILL, cpu over and real over: CPU wins", sandbox.Result{Signal: kill, CPUTimeMs: 1500, RealTimeMs: 3001}, 1},
 		{"SIGKILL and cpu over", sandbox.Result{Signal: kill, CPUTimeMs: 1500, RealTimeMs: 1600}, 1},
 
 		// RLIMIT_CPU delivers SIGXCPU
 		{"SIGXCPU and cpu over", sandbox.Result{Signal: xcpu, CPUTimeMs: 1001}, 1},
 
-		// SIGSEGV is MLE only with memory over, and an overrun still overrides it
-		{"SIGSEGV and cpu over", sandbox.Result{Signal: segv, CPUTimeMs: 1500}, 1},
+		// SIGSEGV is exclusive: memory over is MLE, otherwise RE, and no time check follows
+		{"SIGSEGV, memory over, cpu and real over", sandbox.Result{Signal: segv, MemoryBytes: memOver, CPUTimeMs: 1500, RealTimeMs: 3500}, 3},
+		{"SIGSEGV, memory under, cpu and real over", sandbox.Result{Signal: segv, MemoryBytes: 1 << 20, CPUTimeMs: 1500, RealTimeMs: 3500}, 4},
+		{"SIGSEGV and cpu over only", sandbox.Result{Signal: segv, CPUTimeMs: 1500}, 4},
+		{"SIGSEGV and real over only", sandbox.Result{Signal: segv, RealTimeMs: 3500}, 4},
+		{"SIGSEGV with a non-zero exit code", sandbox.Result{Signal: segv, ExitCode: 1, MemoryBytes: 1 << 20}, 4},
 
 		// error beats everything
 		{"judger error with everything over", sandbox.Result{Error: -10, ExitCode: 1, Signal: segv, MemoryBytes: memOver, CPUTimeMs: 9999, RealTimeMs: 9999}, 5},

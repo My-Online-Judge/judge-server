@@ -26,26 +26,30 @@ type Limits struct {
 	MaxMemoryBytes              int64
 }
 
-// Derive turns the raw outcome of a run into a result code the way qduoj's
-// Judger does (spec section 5.4). It assigns the result in a fixed sequence
-// without "else", so a later assignment overrides an earlier one.
+// Derive turns the raw outcome of a run into a result code in the order of
+// qduoj's Judger, src/runner.c (spec section 5.4). It assigns the result in a
+// fixed sequence without "else" between the later checks, so a later
+// assignment overrides an earlier one.
 //
 // A judger error (r.Error != 0) returns 5 at once and nothing else is looked at.
-// Otherwise the result starts at 0 and these steps run in order, each one
-// overwriting the current value when its condition holds:
+// Otherwise the result starts at 0 and these steps run in order:
 //
-//  1. exit code != 0                        -> 4 runtime error
-//  2. signal is SIGSEGV                     -> 3 if memory > max memory, else 4
-//  3. any other signal != 0                 -> 4 runtime error
-//  4. memory > max memory                   -> 3 memory limit
-//  5. cpu time > max cpu time               -> 1 CPU time limit
-//  6. real time > max real time             -> 2 real time limit
+//  1. exit code != 0                    -> 4 runtime error
+//  2. signal is SIGSEGV                 -> 3 if memory > max memory, else 4,
+//     and return: no time check follows
+//  3. otherwise, each overwriting the current value when it holds:
+//     a. signal != 0                    -> 4 runtime error
+//     b. memory > max memory            -> 3 memory limit
+//     c. real time > max real time      -> 2 real time limit
+//     d. cpu time > max cpu time        -> 1 CPU time limit
 //
-// So the effective precedence is real TLE > CPU TLE > MLE > RE > AC. A signal is
-// never special beyond steps 2 and 3: SIGKILL (the sandbox timer's kill at
-// max_real_time) and SIGXCPU (RLIMIT_CPU) are runtime errors until the time
-// checks turn them into the time limit they are, and a run that merely used
-// too much memory or time before exiting non-zero is reported as that overrun.
+// So for a run that did not die of SIGSEGV the effective precedence is
+// CPU TLE > real TLE > MLE > RE > AC, and a SIGSEGV run is only ever MLE or RE:
+// a segfault is never a time-limit verdict. A signal is not special beyond
+// steps 2 and 3a: SIGKILL (the sandbox timer's kill at max_real_time) and
+// SIGXCPU (RLIMIT_CPU) are runtime errors until the time checks turn them into
+// the limit they are, a run that tripped both clocks reads as CPU TLE, and a run
+// that exited non-zero after overrunning is reported as that overrun.
 func Derive(r sandbox.Result, l Limits) int32 {
 	if r.Error != 0 {
 		return codeSystem
@@ -57,21 +61,22 @@ func Derive(r sandbox.Result, l Limits) int32 {
 		result = codeRuntime
 	}
 	if r.Signal == sigSegv {
-		result = codeRuntime
 		if memOver {
-			result = codeMemory
+			return codeMemory
 		}
-	} else if r.Signal != 0 {
+		return codeRuntime
+	}
+	if r.Signal != 0 {
 		result = codeRuntime
 	}
 	if memOver {
 		result = codeMemory
 	}
-	if r.CPUTimeMs > l.MaxCPUTimeMs {
-		result = codeCPUTime
-	}
 	if r.RealTimeMs > l.MaxRealTimeMs {
 		result = codeRealTime
+	}
+	if r.CPUTimeMs > l.MaxCPUTimeMs {
+		result = codeCPUTime
 	}
 	return result
 }

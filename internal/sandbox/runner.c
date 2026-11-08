@@ -36,7 +36,10 @@
  * The runner reports to the server on fd 3 (a pipe the server created) with one
  * line, written once, when the program is over or could not start:
  *
- *   <error> <wait status> <utime us> <stime us> <maxrss KB> <wall ns>\n
+ *   <error> <wait status> <utime us> <maxrss KB> <wall ns>\n
+ *
+ * The CPU time is the program's user time only (ru_utime), as qduoj's Judger measures
+ * it: system time is not reported, so it does not count against max_cpu_time.
  *
  * The line is parsed in record.go. If the runner is killed first (the server's
  * real-time limit kills the whole process group), nothing is written.
@@ -518,8 +521,8 @@ static long long timeval_us(const struct timeval *tv)
 static void report(int err, int status, const struct rusage *ru, long long wall_ns)
 {
     char buf[160];
-    int n = snprintf(buf, sizeof(buf), "%d %d %lld %lld %lld %lld\n", err, status,
-                     ru ? timeval_us(&ru->ru_utime) : 0LL, ru ? timeval_us(&ru->ru_stime) : 0LL,
+    int n = snprintf(buf, sizeof(buf), "%d %d %lld %lld %lld\n", err, status,
+                     ru ? timeval_us(&ru->ru_utime) : 0LL,
                      ru ? (long long)ru->ru_maxrss : 0LL, wall_ns);
     ssize_t w;
 
