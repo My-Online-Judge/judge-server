@@ -49,7 +49,7 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 	if err != nil {
 		return err
 	}
-	if err := prepareWorkDir(cfg.WorkDir); err != nil {
+	if err := PrepareWorkDir(cfg.WorkDir); err != nil {
 		return err
 	}
 
@@ -80,13 +80,16 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 	return RunGRPC(ctx, gs, lis, shutdownGrace)
 }
 
-// prepareWorkDir makes workDir what the engine expects and wipes what a crashed
+// PrepareWorkDir makes workDir what the engine expects and wipes what a crashed
 // run left behind. The root must be writable by root alone (the run users could
 // otherwise swap the directories under it), so it gets mode 0755. jobs/ (0711:
 // the run users pass through it to their job dir but cannot list it) and spj/
 // (0755) are deleted and recreated empty: a stale job directory is dead state and
 // a half-built checker must never be reused. The Go build cache is kept.
-func prepareWorkDir(workDir string) error {
+//
+// It is exported so the sandbox-tagged engine tests (internal/judge) prepare their
+// work directory exactly as Serve does instead of copying these steps.
+func PrepareWorkDir(workDir string) error {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return fmt.Errorf("create work dir: %w", err)
 	}

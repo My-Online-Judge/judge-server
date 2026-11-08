@@ -69,8 +69,9 @@ error.
 ## `general`: deny-list (everything else is allowed)
 
 Upstream `general.c`: `clone fork vfork kill execveat` killed; `socket` is answered with `EACCES` upstream (its comment
-says the opposite; the controller's rule for this port is to kill, so `socket` is in the kill list here); `execve`
-killed when `arg0 != exe`; `open`/`openat` killed when `flags & O_WRONLY` or `flags & O_RDWR`.
+says the opposite; the controller's rule for this port is to kill, so a network `socket` is killed here, with the one
+exception in the table below); `execve` killed when `arg0 != exe`; `open`/`openat` killed when `flags & O_WRONLY` or
+`flags & O_RDWR`.
 
 ### Additions in this port
 
@@ -90,12 +91,25 @@ upstream already denies, and none is used by `python3 -c 'print(1)'` or by ordin
 | `unshare`, `setns`, `userfaultfd`, `bpf` | defense in depth: kernel attack surface (namespaces, page-fault handling, eBPF) that no program needs. |
 | `prlimit64` unless `arg0 == 0` | same as under `c_cpp`: only the caller's own limits. |
 
+**An exception to the `socket` kill (found by Task 13's run of the real corpus on Ubuntu 22.04).** `socket(AF_UNIX, ...)` is
+answered with `EACCES` instead of killing, as upstream does for every socket; any other `arg0` (AF_INET, AF_INET6,
+AF_NETLINK, AF_PACKET, ...) is still `SIGSYS`. The two rules (`NE AF_UNIX` kill, `EQ AF_UNIX` EACCES) split the whole
+64-bit `arg0`, so an AF_UNIX with a high bit set, which the kernel would truncate to AF_UNIX, is killed (`socket_wide`
+in `TestRunSeccompDenyTable`). Reason: glibc's NSS tries the nscd socket (`socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|
+SOCK_NONBLOCK)`) before it reads `/etc/passwd`, so any `getpwuid()` under a plain kill ends the program with `SIGSYS`;
+Python 3.10 makes that call at start-up whenever `HOME` is unset (it looks up the user site-packages directory), and the
+run environment has no `HOME` (Task 9: only a compile gets one). With the kill, every Python 3 program was a runtime
+error before its first line. No socket is created, so there is nothing to connect with: no capability is added.
+`TestRunGeneralAnswersAFUnixSocketWithEACCES`, `TestRunGeneralGetpwuidFallsBackToPasswdFile`, and the python rows of
+the engine corpus (`internal/judge/engine_sandbox_test.go`). Setting `HOME` in the run environment would avoid the
+lookup too, but a test of Task 9 pins "a run has no HOME", so the filter was changed instead; either is enough.
+
 `TestRunSeccompDenyTable` runs each of these as a probe program: with no seccomp the probe must not be stopped (the
 control), under `general` and `c_cpp` it must die with `SIGSYS`. The io_uring probes skip only when the C library
 headers do not define the syscall number; the filter kills on the number whether or not the kernel has io_uring
 (Docker's default profile answers `EPERM` to it, which the control run shows is not a signal).
 
-Left allowed on purpose: `socketpair` and `AF_UNIX` use (no network), `prctl`, `mmap` with `PROT_EXEC`, `fcntl`,
+Left allowed on purpose: `socketpair` (and an AF_UNIX socket made that way; `socket(AF_UNIX)` itself is answered with EACCES, above), `prctl`, `mmap` with `PROT_EXEC`, `fcntl`,
 and signals to oneself.
 
 ## What the shim does around the filters
@@ -132,8 +146,19 @@ above, `perf_event_open`, `bpf`, `keyctl`, `mount`, ...), but runs as an unprivi
 the container's own default Docker seccomp profile underneath. Neither filter limits `unlink`, `rename`, `mkdir`,
 `chmod` or `truncate`: file permissions of the job directory do.
 
+## Ubuntu 22.04 (Task 13): the real image
+
+The filters were tuned on Debian bookworm (glibc 2.36) in Task 6; Task 13 runs them in the shipped image, Ubuntu 22.04
+(glibc 2.35, libseccomp 2.5.3), with `scripts/sandbox-test.sh`: the whole `internal/sandbox` suite passes there with no
+skip (aarch64 kernel 7.0 under Docker Desktop; x86_64 is not checked on this machine, see the README), and the eight
+languages of `testdata/corpus` judge as expected. The only change the real programs needed is the `AF_UNIX` exception
+above. The `c_cpp` allow-list needed nothing beyond the table already in this file: C and C++ (iostream, a 192 MiB
+`malloc`, a 1 GiB output flood, a futex wait) run under it as they are. `nanosleep` and `clock_nanosleep` are still not
+in it, so the corpus waits (`testdata/corpus/cpp/rtle.cpp`) with a timed `futex`.
+
 ## Reproducing
 
+`scripts/sandbox-test.sh` builds the image and runs everything the way the server runs (it is what Task 13 used).
 `scripts/sandbox-test-dev.sh` builds a throwaway image (Ubuntu 22.04, or `BASE=golang:1.23` for bookworm), compiles the
 shim and runs the `sandbox`-tagged tests under the container's six capabilities. To see what a program calls:
 

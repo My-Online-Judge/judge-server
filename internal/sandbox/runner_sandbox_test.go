@@ -8,8 +8,10 @@ package sandbox
 // process with CHOWN DAC_OVERRIDE FOWNER SETGID SETUID KILL. Fixtures are built
 // at run time into a directory under /work (a tmpfs mounted exec) when there is
 // one. Each test skips with a reason when a prerequisite is missing, so the
-// package is harmless on a plain `go test ./...`. scripts/sandbox-test-dev.sh
-// builds such a container for development.
+// package is harmless on a plain `go test ./...`. With JUDGE_REQUIRE_SANDBOX=1
+// (scripts/sandbox-test.sh sets it) a missing prerequisite fails the test instead:
+// the image run must prove every test ran. scripts/sandbox-test-dev.sh builds a
+// throwaway container for development.
 
 import (
 	"context"
@@ -52,6 +54,17 @@ func TestMain(m *testing.M) {
 
 // ---- prerequisites ----
 
+// skipOrFail ends the test for a missing prerequisite: a skip normally, a failure
+// when JUDGE_REQUIRE_SANDBOX=1, so that a run which must exercise the real
+// sandbox cannot pass by skipping.
+func skipOrFail(t testing.TB, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("JUDGE_REQUIRE_SANDBOX") == "1" {
+		t.Fatalf("JUDGE_REQUIRE_SANDBOX=1 but a prerequisite is missing: "+format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
 // runnerBinary is the shim under test: $JUDGE_RUNNER, else DefaultRunnerPath.
 func runnerBinary() string {
 	if p := os.Getenv("JUDGE_RUNNER"); p != "" {
@@ -64,7 +77,7 @@ func runnerPath(t *testing.T) string {
 	t.Helper()
 	p := runnerBinary()
 	if _, err := os.Stat(p); err != nil {
-		t.Skipf("runner shim not available at %s (build runner.c, or set JUDGE_RUNNER): %v", p, err)
+		skipOrFail(t, "runner shim not available at %s (build runner.c, or set JUDGE_RUNNER): %v", p, err)
 	}
 	return p
 }
@@ -72,14 +85,14 @@ func runnerPath(t *testing.T) string {
 func needRoot(t *testing.T) {
 	t.Helper()
 	if os.Geteuid() != 0 {
-		t.Skip("needs root: the shim switches to uid 12001/12002 with setuid")
+		skipOrFail(t, "needs root: the shim switches to uid 12001/12002 with setuid")
 	}
 }
 
 func needTool(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); err != nil {
-		t.Skipf("%s not installed: %v", path, err)
+		skipOrFail(t, "%s not installed: %v", path, err)
 	}
 }
 
@@ -203,7 +216,7 @@ func probe(t *testing.T) string {
 		probeExe, probeError = buildProbe(dir)
 	})
 	if probeSkip != "" {
-		t.Skipf("probe program not built: %s", probeSkip)
+		skipOrFail(t, "probe program not built: %s", probeSkip)
 	}
 	if probeError != "" {
 		t.Fatalf("probe program does not build: %s", probeError)
@@ -239,6 +252,7 @@ const probeSource = `
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -256,6 +270,19 @@ int main(int argc, char **argv)
 
     if (!strcmp(what, "socket")) {
         r = socket(AF_INET, SOCK_STREAM, 0);
+    } else if (!strcmp(what, "socket_wide")) {
+        /* AF_UNIX with a high bit set: the kernel truncates the family to an int and creates a
+         * unix socket, so the filter must not mistake it for the AF_UNIX it answers with EACCES */
+        r = syscall(SYS_socket, (1L << 32) | AF_UNIX, SOCK_STREAM, 0);
+    } else if (!strcmp(what, "socket_unix")) {
+        /* what glibc's NSS does first for getpwuid(): the nscd socket */
+        r = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        printf("%ld %d\n", r, r < 0 ? errno : 0);
+        return 0;
+    } else if (!strcmp(what, "getpwuid")) {
+        struct passwd *pw = getpwuid(getuid());
+        printf("%s\n", pw ? pw->pw_name : "(null)");
+        return 0;
     } else if (!strcmp(what, "fork")) {
         pid_t p = fork();
         if (p == 0) _exit(0);
@@ -946,7 +973,7 @@ func TestRunSeccompDenyTable(t *testing.T) {
 	// probe must not be stopped (the control run), proving the probe does what
 	// it claims.
 	denied := []string{
-		"socket", "fork", "clone3", "creat", "openat2", "ptrace", "kill", "tgkill_other", "exec_other",
+		"socket", "socket_wide", "fork", "clone3", "creat", "openat2", "ptrace", "kill", "tgkill_other", "exec_other",
 		"io_uring_setup", "io_uring_enter", "io_uring_register", "unshare", "setns", "userfaultfd", "bpf",
 		"prlimit_other", "prlimit_other_set",
 	}
@@ -959,7 +986,11 @@ func TestRunSeccompDenyTable(t *testing.T) {
 				t.Fatalf("control run (no seccomp) was stopped: %+v", control)
 			}
 			if control.ExitCode == 77 {
-				t.Skipf("%s does not exist on %s", what, runtime.GOARCH)
+				// Not a missing prerequisite: the architecture has no such syscall (creat on
+				// aarch64), so there is nothing to deny. Passing, with the reason in the log,
+				// keeps a JUDGE_REQUIRE_SANDBOX=1 run at zero skips.
+				t.Logf("%s does not exist on %s: nothing to deny, not applicable", what, runtime.GOARCH)
+				return
 			}
 			for _, rule := range []string{SeccompGen, SeccompCCpp} {
 				res := run(t, execSpec(dir, exe, rule, what))
@@ -985,6 +1016,52 @@ func TestRunSeccompGeneralAllowsOwnSignalsAndReadOnlyOpen(t *testing.T) {
 		if res := run(t, execSpec(dir, exe, rule, "open_r")); res.Signal != 0 || res.ExitCode != 0 || res.Error != 0 {
 			t.Errorf("read-only open under %s: %+v", rule, res)
 		}
+	}
+}
+
+// A network socket kills the program under general, but AF_UNIX is answered with EACCES: that is how
+// glibc's NSS falls back from the nscd socket to /etc/passwd, which Python 3.10 triggers at start-up
+// (getpwuid, with HOME unset). Nothing is created: the control run, with no filter, gets a descriptor.
+func TestRunGeneralAnswersAFUnixSocketWithEACCES(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	exe := probe(t)
+
+	cs := execSpec(dir, exe, SeccompNone, "socket_unix")
+	control := run(t, cs)
+	var fd, errno int
+	if _, err := fmt.Sscanf(readFile(t, cs.Stdout), "%d %d", &fd, &errno); err != nil || fd < 0 || control.Signal != 0 || control.Error != 0 {
+		t.Fatalf("control run (no seccomp) must create the socket: %+v, printed %q (%v)", control, readFile(t, cs.Stdout), err)
+	}
+
+	s := execSpec(dir, exe, SeccompGen, "socket_unix")
+	res := run(t, s)
+	if res.Signal != 0 || res.Error != 0 || res.ExitCode != 0 {
+		t.Fatalf("socket(AF_UNIX) under general: %+v, want an answer, not a kill", res)
+	}
+	if out, want := readFile(t, s.Stdout), fmt.Sprintf("-1 %d\n", int(syscall.EACCES)); out != want {
+		t.Errorf("socket(AF_UNIX) under general printed %q, want %q (EACCES)", out, want)
+	}
+
+	// c_cpp is an allow-list: socket is not in it, AF_UNIX or not.
+	if res := run(t, execSpec(dir, exe, SeccompCCpp, "socket_unix")); res.Signal != int(syscall.SIGSYS) {
+		t.Errorf("socket(AF_UNIX) under c_cpp: %+v, want SIGSYS", res)
+	}
+}
+
+// getpwuid() works under general: the nscd attempt is refused, NSS reads /etc/passwd, and the
+// uid of the program ("code", 12002) is found.
+func TestRunGeneralGetpwuidFallsBackToPasswdFile(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	exe := probe(t)
+	s := execSpec(dir, exe, SeccompGen, "getpwuid")
+	res := run(t, s)
+	if res.Signal != 0 || res.Error != 0 || res.ExitCode != 0 {
+		t.Fatalf("getpwuid under general: %+v", res)
+	}
+	if out := readFile(t, s.Stdout); out != "code\n" {
+		t.Errorf("getpwuid(12002) printed %q, want %q", out, "code\n")
 	}
 }
 
@@ -1236,7 +1313,7 @@ func TestRunUnresolvableDenyNameFailsClosed(t *testing.T) {
 	variant := filepath.Join(dir, "judge-runner-unknown-deny")
 	out, err := exec.Command("/usr/bin/gcc", "-O1", "-DJUDGE_RUNNER_TEST_UNKNOWN_DENY", "-o", variant, "runner.c", "-lseccomp").CombinedOutput()
 	if err != nil {
-		t.Skipf("cannot build the shim variant (needs libseccomp-dev): %v\n%s", err, out)
+		skipOrFail(t, "cannot build the shim variant (needs libseccomp-dev and runner.c in the working directory): %v\n%s", err, out)
 	}
 	s := defaultSpec(dir, "/bin/true")
 	s.Seccomp = SeccompGen

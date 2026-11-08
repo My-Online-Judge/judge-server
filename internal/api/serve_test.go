@@ -169,8 +169,8 @@ func TestHealthcheckPort(t *testing.T) {
 func TestPrepareWorkDir(t *testing.T) {
 	t.Run("creates the layout", func(t *testing.T) {
 		work := filepath.Join(t.TempDir(), "a", "work")
-		if err := prepareWorkDir(work); err != nil {
-			t.Fatalf("prepareWorkDir: %v", err)
+		if err := PrepareWorkDir(work); err != nil {
+			t.Fatalf("PrepareWorkDir: %v", err)
 		}
 		for name, mode := range map[string]os.FileMode{"": 0o755, "jobs": 0o711, "spj": 0o755} {
 			fi, err := os.Stat(filepath.Join(work, name))
@@ -192,8 +192,8 @@ func TestPrepareWorkDir(t *testing.T) {
 		if err := os.Chmod(work, 0o777); err != nil {
 			t.Fatal(err)
 		}
-		if err := prepareWorkDir(work); err != nil {
-			t.Fatalf("prepareWorkDir: %v", err)
+		if err := PrepareWorkDir(work); err != nil {
+			t.Fatalf("PrepareWorkDir: %v", err)
 		}
 		for _, p := range []string{"jobs/j1", "spj/v1"} {
 			if _, err := os.Stat(filepath.Join(work, p)); err == nil {
@@ -215,8 +215,8 @@ func TestPrepareWorkDir(t *testing.T) {
 		if err := os.Symlink(outside, filepath.Join(work, "jobs")); err != nil {
 			t.Fatal(err)
 		}
-		if err := prepareWorkDir(work); err != nil {
-			t.Fatalf("prepareWorkDir: %v", err)
+		if err := PrepareWorkDir(work); err != nil {
+			t.Fatalf("PrepareWorkDir: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
 			t.Errorf("the symlink target was wiped: %v", err)

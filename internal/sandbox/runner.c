@@ -55,6 +55,7 @@
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -208,7 +209,7 @@ static const char *const c_cpp_allow[] = {
 static const char *const general_deny[] = {
     /* QingdaoU/Judger src/rules/general.c, branch newnew */
     "clone", "fork", "vfork", "kill", "execveat",
-    "socket", /* upstream returns EACCES here; KILL_PROCESS per the spec */
+    /* socket: see add_socket_rules */
     /* added here */
     "clone3",            /* glibc 2.34+ starts threads and processes with it */
     "ptrace", "process_vm_readv", "process_vm_writev",
@@ -245,6 +246,25 @@ static int add_simple(scmp_filter_ctx ctx, uint32_t action, const char *name)
     if (nr == __NR_SCMP_ERROR)
         return action == SCMP_ACT_ALLOW ? 0 : -1;
     return seccomp_rule_add(ctx, action, nr, 0);
+}
+
+/* socket(): a network socket kills the program, as the spec has it (upstream answers
+ * EACCES). AF_UNIX is answered with EACCES instead, as upstream does: no socket is ever
+ * created, so there is nothing to connect with, and it is what lets glibc's NSS fall back
+ * from its nscd socket to /etc/passwd. Without it any getpwuid() ends the program with
+ * SIGSYS, and Python 3.10 makes one at start-up whenever HOME is unset (to find its user
+ * site-packages), which it is for a run. The two rules cover every value of arg0 between
+ * them (the comparison is on all 64 bits, so an AF_UNIX with high bits set, which the
+ * kernel would truncate to AF_UNIX, is killed, not answered). */
+static int add_socket_rules(scmp_filter_ctx ctx)
+{
+    int nr = resolve("socket");
+
+    if (nr == __NR_SCMP_ERROR)
+        return -1;
+    if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1, SCMP_CMP(0, SCMP_CMP_NE, (scmp_datum_t)AF_UNIX)) != 0)
+        return -1;
+    return seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EACCES), nr, 1, SCMP_CMP(0, SCMP_CMP_EQ, (scmp_datum_t)AF_UNIX));
 }
 
 /* prlimit64 reads or sets the limits of any process of the same uid, including
@@ -355,7 +375,8 @@ static int load_seccomp(const char *rule, const char *exe)
                                  SCMP_CMP(0, SCMP_CMP_NE, (scmp_datum_t)getpid())) != 0)
                 goto out;
         }
-        if (add_execve_rule(ctx, 0, exe) != 0 || add_open_rules(ctx, 0) != 0 || add_prlimit_rules(ctx, 0) != 0)
+        if (add_execve_rule(ctx, 0, exe) != 0 || add_open_rules(ctx, 0) != 0 || add_prlimit_rules(ctx, 0) != 0 ||
+            add_socket_rules(ctx) != 0)
             goto out;
     }
     rc = seccomp_load(ctx);

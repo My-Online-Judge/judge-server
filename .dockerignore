@@ -1,0 +1,8 @@
+# Allow-list: the build needs the module, the sources, the test data and the test runner script.
+*
+!go.mod
+!go.sum
+!cmd
+!internal
+!testdata
+!scripts/run-all.sh
