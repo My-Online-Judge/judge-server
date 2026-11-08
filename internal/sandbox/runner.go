@@ -21,6 +21,10 @@ const (
 	wNoWait = 0x01000000 // WNOWAIT: leave the child a zombie so its pid stays reserved
 )
 
+// backstopGrace is how long after MaxRealTimeMs Run gives the shim to enforce the
+// limit itself before it kills the whole process group.
+const backstopGrace = time.Second
+
 // resultGrace bounds how long Run waits for the shim's report once the shim is
 // gone. The report is a few dozen bytes the shim wrote before exiting, so it is
 // already in the pipe; the bound only matters if some process kept the write
@@ -35,13 +39,21 @@ const resultGrace = 250 * time.Millisecond
 // killed it. Everything that goes wrong on the program's side (a limit, a
 // signal, a seccomp kill, a setup step failing in the shim) is in Result.
 //
-// The shim runs in its own process group, which Run kills with SIGKILL when
-// MaxRealTimeMs passes or ctx is done, and once more when the shim has exited,
-// to take along anything the program left behind. A run the timer killed has
-// RealTimeMs = max(measured, MaxRealTimeMs+1) so that it reads as exceeding the
-// limit (Derive compares with a strict ">"), Signal = SIGKILL, and no CPU time
-// or memory: the program died with the shim and nobody could collect them. If
-// ctx ended the run, Run returns ctx.Err() with Signal = SIGKILL.
+// The shim enforces MaxRealTimeMs itself (--real-ms): it kills only the program
+// when the limit passes, reaps it, and reports as for any other run, so a run
+// it timed out keeps its CPU time and peak memory and Signal = SIGKILL, with a
+// RealTimeMs above the limit (Derive compares with a strict ">"). That lets a
+// program that spent its CPU until the limit read as CPU TLE and one that only
+// waited as real TLE.
+//
+// The shim runs in its own process group, which Run kills with SIGKILL as a
+// backstop when MaxRealTimeMs+backstopGrace passes (a shim that is stuck, or a
+// child still starting up, never reports), when ctx is done, and once more when
+// the shim has exited, to take along anything the program left behind. A run
+// the backstop killed has RealTimeMs = max(measured, MaxRealTimeMs+1),
+// Signal = SIGKILL and no CPU time or memory: the program died with the shim
+// and nobody could collect them. If ctx ended the run, Run returns ctx.Err()
+// with Signal = SIGKILL.
 func Run(ctx context.Context, runnerPath string, s Spec) (Result, error) {
 	if err := s.validate(); err != nil {
 		return Result{}, err
@@ -70,7 +82,7 @@ func Run(ctx context.Context, runnerPath string, s Spec) (Result, error) {
 	}
 	pid := cmd.Process.Pid
 
-	// kill may fire from the timer, from ctx, or both. It never signals once
+	// kill may fire from the backstop timer, from ctx, or both. It never signals once
 	// the shim has been reaped, when its pid (and so the group id) could
 	// already belong to someone else.
 	var (
@@ -88,7 +100,7 @@ func Run(ctx context.Context, runnerPath string, s Spec) (Result, error) {
 		*flag = true
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 	}
-	timer := time.AfterFunc(time.Duration(s.MaxRealTimeMs)*time.Millisecond, func() { kill(&timedOut) })
+	timer := time.AfterFunc(time.Duration(s.MaxRealTimeMs)*time.Millisecond+backstopGrace, func() { kill(&timedOut) })
 	stop := make(chan struct{})
 	go func() {
 		select {

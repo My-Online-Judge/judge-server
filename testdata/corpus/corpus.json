@@ -13,6 +13,8 @@
   {"lang": "cpp", "file": "mle.cpp", "expect": 3, "note": "192 MiB with a 128 MiB limit and RLIMIT_AS = 256 MiB: memory over the limit, address space not exhausted"},
   {"lang": "cpp", "file": "mle2x.cpp", "expect": 4, "note": "2x the limit is all of RLIMIT_AS: malloc fails, the program faults, memory stays small: RE, not MLE"},
   {"lang": "cpp", "file": "rtle.cpp", "expect": 2, "note": "5 s futex wait (nanosleep is outside the c_cpp allow-list); the real-time limit is 3 s"},
+  {"lang": "cpp", "file": "rtle_busy.cpp", "expect": 2, "min_cpu_ms": 200, "note": "burns ~300 ms of CPU, then waits 5 s: real TLE, and the CPU time spent before the real-time kill is still reported"},
+  {"lang": "cpp", "file": "tle_wait.cpp", "expect": 1, "min_cpu_ms": 1000, "note": "burns ~1.1 s of CPU (limit 1 s), then waits 5 s: killed at the 3 s real limit with both limits passed, so CPU TLE, not real TLE"},
   {"lang": "cpp", "file": "flood.cpp", "expect": 4, "note": "prints 1 GiB; RLIMIT_FSIZE (32 MiB) ends it with SIGXFSZ; also TestEngineFlood"},
   {"lang": "cpp", "file": "crlf.cpp", "expect": 0, "note": "CRLF line ending: accepted (spec 4.3)"},
   {"lang": "cpp", "file": "stderr.cpp", "expect": 0, "note": "stderr noise next to the right stdout: accepted (spec 4.3)"},

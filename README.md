@@ -79,8 +79,10 @@ entry with a `note` and no `file` says why a verdict has no program.
 - every language of the image (`c`, `cpp`, `java`, `python2`, `python3`, `go`, `javascript`, `php`): `ac`, `wa`, `tle`, `re`,
   and `ce` where the language compiles (JavaScript and PHP have no compile step: a syntax error is a runtime error there);
 - C++ extras: `mle` (192 MiB, between the 128 MiB limit and the `RLIMIT_AS` of twice that), `mle2x` (2x the limit: the address
-  space is refused first, so RE), `rtle` (waits 5 s without the CPU: real TLE at 3 s), `flood` (prints 1 GiB: RE by `SIGXFSZ`,
-  truncated output, nothing left on `/work`), `crlf` and `stderr` (both AC: spec 4.3);
+  space is refused first, so RE), `rtle` (waits 5 s without the CPU: real TLE at 3 s), `rtle_busy` (burns ~300 ms of CPU, then waits: real TLE, and the CPU
+  time spent must still be reported, the entry's `min_cpu_ms`), `tle_wait` (burns ~1.1 s of CPU, then waits: killed at the real limit with both limits passed,
+  so CPU TLE), `flood` (prints 1 GiB: RE by `SIGXFSZ`, truncated output,
+  nothing left on `/work`), `crlf` and `stderr` (both AC: spec 4.3);
 - `c/socket.c` (`socket()` under `c_cpp`: RE), `python3/fork.py` (`os.fork()` under `general`: RE);
 - `java/exec.java`, `java/socket.java`: judged only with the java row's real run command (security manager and
   `/opt/oj/java.policy`), where starting a process or connecting is a `SecurityException` (the programs exit 42);

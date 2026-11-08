@@ -131,10 +131,22 @@ Not seccomp, but part of the same boundary, each with a test:
   so file modes (the stream files, a compiler's artifact) do not depend on the server's umask. `TestRunSetsUmask022`.
 - **The program dies with the runner** (`PR_SET_PDEATHSIG` SIGKILL, set after `setuid` because a credential change
   clears it, before the filter is loaded, with a `getppid()` check against the race). Under `""` a program may leave the
-  runner's process group with `setsid`/`setpgid`, which the group kill does not reach; this covers the program itself.
+  runner's process group with `setsid`/`setpgid`, which the server's group kill (cancellation, and the backstop below)
+  does not reach; this covers the program itself.
   A child the program forks and moves out of the group is not covered (`RLIMIT_NPROC` bounds how many, and the `general`
   filter denies the fork).
   `TestRunProgramThatLeavesTheGroupDiesWithTheRunner`.
+- **The real-time limit is the shim's.** Once the program has started (`execve` done) the shim arms an interval timer for
+  `--real-ms`, and its `SIGALRM` handler `SIGKILL`s the program, only the program. The program is then reaped like any
+  other, so a run that hit the limit still reports its CPU time and peak memory (as qduoj's Judger does) and the verdict
+  can be CPU TLE when the CPU limit was also passed and real TLE when the program only waited. `RealTimeMs` of such a
+  run is at least the limit plus one millisecond (the verdict compares with a strict `>`). The handler kills by pid, which
+  is safe only until the program is reaped, so `SIGALRM` and `SIGCHLD` stay blocked except inside `sigsuspend` in the
+  wait loop, and the reap happens with them blocked. The server's own group kill is a backstop at the limit plus one
+  second (a shim that is stuck, or a program that never reached `execve`): that run has no rusage, as before.
+  `TestRunRealTimeLimit`, `TestRunRealTimeKillReportsCPU`, `TestRunStoppedProgramIsKilledAtTheRealLimit`,
+  `TestRunBackstopKillsAShimThatDoesNotReport`; the corpus entries `cpp/rtle_busy.cpp` (real TLE with CPU reported) and
+  `cpp/tle_wait.cpp` (both limits passed: CPU TLE).
 - **A ptrace stop is not an end.** A program that calls `ptrace(PTRACE_TRACEME)` makes the runner its tracer, and every
   signal it then gets stops it instead of ending it. The runner waits until the program has exited or been killed, and
   kills a stopped one; `record.result` also refuses a status that is neither (`-4`, WAIT_FAILED).

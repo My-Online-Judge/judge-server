@@ -494,12 +494,85 @@ func TestRunRealTimeLimit(t *testing.T) {
 		t.Fatalf("result = %+v", res)
 	}
 	t.Logf("result = %+v", res)
-	if res.RealTimeMs < 1001 {
+	if res.RealTimeMs <= s.MaxRealTimeMs {
 		t.Fatalf("a run killed by the timer must read as over the limit (strict >): %+v", res)
 	}
 	if res.RealTimeMs > 3500 {
 		t.Fatalf("the run was not killed near the limit: %+v", res)
 	}
+	// The shim killed only the program and reaped it, so its rusage survived. Run's own group
+	// kill, the backstop, would have left no memory (TestRunBackstopKillsAShimThatDoesNotReport).
+	if res.MemoryBytes <= 0 {
+		t.Fatalf("a timed-out run lost the program's rusage: %+v", res)
+	}
+}
+
+// The real-time limit kills the program but its CPU time is still reported, so a program that
+// spent its CPU until the limit can be told from one that only waited (CPU TLE, not real TLE).
+func TestRunRealTimeKillReportsCPU(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	spin := compileC(t, dir, "spin", "int main(){volatile unsigned long x=0;for(;;)x++;}\n")
+	s := execSpec(dir, spin, SeccompNone)
+	s.MaxCPUTimeMs = 5000 // RLIMIT_CPU = 6 s, far past the real limit
+	s.MaxRealTimeMs = 500
+	res := run(t, s)
+	t.Logf("result = %+v", res)
+	if res.Error != 0 || res.Signal != int(syscall.SIGKILL) || res.RealTimeMs <= s.MaxRealTimeMs {
+		t.Fatalf("want a SIGKILL by the real-time limit, got %+v", res)
+	}
+	if res.RealTimeMs > 3500 {
+		t.Fatalf("the run was not killed near the limit: %+v", res)
+	}
+	if res.CPUTimeMs < 400 || res.MemoryBytes <= 0 {
+		t.Fatalf("a spin loop killed at 500 ms must report its CPU time (>= 400 ms) and memory: %+v", res)
+	}
+}
+
+// A program that is group-stopped is not an end for wait4 (no WUNTRACED), so only the timer
+// ends it: the shim's SIGKILL works on a stopped process.
+func TestRunStoppedProgramIsKilledAtTheRealLimit(t *testing.T) {
+	needRoot(t)
+	needTool(t, "/bin/sh")
+	dir := newDir(t)
+	s := defaultSpec(dir, "/bin/sh", "-c", "kill -STOP $$")
+	s.MaxRealTimeMs = 500
+	res := run(t, s)
+	t.Logf("result = %+v", res)
+	if res.Error != 0 || res.Signal != int(syscall.SIGKILL) || res.RealTimeMs <= s.MaxRealTimeMs || res.RealTimeMs > 3500 {
+		t.Fatalf("want the stopped program killed at the real-time limit, got %+v", res)
+	}
+}
+
+// Run's own kill is only a backstop: when the shim never reports (a stuck shim, here a script
+// that ignores --real-ms and sleeps), the whole group is killed one second after the limit and
+// the result carries no CPU time or memory.
+func TestRunBackstopKillsAShimThatDoesNotReport(t *testing.T) {
+	needTool(t, "/bin/sh")
+	dir := newDir(t)
+	fake := filepath.Join(dir, "stuck-shim")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 25.1327\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := defaultSpec(dir, "/bin/true")
+	s.MaxRealTimeMs = 300
+	start := time.Now()
+	res, err := Run(context.Background(), fake, s)
+	took := time.Since(start)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	t.Logf("result = %+v after %v", res, took)
+	if res.Signal != int(syscall.SIGKILL) || res.Error != 0 || res.RealTimeMs <= s.MaxRealTimeMs {
+		t.Fatalf("want SIGKILL and a real time over the limit, got %+v", res)
+	}
+	if res.CPUTimeMs != 0 || res.MemoryBytes != 0 {
+		t.Fatalf("a backstop kill has no rusage to report: %+v", res)
+	}
+	if took < time.Duration(s.MaxRealTimeMs)*time.Millisecond+backstopGrace-50*time.Millisecond || took > 3*time.Second {
+		t.Fatalf("the backstop must fire %v after the limit, took %v", backstopGrace, took)
+	}
+	waitGone(t, "25.1327")
 }
 
 func TestRunAddressSpace(t *testing.T) {
@@ -1104,7 +1177,8 @@ func TestRunKillsTheWholeProcessGroup(t *testing.T) {
 	needTool(t, "/bin/sh")
 	needTool(t, "/bin/sleep")
 	dir := newDir(t)
-	// A grandchild that outlives its parent: only a group kill reaches it.
+	// A grandchild that outlives its parent: the shim kills the program (sh) at the limit, and only
+	// the group kill Run does once the shim has exited reaches the grandchild.
 	s := defaultSpec(dir, "/bin/sh", "-c", "/bin/sleep 31.4159 & /bin/sleep 31.4159")
 	s.MaxRealTimeMs = 500
 	res := run(t, s)
@@ -1221,8 +1295,9 @@ func TestRunPtraceStopIsNotACleanExit(t *testing.T) {
 	}
 }
 
-// A program under "" may leave the runner's process group (setsid); the group kill then misses
-// it. The program must die with the runner.
+// A program under "" may leave the runner's process group (setsid); a group kill then misses
+// it. The shim's real-time kill goes to the program by pid, so it does not matter there; when the
+// runner itself is killed with the group (the cancel below) the program must die with it.
 func TestRunProgramThatLeavesTheGroupDiesWithTheRunner(t *testing.T) {
 	needRoot(t)
 	dir := newDir(t)

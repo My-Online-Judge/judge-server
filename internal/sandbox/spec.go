@@ -57,7 +57,7 @@ type Spec struct {
 	Stdin, Stdout, Stderr string
 
 	MaxCPUTimeMs    int64 // RLIMIT_CPU is MaxCPUTimeMs/1000+1 seconds; must be > 0
-	MaxRealTimeMs   int64 // wall-clock limit, enforced by Run killing the process group; must be > 0
+	MaxRealTimeMs   int64 // wall-clock limit from the program's execve, enforced by the shim (--real-ms); Run's own group kill is a backstop; must be > 0
 	MaxAddressSpace int64 // RLIMIT_AS; 0 = unlimited
 	MaxStack        int64 // RLIMIT_STACK; must be > 0
 	MaxOutputBytes  int64 // RLIMIT_FSIZE, the most any file the program writes can grow to; must be > 0
@@ -103,7 +103,7 @@ func (s Spec) validate() error {
 
 // shimArgs builds the judge-runner command line for a validated Spec:
 //
-//	--uid U --gid G --cpu-ms N --as N --stack N --fsize N --nproc N
+//	--uid U --gid G --cpu-ms N --real-ms N --as N --stack N --fsize N --nproc N
 //	[--seccomp RULE] --exe PATH [--chdir DIR] --stdin P --stdout P --stderr P -- argv...
 func shimArgs(s Spec) []string {
 	exe := s.ExePath
@@ -114,6 +114,7 @@ func shimArgs(s Spec) []string {
 		"--uid", strconv.FormatUint(uint64(s.UID), 10),
 		"--gid", strconv.FormatUint(uint64(s.GID), 10),
 		"--cpu-ms", strconv.FormatInt(s.MaxCPUTimeMs, 10),
+		"--real-ms", strconv.FormatInt(s.MaxRealTimeMs, 10),
 		"--as", strconv.FormatInt(s.MaxAddressSpace, 10),
 		"--stack", strconv.FormatInt(s.MaxStack, 10),
 		"--fsize", strconv.FormatInt(s.MaxOutputBytes, 10),

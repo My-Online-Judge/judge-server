@@ -388,6 +388,8 @@ type corpusEntry struct {
 	Note   string `json:"note"`
 	Policy bool   `json:"policy"` // judged only with the java row's real command (security manager)
 	Exit   *int32 `json:"exit"`   // the exit code the first non-AC case must show
+
+	MinCPUMs int64 `json:"min_cpu_ms"` // the CPU time (ms) the first non-AC case must report at least
 }
 
 func testdataDir() string {
@@ -498,6 +500,9 @@ func (env *sandboxEnv) checkEntry(t *testing.T, tag string, row languageRow, e c
 	}
 	if e.Exit != nil && fail != nil && fail.ExitCode != *e.Exit {
 		t.Errorf("first failing case exited %d, want %d: %s", fail.ExitCode, *e.Exit, describe(out))
+	}
+	if e.MinCPUMs > 0 && fail != nil && fail.CPUTimeMs < e.MinCPUMs {
+		t.Errorf("first failing case reports %d ms of CPU, want at least %d: %s", fail.CPUTimeMs, e.MinCPUMs, describe(out))
 	}
 	return out, wall
 }

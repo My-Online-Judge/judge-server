@@ -31,7 +31,7 @@ func TestShimArgs(t *testing.T) {
 	s.Stdin = "/test_case/1.in"
 	s.Stderr = "/work/jobs/1/1.err"
 	want := []string{
-		"--uid", "12002", "--gid", "12002", "--cpu-ms", "1000", "--as", "268435456",
+		"--uid", "12002", "--gid", "12002", "--cpu-ms", "1000", "--real-ms", "3000", "--as", "268435456",
 		"--stack", "134217728", "--fsize", "16777216", "--nproc", "64",
 		"--seccomp", "c_cpp", "--exe", "/work/jobs/1/solution", "--chdir", "/work/jobs/1",
 		"--stdin", "/test_case/1.in", "--stdout", "/work/jobs/1/1.out", "--stderr", "/work/jobs/1/1.err",
@@ -47,7 +47,7 @@ func TestShimArgsDefaults(t *testing.T) {
 	s.Dir = ""
 	got := shimArgs(s)
 	want := []string{
-		"--uid", "12002", "--gid", "12002", "--cpu-ms", "1000", "--as", "0",
+		"--uid", "12002", "--gid", "12002", "--cpu-ms", "1000", "--real-ms", "3000", "--as", "0",
 		"--stack", "134217728", "--fsize", "16777216", "--nproc", "64",
 		"--exe", "/work/jobs/1/solution", // no ExePath: Argv[0]
 		"--stdin", "/dev/null", "--stdout", "/work/jobs/1/1.out", "--stderr", "/dev/null", // "" means /dev/null

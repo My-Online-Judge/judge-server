@@ -14,7 +14,7 @@
  * identity switch with the server-supplied environment, which a dynamic build
  * would let LD_PRELOAD and friends reach.
  *
- *   judge-runner --uid U --gid G --cpu-ms N --as N --stack N --fsize N --nproc N
+ *   judge-runner --uid U --gid G --cpu-ms N --real-ms N --as N --stack N --fsize N --nproc N
  *                [--seccomp c_cpp|general] [--exe PATH] [--chdir DIR]
  *                [--stdin P] [--stdout P] [--stderr P] -- argv...
  *
@@ -33,6 +33,14 @@
  * The runner waits until the program has exited or been killed: a ptrace stop is
  * not an end (see reap).
  *
+ * The runner enforces the real-time limit itself, as qduoj's Judger does: when the
+ * program has started (execve done) it arms an interval timer for --real-ms, and the
+ * SIGALRM handler SIGKILLs the program, only the program. The program is then reaped
+ * like any other, so its CPU time and peak memory are still reported and the server can
+ * tell a program that burned CPU until the limit (CPU TLE) from one that only waited
+ * (real TLE). The server's own kill of the whole process group is only a backstop, for
+ * a runner that is stuck, and takes everything the program left behind in the group.
+ *
  * The runner reports to the server on fd 3 (a pipe the server created) with one
  * line, written once, when the program is over or could not start:
  *
@@ -41,8 +49,13 @@
  * The CPU time is the program's user time only (ru_utime), as qduoj's Judger measures
  * it: system time is not reported, so it does not count against max_cpu_time.
  *
- * The line is parsed in record.go. If the runner is killed first (the server's
- * real-time limit kills the whole process group), nothing is written.
+ * wall is the time from the program's execve to its end. When the runner's timer killed
+ * the program (the status is SIGKILL) wall is at least --real-ms plus one millisecond, so
+ * that it reads as over the limit under the strict ">" of the verdict (the true value can
+ * round to exactly the limit).
+ *
+ * The line is parsed in record.go. If the runner is killed first (the server's backstop
+ * kill of the whole process group, or the server giving up), nothing is written.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -83,7 +96,7 @@ extern char **environ;
 struct config {
     uid_t uid;
     gid_t gid;
-    long long cpu_ms, as_bytes, stack_bytes, fsize_bytes, nproc;
+    long long cpu_ms, real_ms, as_bytes, stack_bytes, fsize_bytes, nproc;
     const char *seccomp;
     const char *exe;
     const char *chdir_dir;
@@ -110,8 +123,8 @@ static int parse_u64(const char *s, unsigned long long max, unsigned long long *
 
 static int parse_args(int argc, char **argv, struct config *c)
 {
-    enum { HAVE_UID = 1, HAVE_GID = 2, HAVE_CPU = 4, HAVE_STACK = 8, HAVE_FSIZE = 16, HAVE_NPROC = 32 };
-    const int required = HAVE_UID | HAVE_GID | HAVE_CPU | HAVE_STACK | HAVE_FSIZE | HAVE_NPROC;
+    enum { HAVE_UID = 1, HAVE_GID = 2, HAVE_CPU = 4, HAVE_STACK = 8, HAVE_FSIZE = 16, HAVE_NPROC = 32, HAVE_REAL = 64 };
+    const int required = HAVE_UID | HAVE_GID | HAVE_CPU | HAVE_REAL | HAVE_STACK | HAVE_FSIZE | HAVE_NPROC;
     int have = 0, i;
     unsigned long long v;
 
@@ -142,6 +155,11 @@ static int parse_args(int argc, char **argv, struct config *c)
             if (parse_u64(val, LLONG_MAX / 2, &v) != 0) return -1;
             c->cpu_ms = (long long)v;
             have |= HAVE_CPU;
+        } else if (strcmp(flag, "--real-ms") == 0) {
+            /* the bound keeps (real_ms + 1) * 1e6 ns inside a long long; 0 would never arm */
+            if (parse_u64(val, LLONG_MAX / 2000000, &v) != 0 || v == 0) return -1;
+            c->real_ms = (long long)v;
+            have |= HAVE_REAL;
         } else if (strcmp(flag, "--as") == 0) {
             if (parse_u64(val, LLONG_MAX, &v) != 0) return -1;
             c->as_bytes = (long long)v;
@@ -533,26 +551,116 @@ static void report(int err, int status, const struct rusage *ru, long long wall_
     } while (w < 0 && errno == EINTR);
 }
 
+/* ---- the real-time limit ----
+ *
+ * The timer's SIGALRM handler kills the program by pid, which is safe only while the
+ * pid cannot belong to anyone else: until the program has been reaped. So SIGALRM and
+ * SIGCHLD stay blocked, except inside sigsuspend() in reap(), and the program is reaped
+ * only while they are blocked; after that no handler can run. The handler is
+ * async-signal-safe (an errno-preserving kill() and two stores). */
+
+static volatile sig_atomic_t timer_fired; /* the real-time limit passed and the handler ran */
+static volatile pid_t timer_target;       /* the program, while it can still be signaled */
+
+static void on_alarm(int sig)
+{
+    int saved = errno;
+
+    (void)sig;
+    timer_fired = 1;
+    if (timer_target > 0)
+        kill(timer_target, SIGKILL); /* a zombie ignores it; its pid is not reused before reap */
+    errno = saved;
+}
+
+/* Only here to interrupt sigsuspend(): an ignored signal never would. */
+static void on_child(int sig)
+{
+    (void)sig;
+}
+
+/* Install both handlers and block both signals. *waiting is the mask to sleep with:
+ * the caller's own, minus the two. */
+static int install_wait_signals(sigset_t *waiting)
+{
+    struct sigaction sa;
+    sigset_t block;
+
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = on_alarm;
+    if (sigaction(SIGALRM, &sa, NULL) != 0)
+        return -1;
+    sa.sa_handler = on_child;
+    if (sigaction(SIGCHLD, &sa, NULL) != 0)
+        return -1;
+    sigemptyset(&block);
+    sigaddset(&block, SIGALRM);
+    sigaddset(&block, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &block, waiting) != 0)
+        return -1;
+    sigdelset(waiting, SIGALRM);
+    sigdelset(waiting, SIGCHLD);
+    return 0;
+}
+
 /* Wait until pid has really ended, exited or been killed. wait4 without WUNTRACED
  * also reports a stop for a traced child, and a program that called
  * ptrace(PTRACE_TRACEME) has made this process its tracer: every signal it then
  * gets (SIGSEGV, SIGFPE, SIGXFSZ...) is a stop, not an end, and passing that on as
  * a status would read as a clean exit. A stopped program is killed and waited for
- * again, so the status reported is the one it really ends with. */
-static int reap(pid_t pid, int *status, struct rusage *ru)
+ * again, so the status reported is the one it really ends with.
+ *
+ * SIGCHLD and SIGALRM are blocked here (see install_wait_signals). The check and the
+ * sleep do not race: a child that ends between a wait4 that found nothing and the
+ * sigsuspend leaves SIGCHLD pending, and sigsuspend then returns at once. */
+static int reap(pid_t pid, int *status, struct rusage *ru, const sigset_t *waiting)
 {
     for (;;) {
-        pid_t r = wait4(pid, status, 0, ru);
+        pid_t r = wait4(pid, status, WNOHANG, ru);
 
         if (r < 0) {
             if (errno == EINTR)
                 continue;
             return -1;
         }
+        if (r == 0) {
+            sigsuspend(waiting); /* returns after a handler ran: the timer or a child event */
+            continue;
+        }
         if (WIFEXITED(*status) || WIFSIGNALED(*status))
             return 0;
         kill(pid, SIGKILL);
     }
+}
+
+/* Kill the program and collect it, for a failure of the runner's own. */
+static void kill_and_reap(pid_t pid, const sigset_t *waiting)
+{
+    int status;
+    struct rusage ru;
+
+    kill(pid, SIGKILL);
+    reap(pid, &status, &ru, waiting);
+}
+
+/* Start the real-time limit: SIGALRM in real_ms. */
+static int arm_timer(long long real_ms)
+{
+    struct itimerval it;
+
+    memset(&it, 0, sizeof(it));
+    it.it_value.tv_sec = (time_t)(real_ms / 1000);
+    it.it_value.tv_usec = (suseconds_t)(real_ms % 1000) * 1000;
+    return setitimer(ITIMER_REAL, &it, NULL);
+}
+
+static void disarm_timer(void)
+{
+    struct itimerval zero;
+
+    memset(&zero, 0, sizeof(zero));
+    setitimer(ITIMER_REAL, &zero, NULL);
 }
 
 int main(int argc, char **argv)
@@ -562,9 +670,10 @@ int main(int argc, char **argv)
     pid_t pid, self;
     signed char code;
     ssize_t n;
-    long long t0;
+    long long t0, wall;
     int status = 0;
     struct rusage ru;
+    sigset_t waiting;
 
     /* The report fd must not reach the program, which is forked from here. */
     if (fcntl(REPORT_FD, F_SETFD, FD_CLOEXEC) != 0)
@@ -599,6 +708,18 @@ int main(int argc, char **argv)
     }
     close(errpipe[1]);
 
+    /* After the fork, so the program does not inherit the blocked signals (the mask
+     * survives execve). A child that ends before this is still found: reap() checks
+     * with wait4 before it ever sleeps. */
+    if (install_wait_signals(&waiting) != 0) {
+        kill(pid, SIGKILL);
+        while (wait4(pid, &status, 0, &ru) < 0 && errno == EINTR)
+            ;
+        report(ERR_WAIT_FAILED, 0, NULL, 0);
+        return 255;
+    }
+    timer_target = pid;
+
     /* EOF with no byte: execve closed the pipe, the program is running. */
     do {
         n = read(errpipe[0], &code, 1);
@@ -606,22 +727,36 @@ int main(int argc, char **argv)
     t0 = now_ns();
 
     if (n == 1) {
-        reap(pid, &status, &ru);
+        reap(pid, &status, &ru, &waiting);
         report((int)code, 0, NULL, 0);
         return 255;
     }
     if (n < 0) {
         /* cannot happen for a pipe we own; do not leave the child running */
-        kill(pid, SIGKILL);
-        reap(pid, &status, &ru);
+        kill_and_reap(pid, &waiting);
         report(ERR_WAIT_FAILED, 0, NULL, 0);
         return 255;
     }
 
-    if (reap(pid, &status, &ru) < 0) {
+    /* The limit counts from the program's execve, like the wall time reported. */
+    if (arm_timer(c.real_ms) != 0) {
+        kill_and_reap(pid, &waiting);
         report(ERR_WAIT_FAILED, 0, NULL, 0);
         return 255;
     }
-    report(0, status, &ru, now_ns() - t0);
+    if (reap(pid, &status, &ru, &waiting) < 0) {
+        disarm_timer();
+        report(ERR_WAIT_FAILED, 0, NULL, 0);
+        return 255;
+    }
+    wall = now_ns() - t0;
+    disarm_timer(); /* SIGALRM is still blocked, so no handler runs after the reap */
+
+    /* The strict ">" of the verdict needs the overrun to show after rounding to
+     * milliseconds. Only a SIGKILL can be the timer's doing; a program that ended on
+     * its own (or by another signal) before the alarm was handled is reported as it is. */
+    if (timer_fired && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL && wall < (c.real_ms + 1) * 1000000LL)
+        wall = (c.real_ms + 1) * 1000000LL;
+    report(0, status, &ru, wall);
     return 0;
 }
