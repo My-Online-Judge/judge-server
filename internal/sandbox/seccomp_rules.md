@@ -108,6 +108,11 @@ Not seccomp, but part of the same boundary, each with a test:
   planted at the last path component, dangling or not, fails the open with `-8`, so it cannot redirect a root open
   (and `O_TRUNC`) to another file. It guards the last component only: the caller must keep the directory of the stream
   files unwritable by the run uid. `TestRunStreamSymlinksAreNotFollowed`.
+- **One path for stdout and stderr is one file.** The shim opens it once and `dup2`s that descriptor onto both
+  (`2>&1`); two opens would each write from offset 0 and overwrite each other (a compile's output goes to one file this
+  way). Only the identical string counts. `TestRunSharedStreamPathKeepsBothStreams`.
+- **The program runs with `umask(022)`**, set in the shim before the stream files are created and kept across `execve`,
+  so file modes (the stream files, a compiler's artifact) do not depend on the server's umask. `TestRunSetsUmask022`.
 - **The program dies with the runner** (`PR_SET_PDEATHSIG` SIGKILL, set after `setuid` because a credential change
   clears it, before the filter is loaded, with a `getppid()` check against the race). Under `""` a program may leave the
   runner's process group with `setsid`/`setpgid`, which the group kill does not reach; this covers the program itself.

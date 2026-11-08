@@ -24,8 +24,9 @@
  * resident set that starts at the server's own (the server vforks the shim and
  * the kernel folds the parent's high-water mark into the child at exec).
  *
- * The child (the program) does, in this order: refuse uid 0 / gid 0, open the
- * stdin/stdout/stderr files (O_NOFOLLOW) and dup2 them, chdir, write 1000 to
+ * The child (the program) does, in this order: refuse uid 0 / gid 0, umask(022),
+ * open the stdin/stdout/stderr files (O_NOFOLLOW) and dup2 them (one file for
+ * stdout and stderr when their paths are the same string), chdir, write 1000 to
  * oom_score_adj, setrlimit, setgroups(0) + setgid + setuid, PR_SET_PDEATHSIG,
  * PR_SET_NO_NEW_PRIVS, load the seccomp filter, execve. A failing step makes it
  * write one signed byte, the judger error code, to an internal pipe and _exit(255).
@@ -424,10 +425,24 @@ static void run_child(const struct config *c, int pipe_fd, pid_t runner_pid)
     if (c->uid == 0 || c->gid == 0)
         child_fail(pipe_fd, ERR_SETUID_FAILED);
 
+    /* Whatever umask the server has, the stream files are 0644 (the checker reads
+     * the user's output) and so is every file the program creates (a compiler's
+     * artifact must be readable and runnable by the run user). The umask survives
+     * the execve. */
+    umask(022);
+
+    /* One path for stdout and stderr means one open file description for both
+     * (the shell's 2>&1): two opens would each write from offset 0 and overwrite
+     * each other. Only the identical string counts, not two names of one file. */
     if (redirect(c->stdin_path, O_RDONLY, 0, STDIN_FILENO) != 0 ||
-        redirect(c->stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDOUT_FILENO) != 0 ||
-        redirect(c->stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDERR_FILENO) != 0)
+        redirect(c->stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDOUT_FILENO) != 0)
         child_fail(pipe_fd, ERR_DUP2_FAILED);
+    if (strcmp(c->stderr_path, c->stdout_path) == 0) {
+        if (dup2(STDOUT_FILENO, STDERR_FILENO) < 0)
+            child_fail(pipe_fd, ERR_DUP2_FAILED);
+    } else if (redirect(c->stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDERR_FILENO) != 0) {
+        child_fail(pipe_fd, ERR_DUP2_FAILED);
+    }
 
     if (c->chdir_dir != NULL && chdir(c->chdir_dir) != 0)
         child_fail(pipe_fd, ERR_INVALID_CONFIG);

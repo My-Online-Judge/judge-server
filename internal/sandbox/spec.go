@@ -46,7 +46,10 @@ type Spec struct {
 	UID, GID uint32 // the identity the program runs as, never 0; supplementary groups are dropped
 
 	// Stream files. Stdin is opened read-only; Stdout and Stderr are created
-	// (0644) and truncated. "" means /dev/null. All three are opened as root
+	// (0644, whatever the server's umask) and truncated. "" means /dev/null. When
+	// Stderr is the same string as Stdout both streams share one open file, so the
+	// writes interleave in order instead of overwriting each other. All three are
+	// opened as root
 	// before the identity switch, so they need not be accessible to UID. The
 	// open refuses a symlink as the last path component (Error -8), but a root
 	// open is only as safe as the directory around it: the caller must keep the

@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/My-Online-Judge/judge-server/internal/bundle"
 	"github.com/My-Online-Judge/judge-server/internal/config"
@@ -244,7 +246,7 @@ func validate(jobID string, r *Request) error {
 	}
 	c := r.Lang.Compile
 	for _, n := range []string{c.SrcName, c.ExeName} {
-		if err := ValidateName(n); err != nil {
+		if err := validFileName(n); err != nil {
 			return invalidf("compile config: %v", err)
 		}
 	}
@@ -269,7 +271,7 @@ func validChecker(ck *Checker) error {
 	}
 	v := Vars{SPJVersion: ck.Version}
 	for _, n := range []string{Expand(ck.Compile.SrcName, v), Expand(ck.ExeName, v)} {
-		if err := ValidateName(n); err != nil {
+		if err := validFileName(n); err != nil {
 			return invalidf("checker: %v", err)
 		}
 	}
@@ -283,6 +285,19 @@ func validChecker(ck *Checker) error {
 		return invalidf("checker command: %v", err)
 	}
 	return validSeccomp(ck.SeccompRule)
+}
+
+// validFileName is ValidateName plus no whitespace: the name is put into a command
+// line that Split cuts at spaces with no quoting, so a space would split one path
+// into two arguments.
+func validFileName(name string) error {
+	if err := ValidateName(name); err != nil {
+		return err
+	}
+	if strings.ContainsFunc(name, unicode.IsSpace) {
+		return fmt.Errorf("file name %q contains whitespace", name)
+	}
+	return nil
 }
 
 func validCompile(what string, c CompileConfig) error {

@@ -761,6 +761,68 @@ func TestRunStdinToStdout(t *testing.T) {
 	}
 }
 
+// One path for stdout and stderr is one open file (2>&1): two opens would each write from
+// offset 0 and overwrite each other, which lost half of a compiler's output.
+func TestRunSharedStreamPathKeepsBothStreams(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	exe := compileC(t, dir, "bothstreams", `#include <unistd.h>
+int main(){
+    write(1, "out one\n", 8);
+    write(2, "err one\n", 8);
+    write(1, "out two\n", 8);
+    write(2, "err two\n", 8);
+    return 0;
+}
+`)
+	s := execSpec(dir, exe, SeccompCCpp)
+	s.Stderr = s.Stdout
+	res := run(t, s)
+	if res.Error != 0 || res.ExitCode != 0 || res.Signal != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	if got, want := readFile(t, s.Stdout), "out one\nerr one\nout two\nerr two\n"; got != want {
+		t.Fatalf("shared file = %q, want %q (writes in order, none overwritten)", got, want)
+	}
+
+	// Two different paths stay two files.
+	s = execSpec(dir, exe, SeccompCCpp)
+	run(t, s)
+	if out, errOut := readFile(t, s.Stdout), readFile(t, s.Stderr); out != "out one\nout two\n" || errOut != "err one\nerr two\n" {
+		t.Fatalf("separate files = %q and %q", out, errOut)
+	}
+
+	// The same /dev/null for both is fine too.
+	s = execSpec(dir, exe, SeccompCCpp)
+	s.Stdout, s.Stderr = "", ""
+	if res := run(t, s); res.Error != 0 || res.ExitCode != 0 {
+		t.Fatalf("both streams on /dev/null: %+v", res)
+	}
+}
+
+// The program and the files it creates get umask 022 whatever umask the server has.
+func TestRunSetsUmask022(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	exe := compileC(t, dir, "umaskprobe", `#include <stdio.h>
+#include <sys/stat.h>
+int main(){ printf("%03o\n", (unsigned)umask(0)); return 0; }
+`)
+	old := syscall.Umask(0o077) // what the shim inherits from this process
+	defer syscall.Umask(old)
+
+	s := execSpec(dir, exe, SeccompNone) // c_cpp does not allow the program's own umask call
+	if res := run(t, s); res.Error != 0 || res.ExitCode != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	if got := readFile(t, s.Stdout); got != "022\n" {
+		t.Fatalf("the program's umask = %q, want 022", got)
+	}
+	if fi, err := os.Stat(s.Stdout); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("stream file mode = %v (%v), want 0644", fi.Mode().Perm(), err)
+	}
+}
+
 func TestRunExitCodeAndTimes(t *testing.T) {
 	needRoot(t)
 	dir := newDir(t)

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"github.com/My-Online-Judge/judge-server/internal/sandbox"
 )
@@ -19,15 +21,29 @@ func (e *Engine) spjLock(version string) chan struct{} {
 	return l.(chan struct{})
 }
 
+// checkerMode is the mode of a published checker binary: read and execute for
+// everyone, written by nobody. Together with root ownership it is what marks a
+// binary as complete (see trustedChecker).
+const checkerMode fs.FileMode = 0o555
+
 // ensureChecker makes sure the checker binary of the request's version is in
 // <WorkDir>/spj/<version>/, compiling it as the spj user when it is not, and
 // returns the compile error message when the checker does not compile.
 //
-// The binary's existence is the cache, checked only while holding the version's
-// lock: gcc and friends create the output file before they finish writing it, so
-// a lock-free check could see (and a case could run) a half-written checker. A
-// failed or cancelled compile removes the binary it left, so a failure is never
-// cached and the next job compiles again.
+// The cache is crash-safe: the compile writes <exe>.tmp-<job id>, and only a
+// compile that succeeded is chowned to root, chmodded 0555 and renamed to the
+// final name, so the final name only ever holds a whole binary. A server that dies
+// mid-compile leaves a temp file (or, from an older server, a half-written final
+// file), neither of which counts: only a root-owned 0555 regular file is a hit
+// (trustedChecker), and anything else under the name is removed before the
+// compile. A failed or cancelled compile removes its temp file, so a failure is
+// never cached and the next job compiles again. Once the compile is over the
+// version dir is handed back to root (0755): the spj user, which also runs the
+// checker, can no longer write beside the binary.
+//
+// The check and the compile happen while holding the version's lock: another job
+// asking for the same version waits for the compile instead of starting a second
+// one (and never sees a file that is still being written).
 func (j *job) ensureChecker(ctx context.Context) (string, error) {
 	ck := j.req.Checker
 	v := Vars{SPJVersion: ck.Version}
@@ -43,10 +59,13 @@ func (j *job) ensureChecker(ctx context.Context) (string, error) {
 	}
 	defer func() { <-lock }()
 
-	if regularFile(j.spjExe) == nil {
+	if trustedChecker(j.spjExe) {
 		return "", nil
 	}
 	if err := j.prepareSPJDir(); err != nil {
+		return "", err
+	}
+	if err := j.clearSPJLeftovers(); err != nil {
 		return "", err
 	}
 	src := filepath.Join(j.spjDir, Expand(ck.Compile.SrcName, v))
@@ -57,27 +76,106 @@ func (j *job) ensureChecker(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("write checker source: %w", err)
 	}
 
+	tmp := j.spjExe + tmpSuffix + j.id
 	msg, err := j.compile(ctx, compileStep{
 		cfg:     ck.Compile,
 		uid:     uidSPJ,
 		dir:     j.spjDir,
-		vars:    Vars{SrcPath: src, ExePath: j.spjExe, ExeDir: j.spjDir, SPJVersion: ck.Version},
+		vars:    Vars{SrcPath: src, ExePath: tmp, ExeDir: j.spjDir, SPJVersion: ck.Version},
 		logPath: filepath.Join(j.dir, "spj-compile.out"),
 	})
-	if err == nil && msg == "" && regularFile(j.spjExe) != nil {
-		msg = fmt.Sprintf("The checker compiled but did not produce %s", exeName)
+	lockErr := j.lockSPJDir() // the compile is over, whatever its outcome
+	if lockErr != nil && (err != nil || msg != "") {
+		slog.Warn("job: hand the checker dir back to root", "dir", j.spjDir, "err", lockErr)
+	}
+	if err == nil && msg == "" {
+		if lockErr != nil {
+			err = lockErr
+		} else {
+			msg, err = j.publishChecker(tmp, exeName)
+		}
 	}
 	if err != nil || msg != "" {
-		if rerr := os.Remove(j.spjExe); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-			slog.Warn("job: remove the binary of a failed checker compile", "path", j.spjExe, "err", rerr)
+		if rerr := os.RemoveAll(tmp); rerr != nil {
+			slog.Warn("job: remove the temp binary of a failed checker compile", "path", tmp, "err", rerr)
 		}
 	}
 	return msg, err
 }
 
+// tmpSuffix joins a checker binary's name and the id of the job compiling it.
+const tmpSuffix = ".tmp-"
+
+// trustedChecker reports whether path is a published checker binary: a regular
+// file (not a symlink) of mode 0555 that, when the server runs as root and so
+// chowned it, is owned by root.
+func trustedChecker(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() || fi.Mode() != checkerMode {
+		return false
+	}
+	if os.Geteuid() == 0 {
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Uid != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// clearSPJLeftovers removes what an earlier server (or job) left under the
+// checker's name: temp files of a compile that never finished, and a file at the
+// final name that is not a published binary (the caller found trustedChecker
+// false, so whatever is there is not one).
+func (j *job) clearSPJLeftovers() error {
+	dir, base := filepath.Split(j.spjExe)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", dir, err)
+	}
+	for _, e := range entries {
+		if name := e.Name(); name == base || strings.HasPrefix(name, base+tmpSuffix) {
+			if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+				return fmt.Errorf("remove leftover %s: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// publishChecker turns the compiled temp file into the cached binary: owned by
+// root, mode 0555, renamed to the final name. fchown and fchmod act on the file
+// opened here (a symlink is refused), not on whatever the path names later. A
+// compile that exited 0 without producing the file is the checker's fault: its
+// message comes back, not an error.
+func (j *job) publishChecker(tmp, exeName string) (string, error) {
+	f, err := os.OpenFile(tmp, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+		return fmt.Sprintf("The checker compiled but did not produce %s", exeName), nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("open compiled checker: %w", err)
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil {
+		return "", fmt.Errorf("stat compiled checker: %w", err)
+	} else if !fi.Mode().IsRegular() {
+		return fmt.Sprintf("The checker compiled but %s is not a regular file", exeName), nil
+	}
+	if err := ignorePermission(f.Chown(0, 0), tmp); err != nil {
+		return "", fmt.Errorf("chown compiled checker: %w", err)
+	}
+	if err := f.Chmod(checkerMode); err != nil {
+		return "", fmt.Errorf("chmod compiled checker: %w", err)
+	}
+	if err := os.Rename(tmp, j.spjExe); err != nil {
+		return "", fmt.Errorf("publish compiled checker: %w", err)
+	}
+	return "", nil
+}
+
 // prepareSPJDir makes <WorkDir>/spj/<version>, root:spj 0775 so the checker's
-// compile can write its binary there. Everyone else (the run user included)
-// only reads it. A symlink or file in its place is refused.
+// compile can write its binary there; lockSPJDir takes that back when the compile
+// is over. A symlink or file in its place is refused.
 func (j *job) prepareSPJDir() error {
 	root := filepath.Join(j.e.d.WorkDir, "spj")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -92,6 +190,23 @@ func (j *job) prepareSPJDir() error {
 		return fmt.Errorf("chown %s: %w", j.spjDir, err)
 	}
 	if err := f.Chmod(0o775); err != nil {
+		return fmt.Errorf("chmod %s: %w", j.spjDir, err)
+	}
+	return nil
+}
+
+// lockSPJDir hands the version dir back to root, 0755: everyone, the spj user
+// included, can read and enter it, nobody but root can write to it.
+func (j *job) lockSPJDir() error {
+	f, err := os.OpenFile(j.spjDir, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", j.spjDir, err)
+	}
+	defer f.Close()
+	if err := ignorePermission(f.Chown(0, 0), j.spjDir); err != nil {
+		return fmt.Errorf("chown %s: %w", j.spjDir, err)
+	}
+	if err := f.Chmod(0o755); err != nil {
 		return fmt.Errorf("chmod %s: %w", j.spjDir, err)
 	}
 	return nil

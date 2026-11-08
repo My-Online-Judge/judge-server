@@ -18,9 +18,11 @@ type Step struct {
 	Err    error // the runner's own failure, as sandbox.Run returns it
 
 	// Stdout and Stderr are written to Spec.Stdout and Spec.Stderr when they are
-	// not nil and the path is not "" (the shim would have created the files). A
-	// Stderr aimed at the same file as Stdout is appended, as a shared file
-	// would hold both streams.
+	// not nil and the path is not "" (the shim would have created the files).
+	// When both paths are the same string the shim opens the file once and shares
+	// it between the two streams (2>&1), so nothing is overwritten; the fake
+	// mirrors that by writing the whole Stdout and then the whole Stderr into the
+	// one file. It cannot interleave real writes.
 	Stdout, Stderr []byte
 
 	// Files are created (mode 0755, parent directories must exist) before the
@@ -181,26 +183,21 @@ func (f *FakeRunner) CtxDone() int {
 }
 
 func writeStreams(spec sandbox.Spec, step Step) error {
+	if spec.Stdout != "" && spec.Stdout == spec.Stderr {
+		if step.Stdout == nil && step.Stderr == nil {
+			return nil
+		}
+		return os.WriteFile(spec.Stdout, append(slices.Clone(step.Stdout), step.Stderr...), 0o644)
+	}
 	if step.Stdout != nil && spec.Stdout != "" {
 		if err := os.WriteFile(spec.Stdout, step.Stdout, 0o644); err != nil {
 			return err
 		}
 	}
-	if step.Stderr == nil || spec.Stderr == "" {
-		return nil
-	}
-	if spec.Stderr != spec.Stdout || step.Stdout == nil {
+	if step.Stderr != nil && spec.Stderr != "" {
 		return os.WriteFile(spec.Stderr, step.Stderr, 0o644)
 	}
-	f, err := os.OpenFile(spec.Stderr, os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	_, werr := f.Write(step.Stderr)
-	if cerr := f.Close(); werr == nil {
-		werr = cerr
-	}
-	return werr
+	return nil
 }
 
 func cloneSpec(s sandbox.Spec) sandbox.Spec {

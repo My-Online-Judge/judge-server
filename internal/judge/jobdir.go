@@ -17,9 +17,11 @@ import (
 // and chowns what it creates):
 //
 //	<id>/          0711 root          passable by the run users, not listable, not writable
-//	<id>/src/      0775 root:compiler the source, the compiled artifact and inline inputs;
-//	                                  the compiler writes here, everyone else only reads and
-//	                                  enters it (a program's working directory)
+//	<id>/src/      0775 root:compiler the source and the compiled artifact; the compiler
+//	                                  writes here, everyone else only reads and enters it
+//	                                  (a program's working directory)
+//	<id>/in/       0755 root          inline inputs N.in (0644), written after the compile;
+//	                                  unlike src/ the compiler cannot touch them
 //	<id>/out/      0755 root          per-case N.out / N.err (and the checker's streams),
 //	                                  created by the shim as root (0644); never writable by
 //	                                  the run user, so the shim's root opens cannot be redirected
@@ -38,8 +40,8 @@ type job struct {
 	id  string
 	req *Request
 
-	dir, srcDir, outDir, tmpDir string
-	srcPath, exePath            string
+	dir, srcDir, inDir, outDir, tmpDir string
+	srcPath, exePath                   string
 
 	pool int // cases run at once, set by runCases
 
@@ -59,6 +61,7 @@ func (e *Engine) newJob(id string, r *Request) (*job, error) {
 
 	j := &job{e: e, id: id, req: r, dir: filepath.Join(jobs, id)}
 	j.srcDir = filepath.Join(j.dir, "src")
+	j.inDir = filepath.Join(j.dir, "in")
 	j.outDir = filepath.Join(j.dir, "out")
 	j.tmpDir = filepath.Join(j.dir, "tmp")
 	j.srcPath = filepath.Join(j.srcDir, r.Lang.Compile.SrcName)
@@ -82,6 +85,7 @@ func (j *job) prepareDirs() error {
 	}{
 		{j.dir, 0o711, -1},
 		{j.srcDir, 0o775, int(uidCompiler)},
+		{j.inDir, 0o755, -1},
 		{j.outDir, 0o755, -1},
 		{j.tmpDir, os.ModeSticky | 0o777, -1},
 	}
@@ -136,9 +140,10 @@ func (j *job) writeSource() error {
 }
 
 // env builds a program's whole environment from the request's entries: an entry
-// whose value is exactly /tmp moves to the job's tmp dir (GOCACHE to the shared Go
-// cache when there is one), and the server's own TMPDIR, PATH and, for a compile,
-// HOME replace any the request carries.
+// whose value is exactly /tmp moves to the job's tmp dir, every GOCACHE entry,
+// whatever its value, moves to the shared Go cache (or to the job's tmp dir when
+// there is none), and the server's own TMPDIR, PATH and, for a compile, HOME
+// replace any the request carries.
 func (j *job) env(entries []string, compile bool) []string {
 	out := make([]string, 0, len(entries)+3)
 	for _, kv := range entries {
@@ -146,12 +151,14 @@ func (j *job) env(entries []string, compile bool) []string {
 		switch {
 		case key == "TMPDIR" || key == "PATH" || (compile && key == "HOME"):
 			continue
-		case val == "/tmp":
+		case key == "GOCACHE":
 			val = j.tmpDir
-			if key == "GOCACHE" && j.e.d.GoCache != nil {
+			if j.e.d.GoCache != nil {
 				val = j.e.d.GoCache.Dir()
 			}
 			kv = key + "=" + val
+		case val == "/tmp":
+			kv = key + "=" + j.tmpDir
 		}
 		out = append(out, kv)
 	}

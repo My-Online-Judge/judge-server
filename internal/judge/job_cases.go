@@ -59,7 +59,7 @@ func (j *job) runCase(ctx context.Context, i int, c bundle.Case) (CaseResult, er
 
 	in := c.InputPath
 	if in == "" { // an inline case
-		in = filepath.Join(j.srcDir, n+".in")
+		in = filepath.Join(j.inDir, n+".in")
 		if err := writeNew(in, c.InputBytes, 0o644); err != nil {
 			return CaseResult{}, fmt.Errorf("write input of case %s: %w", c.Name, err)
 		}

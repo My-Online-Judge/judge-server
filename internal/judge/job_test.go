@@ -189,6 +189,10 @@ func testChecker(version string) *Checker {
 // prints makes the program of every case write out and exit 0.
 func prints(out string) testutil.Step { return testutil.Step{Stdout: []byte(out)} }
 
+// tmpExe is where a checker compile run by job id writes its binary before it is
+// published under the final name.
+func tmpExe(spjExe, id string) string { return spjExe + ".tmp-" + id }
+
 func caseNames(cs []CaseResult) []string {
 	out := make([]string, len(cs))
 	for i, c := range cs {
@@ -348,6 +352,29 @@ func TestJudgeCompileErrorStopsBeforeRuns(t *testing.T) {
 	}
 	f.assertJobDirGone("job1")
 	f.assertBudgetFree()
+}
+
+// Compile stdout and stderr go to one file: the Spec must name the same path for
+// both, which is what makes the shim share one open file (a test in the sandbox
+// package proves that), and the message must carry what both streams wrote.
+func TestJudgeCompileOutputKeepsBothStreams(t *testing.T) {
+	f := newFixture(t)
+	f.fake.Script(gpp, testutil.Step{
+		Result: sandbox.Result{ExitCode: 1},
+		Stdout: []byte("note: from stdout\n"),
+		Stderr: []byte("error: from stderr\n"),
+	})
+
+	out, err := f.judge("job1", cppRequest(f.bundle(threeCases, "")))
+	if err != nil {
+		t.Fatalf("Judge: %v", err)
+	}
+	if want := "note: from stdout\nerror: from stderr\n"; out.CompileError != want {
+		t.Errorf("CompileError = %q, want %q", out.CompileError, want)
+	}
+	if c := f.fake.CallsFor(gpp)[0]; c.Stdout == "" || c.Stdout != c.Stderr {
+		t.Errorf("compile streams = %q / %q, want one shared path", c.Stdout, c.Stderr)
+	}
 }
 
 func TestJudgeCompileFailureWithoutOutputStillSaysSomething(t *testing.T) {
@@ -571,7 +598,7 @@ func TestJudgeCheckerFlow(t *testing.T) {
 	spjExe := filepath.Join(f.spjDir("v1"), "spj-v1")
 	var spjSource string
 	f.fake.Script(gcc, testutil.Step{
-		Files: map[string][]byte{spjExe: []byte("binary")},
+		Files: map[string][]byte{tmpExe(spjExe, "job1"): []byte("binary")},
 		Inspect: func(s sandbox.Spec) {
 			raw, _ := os.ReadFile(filepath.Join(f.spjDir("v1"), "spj-v1.c"))
 			spjSource = string(raw)
@@ -613,7 +640,7 @@ func TestJudgeCheckerFlow(t *testing.T) {
 		t.Errorf("first call = %v as %d, want the user's compile as 12001", calls[0].Argv, calls[0].UID)
 	}
 	c := calls[1]
-	wantArgv := []string{gcc, "-O2", filepath.Join(f.spjDir("v1"), "spj-v1.c"), "-o", spjExe}
+	wantArgv := []string{gcc, "-O2", filepath.Join(f.spjDir("v1"), "spj-v1.c"), "-o", tmpExe(spjExe, "job1")}
 	if !slices.Equal(c.Argv, wantArgv) || c.UID != 12003 || c.GID != 12003 {
 		t.Errorf("checker compile = %v as %d:%d, want %v as 12003:12003", c.Argv, c.UID, c.GID, wantArgv)
 	}
@@ -648,6 +675,12 @@ func TestJudgeCheckerFlow(t *testing.T) {
 		}
 	}
 
+	// The compile's temp file was published: whole, root-owned, 0555, nothing else left.
+	assertPublishedChecker(t, f.spjDir("v1"), spjExe, "binary")
+	if _, err := os.Lstat(tmpExe(spjExe, "job1")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the temp binary is still there (lstat err %v)", err)
+	}
+
 	// A second job with the same version finds the binary and does not compile.
 	if _, err := f.judge("job2", req); err != nil {
 		t.Fatalf("second Judge: %v", err)
@@ -663,11 +696,98 @@ func TestJudgeCheckerFlow(t *testing.T) {
 	f.assertBudgetFree()
 }
 
+// assertPublishedChecker checks a cached checker the way the next job (and the
+// uid 12003 that runs it) sees it: the whole binary, mode 0555, in a version dir
+// that is no longer writable by anyone but root. Ownership is only checkable, and
+// only set, when the server runs as root.
+func assertPublishedChecker(t *testing.T, spjDir, exe, content string) {
+	t.Helper()
+	raw, err := os.ReadFile(exe)
+	if err != nil || string(raw) != content {
+		t.Errorf("checker binary = %q, %v, want %q", raw, err, content)
+	}
+	fi, err := os.Lstat(exe)
+	if err != nil {
+		t.Errorf("lstat checker binary: %v", err)
+		return
+	}
+	if fi.Mode() != 0o555 {
+		t.Errorf("checker binary mode = %v, want -r-xr-xr-x", fi.Mode())
+	}
+	di, err := os.Stat(spjDir)
+	if err != nil {
+		t.Errorf("stat version dir: %v", err)
+		return
+	}
+	if di.Mode() != fs.ModeDir|0o755 {
+		t.Errorf("version dir mode = %v, want drwxr-xr-x (the spj user must not write beside its binary)", di.Mode())
+	}
+	if os.Geteuid() == 0 {
+		if st := fi.Sys().(*syscall.Stat_t); st.Uid != 0 || st.Gid != 0 {
+			t.Errorf("checker binary owner = %d:%d, want root", st.Uid, st.Gid)
+		}
+		if st := di.Sys().(*syscall.Stat_t); st.Uid != 0 || st.Gid != 0 {
+			t.Errorf("version dir owner = %d:%d, want root", st.Uid, st.Gid)
+		}
+	}
+}
+
+// A server that died mid-compile leaves a temp file, or (an older server) a
+// half-written file under the final name. Neither is a cache hit: both go, the
+// checker is compiled again, and only the finished binary is published.
+func TestJudgeCheckerCacheIgnoresHalfWrittenAndStaleFiles(t *testing.T) {
+	f := newFixture(t)
+	b := f.bundle(threeCases[:1], "v1")
+	spjExe := filepath.Join(f.spjDir("v1"), "spj-v1")
+	if err := os.MkdirAll(f.spjDir("v1"), 0o775); err != nil {
+		t.Fatal(err)
+	}
+	stale := tmpExe(spjExe, "crashedjob")
+	other := filepath.Join(f.spjDir("v1"), "spj-v1.c.keep") // not ours: must stay
+	for path, mode := range map[string]os.FileMode{spjExe: 0o755, stale: 0o755, other: 0o644} {
+		if err := os.WriteFile(path, []byte("half"), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{tmpExe(spjExe, "job1"): []byte("whole")}})
+	f.fake.Script(spjExe, testutil.Step{})
+	req := cppRequest(b)
+	req.Checker = testChecker("v1")
+
+	out, err := f.judge("job1", req)
+	if err != nil || len(out.Cases) != 1 || out.Cases[0].Result != 0 {
+		t.Fatalf("Judge = %+v, %v, want the case to run through the fresh checker", out, err)
+	}
+	if n := len(f.fake.CallsFor(gcc)); n != 1 {
+		t.Errorf("checker compiled %d times, want once: the half-written file is not a cache hit", n)
+	}
+	assertPublishedChecker(t, f.spjDir("v1"), spjExe, "whole")
+	if _, err := os.Lstat(stale); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the stale temp file is still there (lstat err %v)", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("an unrelated file in the version dir was removed: %v", err)
+	}
+
+	// A binary of the right content but the wrong mode is no hit either.
+	if err := os.Chmod(spjExe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{tmpExe(spjExe, "job2"): []byte("again")}})
+	if _, err := f.judge("job2", req); err != nil {
+		t.Fatalf("second Judge: %v", err)
+	}
+	if n := len(f.fake.CallsFor(gcc)); n != 2 {
+		t.Errorf("checker compiled %d times, want 2: a 0755 file is not a published binary", n)
+	}
+	assertPublishedChecker(t, f.spjDir("v1"), spjExe, "again")
+}
+
 func TestJudgeCheckerIsSkippedWhenTheProgramFailed(t *testing.T) {
 	f := newFixture(t)
 	b := f.bundle(threeCases[:1], "v1")
 	spjExe := filepath.Join(f.spjDir("v1"), "spj-v1")
-	f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{spjExe: nil}})
+	f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{tmpExe(spjExe, "job1"): nil}})
 	f.fake.Script(f.exe("job1"), testutil.Step{Result: sandbox.Result{ExitCode: 1}})
 	req := cppRequest(b)
 	req.Checker = testChecker("v1")
@@ -699,7 +819,7 @@ func TestJudgeCheckerFailuresAreSystemErrors(t *testing.T) {
 			f := newFixture(t)
 			b := f.bundle(threeCases[:1], "v1")
 			spjExe := filepath.Join(f.spjDir("v1"), "spj-v1")
-			f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{spjExe: nil}})
+			f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{tmpExe(spjExe, "job1"): nil}})
 			f.fake.Script(spjExe, testutil.Step{Result: tt.res})
 			req := cppRequest(b)
 			req.Checker = testChecker("v1")
@@ -743,8 +863,8 @@ func TestJudgeCheckerCompileFailureIsNotCached(t *testing.T) {
 	spjExe := filepath.Join(f.spjDir("v1"), "spj-v1")
 	f.fake.Script(gcc,
 		// The compiler left a half-written binary behind before it failed.
-		testutil.Step{Result: sandbox.Result{ExitCode: 1}, Stderr: []byte("broken\n"), Files: map[string][]byte{spjExe: []byte("half")}},
-		testutil.Step{Files: map[string][]byte{spjExe: []byte("whole")}},
+		testutil.Step{Result: sandbox.Result{ExitCode: 1}, Stderr: []byte("broken\n"), Files: map[string][]byte{tmpExe(spjExe, "job1"): []byte("half")}},
+		testutil.Step{Files: map[string][]byte{tmpExe(spjExe, "job2"): []byte("whole")}},
 	)
 	req := cppRequest(b)
 	req.Checker = testChecker("v1")
@@ -753,8 +873,13 @@ func TestJudgeCheckerCompileFailureIsNotCached(t *testing.T) {
 	if err != nil || out.SPJCompileError == "" {
 		t.Fatalf("first Judge = %+v, %v, want an SPJCompileError", out, err)
 	}
-	if _, err := os.Lstat(spjExe); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("the failed compile's binary is still cached (lstat err %v)", err)
+	for _, path := range []string{spjExe, tmpExe(spjExe, "job1")} {
+		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s is still there after a failed compile (lstat err %v)", path, err)
+		}
+	}
+	if di, err := os.Stat(f.spjDir("v1")); err != nil || di.Mode() != fs.ModeDir|0o755 {
+		t.Errorf("version dir after a failed compile = %v, %v, want drwxr-xr-x", di, err)
 	}
 
 	out, err = f.judge("job2", req)
@@ -777,10 +902,10 @@ func TestJudgeCheckerCompilesOnceUnderConcurrency(t *testing.T) {
 	gate := make(chan struct{})
 	f.fake.Script(gcc, testutil.Step{
 		Block: gate,
-		Files: map[string][]byte{spjExe: []byte("whole")},
+		Files: map[string][]byte{tmpExe(spjExe, "jobA"): []byte("whole")},
 		// The linker creates the binary long before it is done writing it.
 		Inspect: func(sandbox.Spec) {
-			if err := os.WriteFile(spjExe, []byte("half"), 0o755); err != nil {
+			if err := os.WriteFile(tmpExe(spjExe, "jobA"), []byte("half"), 0o755); err != nil {
 				t.Errorf("write the half-written binary: %v", err)
 			}
 		},
@@ -816,7 +941,7 @@ func TestJudgeCheckerWorksWithInlineCases(t *testing.T) {
 	f := newFixture(t)
 	b := bundle.Inline([]bundle.InlineCase{{Input: []byte("a\n"), Output: []byte("x\n")}})
 	spjExe := filepath.Join(f.spjDir("v1"), "spj-v1")
-	f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{spjExe: nil}})
+	f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{tmpExe(spjExe, "job1"): nil}})
 	req := cppRequest(b)
 	req.Checker = testChecker("v1") // the request is authoritative: the bundle is not marked SPJ
 
@@ -828,7 +953,7 @@ func TestJudgeCheckerWorksWithInlineCases(t *testing.T) {
 		t.Errorf("Result = %d, want 0", out.Cases[0].Result)
 	}
 	checks := f.fake.CallsFor(spjExe)
-	if want := []string{spjExe, filepath.Join(f.jobDir("job1"), "src", "1.in"), filepath.Join(f.jobDir("job1"), "out", "1.out")}; len(checks) != 1 || !slices.Equal(checks[0].Argv, want) {
+	if want := []string{spjExe, filepath.Join(f.jobDir("job1"), "in", "1.in"), filepath.Join(f.jobDir("job1"), "out", "1.out")}; len(checks) != 1 || !slices.Equal(checks[0].Argv, want) {
 		t.Errorf("checker calls = %+v, want one with argv %v", checks, want)
 	}
 }
@@ -979,7 +1104,8 @@ func TestJudgeCancelWhileWaitingForBudget(t *testing.T) {
 func TestJudgeGoEnvRewrite(t *testing.T) {
 	setup := func(f *fixture) Request {
 		req := cppRequest(f.bundle(threeCases[:1], ""))
-		req.Lang.Compile.Env = []string{"GOCACHE=/tmp", "FOO=/tmp", "KEEP=/tmpx", "TMPDIR=/other", "HOME=/root", "PATH=/evil"}
+		// GOCACHE is rewritten whatever its value; other entries only when exactly /tmp.
+		req.Lang.Compile.Env = []string{"GOCACHE=/var/cache/go", "FOO=/tmp", "KEEP=/tmpx", "TMPDIR=/other", "HOME=/root", "PATH=/evil"}
 		req.Lang.Run.Env = []string{"GODEBUG=madvdontneed=1", "BAR=/tmp", "GOCACHE=/tmp"}
 		return req
 	}
@@ -1017,8 +1143,12 @@ func TestJudgeGoEnvRewrite(t *testing.T) {
 			t.Fatalf("Judge: %v", err)
 		}
 		tmp := filepath.Join(f.jobDir("job1"), "tmp")
-		if env := f.fake.CallsFor(gpp)[0].Env; !slices.Contains(env, "GOCACHE="+tmp) {
+		env := f.fake.CallsFor(gpp)[0].Env
+		if !slices.Contains(env, "GOCACHE="+tmp) || envCount(env, "GOCACHE=") != 1 {
 			t.Errorf("compile env %v, want GOCACHE in the job's tmp when there is no shared cache", env)
+		}
+		if run := f.fake.CallsFor(f.exe("job1"))[0].Env; !slices.Contains(run, "GOCACHE="+tmp) {
+			t.Errorf("run env %v, want GOCACHE in the job's tmp too", run)
 		}
 	})
 }
@@ -1114,11 +1244,11 @@ func TestJudgeInlineCases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Judge: %v", err)
 	}
-	src := filepath.Join(f.jobDir("job1"), "src")
+	in := filepath.Join(f.jobDir("job1"), "in") // root-only, not the compiler-writable src/
 	wantRead := map[string]string{
-		filepath.Join(src, "1.in"): "a\n|-rw-r--r--",
-		filepath.Join(src, "2.in"): "|-rw-r--r--",
-		filepath.Join(src, "3.in"): "c\n|-rw-r--r--",
+		filepath.Join(in, "1.in"): "a\n|-rw-r--r--",
+		filepath.Join(in, "2.in"): "|-rw-r--r--",
+		filepath.Join(in, "3.in"): "c\n|-rw-r--r--",
 	}
 	for path, want := range wantRead {
 		if read[path] != want {
@@ -1241,6 +1371,11 @@ func TestJudgeRejectsInvalidRequests(t *testing.T) {
 		{"src name is empty", func(r *Request) { r.Lang.Compile.SrcName = "" }},
 		{"exe name escapes the job dir", func(r *Request) { r.Lang.Compile.ExeName = "a/../../b" }},
 		{"exe name is empty", func(r *Request) { r.Lang.Compile.ExeName = "" }},
+		{"src name has a space", func(r *Request) { r.Lang.Compile.SrcName = "my main.cpp" }},
+		{"src name has a tab", func(r *Request) { r.Lang.Compile.SrcName = "main\t.cpp" }},
+		{"src name has a newline", func(r *Request) { r.Lang.Compile.SrcName = "main.cpp\n" }},
+		{"exe name has a space", func(r *Request) { r.Lang.Compile.ExeName = "my main" }},
+		{"exe name has a no-break space", func(r *Request) { r.Lang.Compile.ExeName = "my\u00a0main" }},
 		{"zero cpu limit", func(r *Request) { r.MaxCPUTimeMs = 0 }},
 		{"negative cpu limit", func(r *Request) { r.MaxCPUTimeMs = -5 }},
 		{"absurd cpu limit", func(r *Request) { r.MaxCPUTimeMs = 1 << 40 }},
@@ -1263,6 +1398,14 @@ func TestJudgeRejectsInvalidRequests(t *testing.T) {
 		{"checker src name escapes", func(r *Request) {
 			r.Checker = testChecker("v1")
 			r.Checker.Compile.SrcName = "../{spj_version}.c"
+		}},
+		{"checker src name has a space", func(r *Request) {
+			r.Checker = testChecker("v1")
+			r.Checker.Compile.SrcName = "spj {spj_version}.c"
+		}},
+		{"checker exe name has a space", func(r *Request) {
+			r.Checker = testChecker("v1")
+			r.Checker.ExeName = "spj {spj_version}"
 		}},
 		{"checker exe name is empty", func(r *Request) {
 			r.Checker = testChecker("v1")
@@ -1328,7 +1471,7 @@ func TestJudgeJobDirLayout(t *testing.T) {
 	}
 	seen := map[string]entry{}
 	f.fake.Script(gpp, testutil.Step{Inspect: func(sandbox.Spec) {
-		for _, name := range []string{"", "src", "out", "tmp"} {
+		for _, name := range []string{"", "src", "in", "out", "tmp"} {
 			fi, err := os.Stat(filepath.Join(jobDir, name))
 			if err != nil {
 				t.Errorf("stat %q: %v", name, err)
@@ -1352,6 +1495,7 @@ func TestJudgeJobDirLayout(t *testing.T) {
 	wantMode := map[string]fs.FileMode{
 		"":    fs.ModeDir | 0o711,
 		"src": fs.ModeDir | 0o775,
+		"in":  fs.ModeDir | 0o755,
 		"out": fs.ModeDir | 0o755,
 		"tmp": fs.ModeDir | fs.ModeSticky | 0o777,
 	}
@@ -1364,7 +1508,7 @@ func TestJudgeJobDirLayout(t *testing.T) {
 		if e := seen["src"]; e.uid != 0 || e.gid != 12001 {
 			t.Errorf("src owner = %d:%d, want 0:12001", e.uid, e.gid)
 		}
-		for _, name := range []string{"", "out", "tmp"} {
+		for _, name := range []string{"", "in", "out", "tmp"} {
 			if e := seen[name]; e.uid != 0 {
 				t.Errorf("%q owner uid = %d, want root", name, e.uid)
 			}
