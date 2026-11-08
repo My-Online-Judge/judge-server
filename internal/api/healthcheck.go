@@ -18,22 +18,30 @@ import (
 // healthcheckTimeout bounds the whole probe: dial, handshake and Ping.
 const healthcheckTimeout = 3 * time.Second
 
+// hostName is this host's name; a variable so a test can stand in a host whose
+// name is in no certificate.
+var hostName = os.Hostname
+
 // Healthcheck pings the server on this host over mutual TLS and returns nil only
 // when it answers. It dials 127.0.0.1 at the port of cfg.Listen, verifying the
-// server certificate for this host's name (the one the certificate is issued for)
-// and presenting that same certificate as its client certificate: the PKI issues
-// it with both extended key usages, and Ping admits any CA-signed client. The
-// token, when configured, goes in the metadata as for any other call.
+// server certificate for cfg.HealthcheckServerName (HEALTHCHECK_SERVER_NAME), or
+// for this host's name when that is empty (the name the certificate is issued for
+// under compose, where the host name is set to it), and presenting that same
+// certificate as its client certificate: the PKI issues it with both extended key
+// usages, and Ping admits any CA-signed client. The token, when configured, goes
+// in the metadata as for any other call.
 func Healthcheck(cfg config.Config) error {
 	port, err := healthcheckPort(cfg.Listen)
 	if err != nil {
 		return err
 	}
-	host, err := os.Hostname()
-	if err != nil {
-		return fmt.Errorf("host name: %w", err)
+	name := cfg.HealthcheckServerName
+	if name == "" {
+		if name, err = hostName(); err != nil {
+			return fmt.Errorf("host name: %w", err)
+		}
 	}
-	creds, err := clientCreds(cfg.TLSDir, host)
+	creds, err := clientCreds(cfg.TLSDir, name)
 	if err != nil {
 		return err
 	}

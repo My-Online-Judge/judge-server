@@ -243,6 +243,59 @@ func TestHealthcheckFailures(t *testing.T) {
 	})
 }
 
+// On k3s the host name is the pod's, which is in no certificate SAN: HEALTHCHECK_SERVER_NAME names the
+// SAN to verify instead. The certificate has the SAN judge-server and not the (stood-in) host name.
+func TestHealthcheckServerName(t *testing.T) {
+	r := startRig(t, rigOptions{})
+	cfg := r.cfg // TLS dir and token of the rig
+	cfg.Listen = r.addr
+
+	prev := hostName
+	t.Cleanup(func() { hostName = prev })
+	hostName = func() (string, error) { return "judge-server-7d9f8b6c5-xk2lq", nil }
+
+	t.Run("by default the host name is verified, and it is in no SAN", func(t *testing.T) {
+		wantNameMismatch(t, Healthcheck(cfg))
+	})
+	t.Run("the configured name is verified instead", func(t *testing.T) {
+		cfg := cfg
+		cfg.HealthcheckServerName = testutil.ServerName // "judge-server", a SAN
+		if err := Healthcheck(cfg); err != nil {
+			t.Fatalf("Healthcheck with HEALTHCHECK_SERVER_NAME=%s: %v", cfg.HealthcheckServerName, err)
+		}
+	})
+	t.Run("the configured name wins over a host name that would pass", func(t *testing.T) {
+		hostName = func() (string, error) { return testutil.ServerName, nil }
+		cfg := cfg
+		cfg.HealthcheckServerName = "not-in-the-certificate"
+		wantNameMismatch(t, Healthcheck(cfg))
+	})
+	t.Run("the host name is not looked up when the name is configured", func(t *testing.T) {
+		hostName = func() (string, error) { return "", os.ErrNotExist }
+		cfg := cfg
+		cfg.HealthcheckServerName = testutil.ServerName
+		if err := Healthcheck(cfg); err != nil {
+			t.Fatalf("Healthcheck failed on the host name lookup although the name is configured: %v", err)
+		}
+		cfg.HealthcheckServerName = ""
+		if err := Healthcheck(cfg); err == nil {
+			t.Fatal("Healthcheck passed although the host name could not be read")
+		}
+	})
+}
+
+// wantNameMismatch fails unless err is the TLS client's refusal of a server certificate that is not valid for the
+// name asked for (and not, say, a refused connection, which would make the passing cases above vacuous).
+func wantNameMismatch(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Healthcheck passed for a name that is not in the certificate")
+	}
+	if !strings.Contains(err.Error(), "certificate is valid for") {
+		t.Fatalf("Healthcheck failed, but not on the certificate name: %v", err)
+	}
+}
+
 func TestHealthcheckPort(t *testing.T) {
 	for listen, want := range map[string]string{":8080": "8080", "0.0.0.0:9": "9", "[::]:443": "443", "127.0.0.1:65535": "65535"} {
 		got, err := healthcheckPort(listen)

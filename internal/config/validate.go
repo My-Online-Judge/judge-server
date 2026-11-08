@@ -57,6 +57,12 @@ func Validate(c Config) error {
 		errs = append(errs, fmt.Errorf("TMP_DIR must not be the same directory as WORK_DIR (%q): both hold a jobs/ directory", c.TmpDir))
 	}
 
+	// The name goes to the TLS stack as the server name to verify: a blank in it can match no
+	// certificate, so the probe would fail on every run with a message about the certificate.
+	if strings.ContainsFunc(c.HealthcheckServerName, unicode.IsSpace) {
+		errs = append(errs, fmt.Errorf("HEALTHCHECK_SERVER_NAME must not contain whitespace, got %q", c.HealthcheckServerName))
+	}
+
 	if len(c.AllowedClients) == 0 {
 		errs = append(errs, errors.New("JUDGE_ALLOWED_CLIENTS must name at least one client CN"))
 	}

@@ -58,7 +58,8 @@ What a job owns is closed to every other slot, with the slot's gid as the key (`
   uids are the same numbers in both sandbox containers.
 
 ```
-judge-server [serve|healthcheck|mock]      serve (default); healthcheck pings itself over mTLS (the compose probe);
+judge-server [serve|healthcheck|mock]      serve (default); healthcheck pings itself over mTLS (the compose and k3s probe),
+                                           verifying the certificate for HEALTHCHECK_SERVER_NAME or, unset, the host name;
                                            mock is the scripted API of the development stack (internal/mock)
 ```
 
@@ -73,6 +74,7 @@ the three TLS files, or with an empty client list; it never listens in plaintext
 | `TLS_DIR` | `/etc/oj/tls` | must hold `tls.crt`, `tls.key`, `ca.crt` (the server's certificate, its key, the CA of the clients) |
 | `TOKEN` | empty | optional shared secret; when set, every call must carry `x-judge-server-token: <sha256 hex of TOKEN>` as well |
 | `JUDGE_ALLOWED_CLIENTS` | `judge-worker,run-worker` | client certificate CNs admitted to `Judge` (`Ping` admits any CA-signed client, for the healthcheck) |
+| `HEALTHCHECK_SERVER_NAME` | empty (this host's name, `os.Hostname()`) | the name the `healthcheck` subcommand verifies the server certificate for; set it where the host name is in no certificate SAN (a k3s pod's name is the pod's, not the service's `judge-server`); no whitespace |
 | `TEST_CASE_DIR` | `/test_case` | where `<slug>__<hash>` bundles are read from |
 | `WORK_DIR` | `/work` | job directories, the checker cache, the Go build cache; a tmpfs mounted `exec`; absolute, no whitespace |
 | `TMP_DIR` | `/tmp` | the tmpfs of the programs' `TMPDIR` (`<TMP_DIR>/jobs/<id>`), apart from `WORK_DIR`; absolute, no whitespace, not `WORK_DIR`; the server sets it to `0711` |

@@ -37,6 +37,16 @@ func TestValidateAcceptsZeroQueue(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsHealthcheckServerName(t *testing.T) {
+	for _, name := range []string{"", "judge-server", "judge-server.oj.svc.cluster.local"} {
+		cfg := validConfig(t)
+		cfg.HealthcheckServerName = name
+		if err := Validate(cfg); err != nil {
+			t.Errorf("Validate(HealthcheckServerName=%q) = %v", name, err)
+		}
+	}
+}
+
 func TestValidateRejects(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -64,6 +74,8 @@ func TestValidateRejects(t *testing.T) {
 		{"tmp dir is the work dir", func(c *Config) { c.TmpDir = c.WorkDir + "/" }, "TMP_DIR"},
 		{"relative test case dir", func(c *Config) { c.TestCaseDir = "test_case" }, "TEST_CASE_DIR"},
 		{"test case dir with a tab", func(c *Config) { c.TestCaseDir = "/test\tcase" }, "TEST_CASE_DIR"},
+		{"healthcheck server name with a space", func(c *Config) { c.HealthcheckServerName = "judge server" }, "HEALTHCHECK_SERVER_NAME"},
+		{"healthcheck server name with a tab", func(c *Config) { c.HealthcheckServerName = "judge-server\t" }, "HEALTHCHECK_SERVER_NAME"},
 		{"no allowed clients", func(c *Config) { c.AllowedClients = []string{} }, "JUDGE_ALLOWED_CLIENTS"},
 		{"nil allowed clients", func(c *Config) { c.AllowedClients = nil }, "JUDGE_ALLOWED_CLIENTS"},
 		{"blank allowed client", func(c *Config) { c.AllowedClients = []string{"judge-worker", " "} }, "JUDGE_ALLOWED_CLIENTS"},

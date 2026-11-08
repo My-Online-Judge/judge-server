@@ -59,6 +59,22 @@ func TestLoadParsesBytesAndInts(t *testing.T) {
 	}
 }
 
+func TestLoadHealthcheckServerName(t *testing.T) {
+	got, err := Load(envOf(map[string]string{"HEALTHCHECK_SERVER_NAME": "judge-server"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.HealthcheckServerName != "judge-server" {
+		t.Errorf("HealthcheckServerName = %q, want judge-server", got.HealthcheckServerName)
+	}
+	// Unset or empty is the default: the healthcheck verifies for the host's name.
+	for _, env := range []map[string]string{nil, {"HEALTHCHECK_SERVER_NAME": ""}} {
+		if got, err := Load(envOf(env)); err != nil || got.HealthcheckServerName != "" {
+			t.Errorf("Load(%v): HealthcheckServerName = %q, %v; want empty", env, got.HealthcheckServerName, err)
+		}
+	}
+}
+
 func TestLoadRejectsBadInt(t *testing.T) {
 	_, err := Load(envOf(map[string]string{"MAX_JOBS": "x"}))
 	if err == nil {

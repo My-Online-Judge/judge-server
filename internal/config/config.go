@@ -20,6 +20,11 @@ type Config struct {
 	Token          string
 	AllowedClients []string
 
+	// HealthcheckServerName is the name the healthcheck subcommand verifies the server
+	// certificate for. Empty means this host's name (os.Hostname); set it where the host
+	// name is in no certificate SAN (a k3s pod's name is the pod's, not the service's).
+	HealthcheckServerName string
+
 	TestCaseDir string
 	WorkDir     string
 	TmpDir      string // the tmpfs a run's TMPDIR lives on (<TmpDir>/jobs/<id>), apart from WorkDir
@@ -58,6 +63,8 @@ func Load(getenv func(string) string) (Config, error) {
 		WorkDir:        str("WORK_DIR", "/work"),
 		TmpDir:         str("TMP_DIR", "/tmp"),
 		LogFormat:      str("LOG_FORMAT", "json"),
+
+		HealthcheckServerName: getenv("HEALTHCHECK_SERVER_NAME"),
 	}
 
 	var err error
