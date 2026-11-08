@@ -1,0 +1,12 @@
+version: v2
+inputs:
+  - directory: ../oj-common/src/main/proto
+    paths:
+      - ../oj-common/src/main/proto/judge_server.proto
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.1
+    out: internal/pb
+    opt: module=github.com/My-Online-Judge/judge-server/internal/pb
+  - remote: buf.build/grpc/go:v1.5.1
+    out: internal/pb
+    opt: module=github.com/My-Online-Judge/judge-server/internal/pb

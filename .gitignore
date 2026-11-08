@@ -1,2 +1,12 @@
 .env
 log
+
+# Go / build
+/bin/
+*.test
+*.out
+coverage.*
+vendor/
+
+# buf
+.buf/
