@@ -25,6 +25,9 @@ type record struct {
 
 const recordFields = 6
 
+// errWaitFailed is qduoj's WAIT_FAILED: the wait status is not a termination.
+const errWaitFailed = -4
+
 // parseRecord reads the shim's report. ok is false for anything that is not
 // exactly six integers followed by a newline, such as an empty pipe because the
 // shim was killed before it could write.
@@ -65,6 +68,10 @@ func (r record) result() Result {
 		res.Signal = int(ws.Signal())
 	case ws.Exited():
 		res.ExitCode = ws.ExitStatus()
+	default:
+		// Neither exited nor killed (a ptrace-stop or similar): the shim waits for a real
+		// end, so this is a shim fault, and zeros here would read as a clean exit.
+		return Result{Error: errWaitFailed}
 	}
 	res.CPUTimeMs = roundHalfUp(r.utimeUs+r.stimeUs, 1_000)
 	res.RealTimeMs = roundHalfUp(r.wallNs, 1_000_000)

@@ -24,11 +24,13 @@
  * resident set that starts at the server's own (the server vforks the shim and
  * the kernel folds the parent's high-water mark into the child at exec).
  *
- * The child (the program) does, in this order: open the stdin/stdout/stderr
- * files and dup2 them, chdir, write 1000 to oom_score_adj, setrlimit,
- * setgroups(0) + setgid + setuid, PR_SET_NO_NEW_PRIVS, load the seccomp filter,
- * execve. A failing step makes it write one signed byte, the judger error code,
- * to an internal pipe and _exit(255).
+ * The child (the program) does, in this order: refuse uid 0 / gid 0, open the
+ * stdin/stdout/stderr files (O_NOFOLLOW) and dup2 them, chdir, write 1000 to
+ * oom_score_adj, setrlimit, setgroups(0) + setgid + setuid, PR_SET_PDEATHSIG,
+ * PR_SET_NO_NEW_PRIVS, load the seccomp filter, execve. A failing step makes it
+ * write one signed byte, the judger error code, to an internal pipe and _exit(255).
+ * The runner waits until the program has exited or been killed: a ptrace stop is
+ * not an end (see reap).
  *
  * The runner reports to the server on fd 3 (a pipe the server created) with one
  * line, written once, when the program is over or could not start:
@@ -59,9 +61,10 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Judger error codes, the numbers qduoj uses (-3 to -5 are not used here). */
+/* Judger error codes, the numbers qduoj uses (-3 and -5 are not used here). */
 #define ERR_INVALID_CONFIG (-1)
 #define ERR_FORK_FAILED (-2)
+#define ERR_WAIT_FAILED (-4)
 #define ERR_LOAD_SECCOMP_FAILED (-6)
 #define ERR_SETRLIMIT_FAILED (-7)
 #define ERR_DUP2_FAILED (-8)
@@ -179,10 +182,12 @@ static int parse_args(int argc, char **argv, struct config *c)
  *
  * Syscalls are looked up by name for the native architecture. A name libseccomp
  * has no number for at all (a syscall newer than the installed libseccomp) is
- * skipped. One the architecture lacks (open, fork, vfork, creat, access,
- * arch_prctl, readlink on aarch64) gets a pseudo number that seccomp_rule_add
- * accepts and ignores for that architecture, so one source serves x86_64 and
- * aarch64. See seccomp_rules.md for what each list is, where it comes from and why.
+ * skipped in an allow-list, which only makes the filter stricter, and is an error
+ * (-6, the run does not start) in a deny-list, where skipping would leave a hole.
+ * A syscall the architecture lacks (open, fork, vfork, creat, access, arch_prctl,
+ * readlink on aarch64) gets a pseudo number that seccomp_rule_add accepts and
+ * ignores for that architecture, so one source serves x86_64 and aarch64.
+ * See seccomp_rules.md for what each list is, where it comes from and why.
  */
 
 /* c_cpp: default KILL_PROCESS, these are allowed. */
@@ -190,11 +195,12 @@ static const char *const c_cpp_allow[] = {
     /* QingdaoU/Judger src/rules/c_cpp.c, branch newnew */
     "access", "arch_prctl", "brk", "clock_gettime", "close", "exit_group", "faccessat", "fstat",
     "futex", "getrandom", "lseek", "mmap", "mprotect", "munmap", "newfstatat", "pread64",
-    "prlimit64", "read", "readlink", "readv", "rseq", "set_robust_list", "set_tid_address",
+    "read", "readlink", "readv", "rseq", "set_robust_list", "set_tid_address",
     "write", "writev",
     /* added here */
     "mremap",     /* realloc of a large block */
     "readlinkat", /* readlink on architectures without readlink */
+    /* prlimit64 is not here: see add_prlimit_rules */
 };
 
 /* general: default ALLOW, these are killed. */
@@ -208,6 +214,15 @@ static const char *const general_deny[] = {
     "tkill", "pidfd_send_signal", "pidfd_getfd", "pidfd_open",
     "creat",   /* open for writing without flags to check */
     "openat2", /* its flags are in a struct the filter cannot read */
+    /* io_uring can open files and create sockets without the calls denied above */
+    "io_uring_setup", "io_uring_enter", "io_uring_register",
+    /* defense in depth: kernel attack surface a program has no use for */
+    "unshare", "setns", "userfaultfd", "bpf",
+#ifdef JUDGE_RUNNER_TEST_UNKNOWN_DENY
+    /* build-time test hook, never defined in a real build: a name libseccomp cannot
+     * resolve must fail the filter (see runner_sandbox_test.go) */
+    "judge_runner_test_no_such_syscall",
+#endif
 };
 
 /* general: killed when the target process is not the caller itself. */
@@ -220,13 +235,33 @@ static int resolve(const char *name)
     return seccomp_syscall_resolve_name(name); /* __NR_SCMP_ERROR if unknown */
 }
 
+/* An allow-list entry libseccomp does not know is dropped (the filter gets
+ * stricter); a deny-list entry it does not know fails the whole filter. */
 static int add_simple(scmp_filter_ctx ctx, uint32_t action, const char *name)
 {
     int nr = resolve(name);
 
     if (nr == __NR_SCMP_ERROR)
-        return 0;
+        return action == SCMP_ACT_ALLOW ? 0 : -1;
     return seccomp_rule_add(ctx, action, nr, 0);
+}
+
+/* prlimit64 reads or sets the limits of any process of the same uid, including
+ * other cases running concurrently. Only prlimit64(0, res, NULL, &old) is allowed,
+ * which is what glibc's getrlimit and its start-up do: the caller itself (arg0 == 0)
+ * and no new limit (arg2 == NULL). Anything else is killed. */
+static int add_prlimit_rules(scmp_filter_ctx ctx, int allow_list)
+{
+    int nr = resolve("prlimit64");
+
+    if (nr == __NR_SCMP_ERROR)
+        return allow_list ? 0 : -1;
+    if (allow_list)
+        return seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 2,
+                                SCMP_CMP(0, SCMP_CMP_EQ, 0), SCMP_CMP(2, SCMP_CMP_EQ, 0));
+    if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1, SCMP_CMP(0, SCMP_CMP_NE, 0)) != 0)
+        return -1;
+    return seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1, SCMP_CMP(2, SCMP_CMP_NE, 0));
 }
 
 /* The one execve the program may do, to its own executable: the pointer is
@@ -254,8 +289,11 @@ static int add_open_rules(scmp_filter_ctx ctx, int allow_read_only)
     for (i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
         int nr = resolve(calls[i].name);
 
-        if (nr == __NR_SCMP_ERROR)
-            continue;
+        if (nr == __NR_SCMP_ERROR) {
+            if (allow_read_only)
+                continue;
+            return -1;
+        }
         if (allow_read_only) {
             if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 1,
                                  SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0)) != 0)
@@ -300,7 +338,8 @@ static int load_seccomp(const char *rule, const char *exe)
         for (i = 0; i < sizeof(c_cpp_allow) / sizeof(c_cpp_allow[0]); i++)
             if (add_simple(ctx, SCMP_ACT_ALLOW, c_cpp_allow[i]) != 0)
                 goto out;
-        if (add_execve_rule(ctx, 1, exe) != 0 || add_open_rules(ctx, 1) != 0 || add_ioctl_tcgets_rule(ctx) != 0)
+        if (add_execve_rule(ctx, 1, exe) != 0 || add_open_rules(ctx, 1) != 0 || add_ioctl_tcgets_rule(ctx) != 0 ||
+            add_prlimit_rules(ctx, 1) != 0)
             goto out;
     } else {
         for (i = 0; i < sizeof(general_deny) / sizeof(general_deny[0]); i++)
@@ -310,14 +349,14 @@ static int load_seccomp(const char *rule, const char *exe)
             int nr = resolve(general_deny_foreign_signal[i]);
 
             if (nr == __NR_SCMP_ERROR)
-                continue;
+                goto out;
             /* arg0 is the target's thread group id; the program's own id is the same
              * before and after execve. */
             if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1,
                                  SCMP_CMP(0, SCMP_CMP_NE, (scmp_datum_t)getpid())) != 0)
                 goto out;
         }
-        if (add_execve_rule(ctx, 0, exe) != 0 || add_open_rules(ctx, 0) != 0)
+        if (add_execve_rule(ctx, 0, exe) != 0 || add_open_rules(ctx, 0) != 0 || add_prlimit_rules(ctx, 0) != 0)
             goto out;
     }
     rc = seccomp_load(ctx);
@@ -340,9 +379,13 @@ static void child_fail(int pipe_fd, int code)
     _exit(255);
 }
 
+/* The stream files are opened as root (DAC_OVERRIDE), so a symlink planted at one
+ * of the paths must not be followed: O_NOFOLLOW makes the open fail (ELOOP, also
+ * for a dangling link that O_CREAT would otherwise create). It covers the last
+ * path component only: the caller keeps the directory unwritable by the run uid. */
 static int redirect(const char *path, int flags, mode_t mode, int target)
 {
-    int fd = open(path, flags | O_CLOEXEC, mode);
+    int fd = open(path, flags | O_CLOEXEC | O_NOFOLLOW, mode);
 
     if (fd < 0)
         return -1;
@@ -376,8 +419,13 @@ static void write_oom_score_adj(void)
     close(fd);
 }
 
-static void run_child(const struct config *c, int pipe_fd)
+static void run_child(const struct config *c, int pipe_fd, pid_t runner_pid)
 {
+    /* Never run a program as root, whatever the caller asked for: setuid(0) would
+     * succeed even as root, so the identity switch itself would not notice. */
+    if (c->uid == 0 || c->gid == 0)
+        child_fail(pipe_fd, ERR_SETUID_FAILED);
+
     if (redirect(c->stdin_path, O_RDONLY, 0, STDIN_FILENO) != 0 ||
         redirect(c->stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDOUT_FILENO) != 0 ||
         redirect(c->stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDERR_FILENO) != 0)
@@ -399,6 +447,13 @@ static void run_child(const struct config *c, int pipe_fd)
 
     if (setgroups(0, NULL) != 0 || setgid(c->gid) != 0 || setuid(c->uid) != 0)
         child_fail(pipe_fd, ERR_SETUID_FAILED);
+
+    /* Die with the runner, so a program that leaves the runner's process group
+     * (setsid, setpgid) still goes when the runner is killed. Set after the identity
+     * switch, which clears it; execve of a program that is not setuid keeps it. If
+     * the runner is already gone nobody wants the run. */
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != runner_pid)
+        _exit(255);
 
     /* Needed for seccomp without CAP_SYS_ADMIN, and kept for every run. */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
@@ -441,21 +496,33 @@ static void report(int err, int status, const struct rusage *ru, long long wall_
     } while (w < 0 && errno == EINTR);
 }
 
-static pid_t reap(pid_t pid, int *status, struct rusage *ru)
+/* Wait until pid has really ended, exited or been killed. wait4 without WUNTRACED
+ * also reports a stop for a traced child, and a program that called
+ * ptrace(PTRACE_TRACEME) has made this process its tracer: every signal it then
+ * gets (SIGSEGV, SIGFPE, SIGXFSZ...) is a stop, not an end, and passing that on as
+ * a status would read as a clean exit. A stopped program is killed and waited for
+ * again, so the status reported is the one it really ends with. */
+static int reap(pid_t pid, int *status, struct rusage *ru)
 {
-    pid_t r;
+    for (;;) {
+        pid_t r = wait4(pid, status, 0, ru);
 
-    do {
-        r = wait4(pid, status, 0, ru);
-    } while (r < 0 && errno == EINTR);
-    return r;
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (WIFEXITED(*status) || WIFSIGNALED(*status))
+            return 0;
+        kill(pid, SIGKILL);
+    }
 }
 
 int main(int argc, char **argv)
 {
     struct config c;
     int errpipe[2];
-    pid_t pid;
+    pid_t pid, self;
     signed char code;
     ssize_t n;
     long long t0;
@@ -482,6 +549,7 @@ int main(int argc, char **argv)
         report(ERR_FORK_FAILED, 0, NULL, 0);
         return 255;
     }
+    self = getpid();
     pid = fork();
     if (pid < 0) {
         report(ERR_FORK_FAILED, 0, NULL, 0);
@@ -489,7 +557,7 @@ int main(int argc, char **argv)
     }
     if (pid == 0) {
         close(errpipe[0]);
-        run_child(&c, errpipe[1]);
+        run_child(&c, errpipe[1], self);
         _exit(255); /* not reached */
     }
     close(errpipe[1]);
@@ -509,12 +577,12 @@ int main(int argc, char **argv)
         /* cannot happen for a pipe we own; do not leave the child running */
         kill(pid, SIGKILL);
         reap(pid, &status, &ru);
-        report(ERR_FORK_FAILED, 0, NULL, 0);
+        report(ERR_WAIT_FAILED, 0, NULL, 0);
         return 255;
     }
 
     if (reap(pid, &status, &ru) < 0) {
-        report(ERR_FORK_FAILED, 0, NULL, 0);
+        report(ERR_WAIT_FAILED, 0, NULL, 0);
         return 255;
     }
     report(0, status, &ru, now_ns() - t0);

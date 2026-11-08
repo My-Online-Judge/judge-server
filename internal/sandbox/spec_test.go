@@ -76,6 +76,8 @@ func TestValidate(t *testing.T) {
 		{"stack", func(s *Spec) { s.MaxStack = 0 }, "MaxStack"},
 		{"fsize", func(s *Spec) { s.MaxOutputBytes = 0 }, "MaxOutputBytes"},
 		{"nproc", func(s *Spec) { s.MaxProcs = 0 }, "MaxProcs"},
+		{"uid 0", func(s *Spec) { s.UID = 0 }, "UID and GID must not be 0"},
+		{"gid 0", func(s *Spec) { s.GID = 0 }, "UID and GID must not be 0"},
 		{"unknown rule", func(s *Spec) { s.Seccomp = "golang" }, `unknown seccomp rule "golang"`},
 	}
 	for _, tt := range tests {

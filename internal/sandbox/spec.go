@@ -43,11 +43,14 @@ type Spec struct {
 	Env  []string // the program's whole environment (KEY=VALUE); the server's own is never inherited
 	Dir  string   // working directory, "" = leave as is
 
-	UID, GID uint32 // the identity the program runs as; supplementary groups are dropped
+	UID, GID uint32 // the identity the program runs as, never 0; supplementary groups are dropped
 
 	// Stream files. Stdin is opened read-only; Stdout and Stderr are created
 	// (0644) and truncated. "" means /dev/null. All three are opened as root
-	// before the identity switch, so they need not be accessible to UID.
+	// before the identity switch, so they need not be accessible to UID. The
+	// open refuses a symlink as the last path component (Error -8), but a root
+	// open is only as safe as the directory around it: the caller must keep the
+	// directory of the stream files unwritable by UID.
 	Stdin, Stdout, Stderr string
 
 	MaxCPUTimeMs    int64 // RLIMIT_CPU is MaxCPUTimeMs/1000+1 seconds; must be > 0
@@ -72,6 +75,8 @@ func (s Spec) validate() error {
 	switch {
 	case len(s.Argv) == 0:
 		return fmt.Errorf("%w: empty argv", errInvalidSpec)
+	case s.UID == 0 || s.GID == 0:
+		return fmt.Errorf("%w: UID and GID must not be 0 (a program never runs as root)", errInvalidSpec)
 	case s.MaxCPUTimeMs <= 0 || s.MaxCPUTimeMs > maxTimeLimitMs:
 		return fmt.Errorf("%w: MaxCPUTimeMs must be in (0, %d]", errInvalidSpec, maxTimeLimitMs)
 	case s.MaxRealTimeMs <= 0 || s.MaxRealTimeMs > maxTimeLimitMs:

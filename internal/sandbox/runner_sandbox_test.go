@@ -13,8 +13,11 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -34,7 +37,8 @@ var (
 	sharedDir  string
 	probeOnce  sync.Once
 	probeExe   string
-	probeError string
+	probeError string // the probe could not be built although gcc and the shim are there: a failure
+	probeSkip  string // a prerequisite is missing: a skip
 	runCounter atomic.Int64
 )
 
@@ -177,6 +181,14 @@ func execSpec(dir, exe, seccomp string, args ...string) Spec {
 func probe(t *testing.T) string {
 	t.Helper()
 	probeOnce.Do(func() {
+		if _, err := os.Stat("/usr/bin/gcc"); err != nil {
+			probeSkip = "/usr/bin/gcc not installed"
+			return
+		}
+		if _, err := os.Stat(runnerBinary()); err != nil {
+			probeSkip = "runner shim missing: " + err.Error()
+			return
+		}
 		base := ""
 		if st, err := os.Stat("/work"); err == nil && st.IsDir() {
 			base = "/work"
@@ -190,21 +202,18 @@ func probe(t *testing.T) string {
 		_ = os.Chmod(dir, 0o777)
 		probeExe, probeError = buildProbe(dir)
 	})
+	if probeSkip != "" {
+		t.Skipf("probe program not built: %s", probeSkip)
+	}
 	if probeError != "" {
-		t.Skipf("probe program not built: %s", probeError)
+		t.Fatalf("probe program does not build: %s", probeError)
 	}
 	return probeExe
 }
 
 func buildProbe(dir string) (exe, errMsg string) {
 	const compiler = "/usr/bin/gcc"
-	if _, err := os.Stat(compiler); err != nil {
-		return "", compiler + " not installed"
-	}
 	runner := runnerBinary()
-	if _, err := os.Stat(runner); err != nil {
-		return "", "runner shim missing: " + err.Error()
-	}
 	src := filepath.Join(dir, "probe.c")
 	if err := os.WriteFile(src, []byte(probeSource), 0o644); err != nil {
 		return "", err.Error()
@@ -234,6 +243,7 @@ const probeSource = `
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -308,6 +318,59 @@ int main(int argc, char **argv)
         return 0;
     } else if (!strcmp(what, "exit3")) {
         return 3;
+    } else if (!strcmp(what, "ptrace_segv")) {
+        /* the runner becomes the tracer: a signal now stops the program instead of ending it */
+        syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
+        raise(SIGSEGV);
+        return 0;
+    } else if (!strcmp(what, "ptrace_exit3")) {
+        syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
+        return 3;
+    } else if (!strcmp(what, "setsid_sleep")) {
+        /* leave the runner's process group; argv[2] only marks the process for the test */
+        setsid();
+        sleep(31);
+        return 0;
+    } else if (!strcmp(what, "io_uring_setup")) {
+#ifdef SYS_io_uring_setup
+        char params[120] = { 0 };
+        r = syscall(SYS_io_uring_setup, 8, params);
+#else
+        return 77;
+#endif
+    } else if (!strcmp(what, "io_uring_enter")) {
+#ifdef SYS_io_uring_enter
+        r = syscall(SYS_io_uring_enter, -1, 0, 0, 0, NULL, 0);
+#else
+        return 77;
+#endif
+    } else if (!strcmp(what, "io_uring_register")) {
+#ifdef SYS_io_uring_register
+        r = syscall(SYS_io_uring_register, -1, 0, NULL, 0);
+#else
+        return 77;
+#endif
+    } else if (!strcmp(what, "unshare")) {
+        r = syscall(SYS_unshare, 0);
+    } else if (!strcmp(what, "setns")) {
+        r = syscall(SYS_setns, -1, 0);
+    } else if (!strcmp(what, "userfaultfd")) {
+        r = syscall(SYS_userfaultfd, 0);
+    } else if (!strcmp(what, "bpf")) {
+        r = syscall(SYS_bpf, 0, NULL, 0);
+    } else if (!strcmp(what, "prlimit_other")) {
+        /* read another process's limit: pid 1 is not the caller */
+        struct rlimit old;
+        r = syscall(SYS_prlimit64, 1, RLIMIT_CPU, NULL, &old);
+    } else if (!strcmp(what, "prlimit_set")) {
+        /* set a limit, even the caller's own: a new_limit is not allowed */
+        struct rlimit lim = { 0, 0 };
+        r = syscall(SYS_prlimit64, 0, RLIMIT_CORE, &lim, NULL);
+    } else if (!strcmp(what, "getrlimit")) {
+        struct rlimit lim;
+        if (getrlimit(RLIMIT_STACK, &lim) != 0) return 1;
+        printf("%llu\n", (unsigned long long)lim.rlim_cur);
+        return 0;
     } else {
         return 2;
     }
@@ -542,16 +605,60 @@ func TestRunPythonUnderGeneral(t *testing.T) {
 	}
 }
 
-func TestRunSetuidFailureReported(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("running as root: setuid(0) succeeds; TestRunSetuidInvalidIDReported covers the failure path as root")
+// runShimDirect starts the shim exactly as Run does but without Run's validation, to reach the
+// shim's own checks. It returns the shim's report.
+func runShimDirect(t *testing.T, s Spec) (record, bool) {
+	t.Helper()
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer pr.Close()
+	cmd := exec.Command(runnerPath(t), shimArgs(s)...)
+	cmd.Env = append([]string{}, s.Env...)
+	cmd.ExtraFiles = []*os.File{pw}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pw.Close()
+	_ = cmd.Wait()
+	_ = pr.SetReadDeadline(time.Now().Add(time.Second))
+	b, _ := io.ReadAll(io.LimitReader(pr, 256))
+	return parseRecord(b)
+}
+
+// The shim refuses to run a program as root, even as root itself: setuid(0) would succeed there.
+func TestRunSetuidFailureReported(t *testing.T) {
+	dir := newDir(t)
+	for _, id := range []struct {
+		name     string
+		uid, gid uint32
+	}{{"uid 0", 0, uidCode}, {"gid 0", uidCode, 0}, {"both 0", 0, 0}} {
+		t.Run(id.name, func(t *testing.T) {
+			s := defaultSpec(dir, "/bin/sh", "-c", "echo ran")
+			s.UID, s.GID = id.uid, id.gid
+			rec, ok := runShimDirect(t, s)
+			if !ok || rec.err != -9 {
+				t.Fatalf("report = %+v (ok %v), want Error -9", rec, ok)
+			}
+			if _, err := os.Stat(s.Stdout); err == nil {
+				t.Fatalf("the program's stdout file was created: nothing may run before the identity check")
+			}
+		})
+	}
+}
+
+func TestRunRejectsRootIdentity(t *testing.T) {
 	dir := newDir(t)
 	s := defaultSpec(dir, "/bin/true")
-	s.UID, s.GID = 0, 0
-	res := run(t, s)
-	if res.Error != -9 {
-		t.Fatalf("result = %+v, want Error -9", res)
+	s.UID = 0
+	if _, err := Run(context.Background(), DefaultRunnerPath, s); !errors.Is(err, errInvalidSpec) {
+		t.Fatalf("uid 0: err = %v, want an invalid-spec error", err)
+	}
+	s = defaultSpec(dir, "/bin/true")
+	s.GID = 0
+	if _, err := Run(context.Background(), DefaultRunnerPath, s); !errors.Is(err, errInvalidSpec) {
+		t.Fatalf("gid 0: err = %v, want an invalid-spec error", err)
 	}
 }
 
@@ -760,7 +867,11 @@ func TestRunSeccompDenyTable(t *testing.T) {
 	// Every probe is a call the rule must kill with SIGSYS. Under "" the same
 	// probe must not be stopped (the control run), proving the probe does what
 	// it claims.
-	denied := []string{"socket", "fork", "clone3", "creat", "openat2", "ptrace", "kill", "tgkill_other", "exec_other"}
+	denied := []string{
+		"socket", "fork", "clone3", "creat", "openat2", "ptrace", "kill", "tgkill_other", "exec_other",
+		"io_uring_setup", "io_uring_enter", "io_uring_register", "unshare", "setns", "userfaultfd", "bpf",
+		"prlimit_other", "prlimit_set",
+	}
 	for _, what := range denied {
 		t.Run(what, func(t *testing.T) {
 			dir := newDir(t)
@@ -919,5 +1030,140 @@ func TestRunStartFailureIsAnError(t *testing.T) {
 	dir := newDir(t)
 	if _, err := Run(context.Background(), filepath.Join(dir, "no-such-shim"), defaultSpec(dir, "/bin/true")); err == nil {
 		t.Fatal("a shim that cannot be started must be an error, not a Result")
+	}
+}
+
+// ---- fixes from review round 1 ----
+
+// A program that makes the runner its tracer (PTRACE_TRACEME) turns every signal into a
+// ptrace-stop; the runner must not report a stop as a clean exit.
+func TestRunPtraceStopIsNotACleanExit(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	exe := probe(t)
+	res := run(t, execSpec(dir, exe, SeccompNone, "ptrace_segv"))
+	t.Logf("result = %+v", res)
+	if res.Error == 0 && res.Signal == 0 {
+		t.Fatalf("a segfault under PTRACE_TRACEME reads as a normal exit: %+v", res)
+	}
+	// The shim kills the stopped program and reports how it really ended, so the Go side's
+	// own refusal of a stop status (record_test.go) is a second line, not the first.
+	if res.Error != 0 || res.Signal != int(syscall.SIGKILL) {
+		t.Fatalf("want the stopped program killed by the shim (Signal %d, no Error), got %+v", syscall.SIGKILL, res)
+	}
+	// Tracing alone changes nothing about a program that just exits.
+	res = run(t, execSpec(dir, exe, SeccompNone, "ptrace_exit3"))
+	if res.ExitCode != 3 || res.Signal != 0 || res.Error != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+// A program under "" may leave the runner's process group (setsid); the group kill then misses
+// it. The program must die with the runner.
+func TestRunProgramThatLeavesTheGroupDiesWithTheRunner(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	const marker = "setsid-31.4159"
+	s := execSpec(dir, probe(t), SeccompNone, "setsid_sleep", marker)
+	s.MaxRealTimeMs = 500
+	res := run(t, s)
+	if res.Signal != int(syscall.SIGKILL) || res.RealTimeMs < 501 {
+		t.Fatalf("result = %+v", res)
+	}
+	waitGone(t, marker)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(300*time.Millisecond, cancel)
+	if _, err := Run(ctx, runnerPath(t), execSpec(dir, probe(t), SeccompNone, "setsid_sleep", marker+"b")); err != context.Canceled {
+		t.Fatalf("err = %v", err)
+	}
+	waitGone(t, marker+"b")
+}
+
+// The shim opens the stream files as root: a symlink planted at one of those paths must not
+// redirect the open to some other file.
+func TestRunStreamSymlinksAreNotFollowed(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "stream-link")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	dangling := filepath.Join(dir, "dangling-link")
+	created := filepath.Join(dir, "must-not-be-created")
+	if err := os.Symlink(created, dangling); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name   string
+		mutate func(*Spec)
+	}{
+		{"stdout", func(s *Spec) { s.Stdout = link }},
+		{"stderr", func(s *Spec) { s.Stderr = link }},
+		{"stdin", func(s *Spec) { s.Stdin = link }},
+		{"stdout dangling", func(s *Spec) { s.Stdout = dangling }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := defaultSpec(dir, "/bin/true")
+			c.mutate(&s)
+			if res := run(t, s); res.Error != -8 {
+				t.Fatalf("result = %+v, want Error -8", res)
+			}
+			if got := readFile(t, victim); got != "keep\n" {
+				t.Fatalf("the symlink target was modified: %q", got)
+			}
+			if _, err := os.Lstat(created); err == nil {
+				t.Fatal("the symlink's dangling target was created")
+			}
+		})
+	}
+}
+
+// getrlimit is prlimit64(0, res, NULL, &old); naming another process or passing a new limit is not.
+func TestRunPrlimitOnlyReadsOwnLimits(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	for _, rule := range []string{SeccompGen, SeccompCCpp} {
+		s := execSpec(dir, probe(t), rule, "getrlimit")
+		res := run(t, s)
+		if res.Signal != 0 || res.ExitCode != 0 || res.Error != 0 {
+			t.Fatalf("getrlimit under %s: %+v", rule, res)
+		}
+		if got := readFile(t, s.Stdout); got != fmt.Sprint(64<<20)+"\n" {
+			t.Fatalf("getrlimit under %s printed %q, want the 64 MiB stack limit", rule, got)
+		}
+	}
+}
+
+// A deny-list name libseccomp cannot resolve must stop the run (-6), not silently leave a hole.
+// The test builds a variant of the shim with one unresolvable name added to the deny-list.
+func TestRunUnresolvableDenyNameFailsClosed(t *testing.T) {
+	needRoot(t)
+	needTool(t, "/usr/bin/gcc")
+	dir := newDir(t)
+	variant := filepath.Join(dir, "judge-runner-unknown-deny")
+	out, err := exec.Command("/usr/bin/gcc", "-O1", "-DJUDGE_RUNNER_TEST_UNKNOWN_DENY", "-o", variant, "runner.c", "-lseccomp").CombinedOutput()
+	if err != nil {
+		t.Skipf("cannot build the shim variant (needs libseccomp-dev): %v\n%s", err, out)
+	}
+	s := defaultSpec(dir, "/bin/true")
+	s.Seccomp = SeccompGen
+	res, err := Run(context.Background(), variant, s)
+	if err != nil || res.Error != -6 {
+		t.Fatalf("result = %+v, err = %v; want Error -6", res, err)
+	}
+	// The same variant still runs under c_cpp, which has no deny-list, and with the real shim
+	// the same program runs under general.
+	s.Seccomp = SeccompNone
+	if res, err := Run(context.Background(), variant, s); err != nil || res.Error != 0 || res.ExitCode != 0 {
+		t.Fatalf("no seccomp: result = %+v, err = %v", res, err)
+	}
+	s.Seccomp = SeccompGen
+	if res := run(t, s); res.Error != 0 || res.ExitCode != 0 || res.Signal != 0 {
+		t.Fatalf("real shim under general: %+v", res)
 	}
 }
