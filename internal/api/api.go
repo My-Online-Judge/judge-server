@@ -69,7 +69,7 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 		GoCache:    goCache,
 	})
 	adm := NewAdmission(cfg.MaxJobs, cfg.MaxQueue)
-	gs := newGRPCServer(tlsCfg, cfg, NewServer(cfg, eng, adm, version))
+	gs := NewGRPCServer(tlsCfg, cfg, NewServer(cfg, eng, adm, version))
 
 	lis, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -77,7 +77,7 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 	}
 	slog.Info("judge-server listening", "addr", lis.Addr().String(), "version", version,
 		"max_jobs", cfg.MaxJobs, "max_queue", cfg.MaxQueue, "token_required", cfg.Token != "")
-	return runGRPC(ctx, gs, lis, shutdownGrace)
+	return RunGRPC(ctx, gs, lis, shutdownGrace)
 }
 
 // prepareWorkDir makes workDir what the engine expects and wipes what a crashed
@@ -113,11 +113,12 @@ func prepareWorkDir(workDir string) error {
 	return nil
 }
 
-// runGRPC serves on lis until ctx ends or the server fails, then stops it:
+// RunGRPC serves on lis until ctx ends or the server fails, then stops it:
 // GracefulStop waits for the running calls, and once grace has passed Stop cuts
 // the ones still going (their contexts are cancelled, so the engine kills the
-// children and removes the job dirs).
-func runGRPC(ctx context.Context, gs *grpc.Server, lis net.Listener, grace time.Duration) error {
+// children and removes the job dirs). It is exported for the mock subcommand
+// (internal/mock), which stops the same way.
+func RunGRPC(ctx context.Context, gs *grpc.Server, lis net.Listener, grace time.Duration) error {
 	served := make(chan error, 1)
 	go func() { served <- gs.Serve(lis) }()
 

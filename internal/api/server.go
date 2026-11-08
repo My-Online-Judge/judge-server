@@ -46,9 +46,11 @@ func NewServer(cfg config.Config, eng Judger, adm *Admission, version string) *S
 	return &Server{cfg: cfg, eng: eng, adm: adm, version: version, hostname: host, sampler: NewCPUSampler()}
 }
 
-// newGRPCServer builds the gRPC server Serve runs: TLS from tlsCfg, the auth
-// interceptor with cfg's allow-list and token digest, and srv registered.
-func newGRPCServer(tlsCfg *tls.Config, cfg config.Config, srv judgev1.JudgeServerServer) *grpc.Server {
+// NewGRPCServer builds the gRPC server Serve runs: TLS from tlsCfg, the auth
+// interceptor with cfg's allow-list and token digest, and srv registered. It is
+// exported so the mock subcommand (internal/mock) authenticates its callers
+// exactly as the real server does.
+func NewGRPCServer(tlsCfg *tls.Config, cfg config.Config, srv judgev1.JudgeServerServer) *grpc.Server {
 	gs := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
 		grpc.UnaryInterceptor(AuthInterceptor(cfg.AllowedClients, tokenDigest(cfg.Token))),

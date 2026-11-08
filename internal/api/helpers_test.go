@@ -112,7 +112,7 @@ func answers(out judge.Outcome) func(context.Context, string, judge.Request) (ju
 }
 
 // rig is a real gRPC server over mutual TLS on 127.0.0.1:0, built the way Serve
-// builds it (newGRPCServer), with a fake engine behind it.
+// builds it (NewGRPCServer), with a fake engine behind it.
 type rig struct {
 	cfg  config.Config
 	mat  *testutil.TLSMaterial
@@ -160,7 +160,7 @@ func newRig(t *testing.T, opt rigOptions) *rig {
 	if err != nil {
 		t.Fatalf("TLSConfig: %v", err)
 	}
-	r.gs = newGRPCServer(tlsCfg, cfg, NewServer(cfg, judger, r.adm, "v-test"))
+	r.gs = NewGRPCServer(tlsCfg, cfg, NewServer(cfg, judger, r.adm, "v-test"))
 	r.lis, err = net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)

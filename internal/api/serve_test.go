@@ -245,7 +245,7 @@ func TestRunGRPCGracefulStop(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		served := make(chan error, 1)
-		go func() { served <- runGRPC(ctx, r.gs, r.lis, grace) }()
+		go func() { served <- RunGRPC(ctx, r.gs, r.lis, grace) }()
 
 		rpc := make(chan error, 1)
 		go func() { _, err := r.judge(t, validRequest()); rpc <- err }()
@@ -257,7 +257,7 @@ func TestRunGRPCGracefulStop(t *testing.T) {
 			time.AfterFunc(finishAfter, func() { close(unblock) })
 		}
 		if err := <-served; err != nil {
-			t.Fatalf("runGRPC: %v", err)
+			t.Fatalf("RunGRPC: %v", err)
 		}
 		return <-rpc, time.Since(start)
 	}
