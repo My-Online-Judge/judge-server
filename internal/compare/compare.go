@@ -1,6 +1,10 @@
 // Package compare turns a program's output into the bytes the judge compares
 // and hashes. It mirrors TestCaseBundleBuilder.comparedOutput in
 // oj-problem-service, which produced the expected stripped_output_md5.
+//
+// Normalize and MD5Hex work on a whole buffer, which is how the bundle's expected
+// outputs are read. Hasher gives the same md5 for a stream of any size without
+// holding it; the judge compares a program's output through it.
 package compare
 
 import (
@@ -36,11 +40,4 @@ func isASCIISpace(c byte) bool {
 func MD5Hex(b []byte) string {
 	sum := md5.Sum(b)
 	return hex.EncodeToString(sum[:])
-}
-
-// Matches normalises actual and reports its md5 and whether that md5 equals
-// expectedStrippedMD5 (lowercase hex, as stored in the bundle's info file).
-func Matches(actual []byte, expectedStrippedMD5 string) (md5Hex string, ok bool) {
-	md5Hex = MD5Hex(Normalize(actual))
-	return md5Hex, md5Hex == expectedStrippedMD5
 }

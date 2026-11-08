@@ -1,6 +1,7 @@
 package judge
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/My-Online-Judge/judge-server/internal/bundle"
+	"github.com/My-Online-Judge/judge-server/internal/compare"
 	"github.com/My-Online-Judge/judge-server/internal/config"
 	"github.com/My-Online-Judge/judge-server/internal/sandbox"
 	"github.com/My-Online-Judge/judge-server/internal/testutil"
@@ -732,6 +734,108 @@ func TestJudgeOutputCapAndTruncation(t *testing.T) {
 			})
 		}
 	}
+}
+
+// readOutput streams the output file through compare.Hasher: the digest is that of the whole normalised
+// file, however big, and the response gets only the first OutputResponseCap bytes.
+func TestReadOutput(t *testing.T) {
+	f := newFixture(t)
+	j := &job{e: f.engine()}
+	write := func(data []byte) string {
+		path := filepath.Join(t.TempDir(), "1.out")
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// A 6 MiB output with CRLF line ends and blank trailing lines, the shape that needs the Hasher's hold-back.
+	big := append(bytes.Repeat([]byte("0123456789abcdef\r\n"), 6<<20/18), "\r\n\r\n  \n"...)
+
+	t.Run("md5 of a big output equals the whole-buffer one", func(t *testing.T) {
+		got, err := j.readOutput("1", write(big), true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := compare.MD5Hex(compare.Normalize(big)); got.md5 != want {
+			t.Errorf("md5 = %s, want %s", got.md5, want)
+		}
+		if got.head != nil || got.truncated {
+			t.Errorf("head = %d bytes, truncated %v, want none when it was not asked for", len(got.head), got.truncated)
+		}
+	})
+	t.Run("the response is the first bytes, as the file was written", func(t *testing.T) {
+		got, err := j.readOutput("1", write(big), true, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.truncated || !bytes.Equal(got.head, big[:f.deps.Cfg.OutputResponseCap]) {
+			t.Errorf("head = %d bytes, truncated %v; want the first %d bytes of the raw output, truncated", len(got.head), got.truncated, f.deps.Cfg.OutputResponseCap)
+		}
+		if want := compare.MD5Hex(compare.Normalize(big)); got.md5 != want {
+			t.Errorf("md5 = %s, want %s", got.md5, want)
+		}
+	})
+	t.Run("a small output is returned whole and not truncated", func(t *testing.T) {
+		got, err := j.readOutput("1", write([]byte("1\r\n")), true, true)
+		if err != nil || string(got.head) != "1\r\n" || got.truncated || got.md5 != md5One {
+			t.Errorf("got %+v, %v; want head \"1\\r\\n\", md5 %s", got, err, md5One)
+		}
+	})
+	t.Run("a missing file reads as empty", func(t *testing.T) {
+		got, err := j.readOutput("1", filepath.Join(t.TempDir(), "nothing"), true, true)
+		if err != nil || got.md5 != md5Empty || len(got.head) != 0 || got.truncated {
+			t.Errorf("got %+v, %v; want the md5 of nothing and no output", got, err)
+		}
+	})
+	t.Run("a file over the cap is the sandbox failing", func(t *testing.T) {
+		small := &job{e: &Engine{d: Deps{Cfg: config.Config{OutputFileCap: 10, OutputResponseCap: 4}}}}
+		if _, err := small.readOutput("1", write(bytes.Repeat([]byte("x"), 11)), true, false); err == nil {
+			t.Error("an 11 byte file under a 10 byte cap was accepted")
+		}
+		if _, err := small.readOutput("1", write(bytes.Repeat([]byte("x"), 10)), true, false); err != nil {
+			t.Errorf("a file exactly at the cap was refused: %v", err)
+		}
+	})
+	t.Run("the response alone reads only the first cap+1 bytes", func(t *testing.T) {
+		// A FIFO fed forever, under a file cap that no run could reach: reading it to its end never
+		// finishes, so readOutput returns only if it stops at OutputResponseCap+1 bytes. (The writer ends
+		// when the reader closes the pipe.)
+		endless := &job{e: &Engine{d: Deps{Cfg: config.Config{OutputFileCap: 1 << 60, OutputResponseCap: 64 << 10}}}}
+		fifo := filepath.Join(t.TempDir(), "endless")
+		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+			t.Skipf("no FIFO here: %v", err)
+		}
+		go func() {
+			w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+			if err != nil {
+				return
+			}
+			defer w.Close()
+			block := bytes.Repeat([]byte("z"), 1<<16)
+			for {
+				if _, err := w.Write(block); err != nil {
+					return
+				}
+			}
+		}()
+		type result struct {
+			got outputRead
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			got, err := endless.readOutput("1", fifo, false, true)
+			done <- result{got, err}
+		}()
+		select {
+		case r := <-done:
+			if r.err != nil || len(r.got.head) != 64<<10 || !r.got.truncated || r.got.md5 != "" {
+				t.Errorf("got %d bytes, truncated %v, md5 %q, err %v; want 64 KiB, truncated, no md5", len(r.got.head), r.got.truncated, r.got.md5, r.err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("readOutput did not stop after the response cap: it reads the whole file")
+		}
+	})
 }
 
 func TestJudgeOutputIsReturnedEvenWhenTheProgramFailed(t *testing.T) {

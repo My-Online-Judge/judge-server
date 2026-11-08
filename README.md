@@ -47,6 +47,9 @@ What a job owns is closed to every other slot, with the slot's gid as the key (`
   (up to 8), not one per case. At start-up `serve` reads the size of `WORK_DIR`'s filesystem (`statfs`) and refuses to start
   when `MAX_JOBS` x 8 x `OUTPUT_FILE_CAP_BYTES` + `GOCACHE_CAP_BYTES` does not fit, naming the numbers. The checker's stream
   files are trusted and not in the formula.
+- The comparison streams a case's output through the normaliser into md5 (`compare.Hasher`; it holds back only a trailing
+  run of whitespace and a pending CR, 64 KiB at most) and reads only `OUTPUT_RESPONSE_CAP_BYTES` + 1 bytes for the response,
+  so the server never holds a case's whole output in memory.
 - Under the `c_cpp` and `general` filters a run cannot open a file for writing and, under `general`, cannot make, link,
   rename or truncate an entry (`mkdir`, `mknod`, `symlink`, `link`, `rename`, `truncate`, `memfd_create` and their at-forms are
   denied; see `internal/sandbox/seccomp_rules.md`); the rows that run with no filter (Java, Go, JavaScript, PHP) can write

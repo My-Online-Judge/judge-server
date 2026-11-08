@@ -2,9 +2,12 @@ package judge
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 
 	"golang.org/x/sync/errgroup"
@@ -56,7 +59,6 @@ func (j *job) runCase(ctx context.Context, i int, c bundle.Case) (CaseResult, er
 		return CaseResult{}, err
 	}
 	r := j.req
-	cfg := j.e.d.Cfg
 	n := strconv.Itoa(i + 1)
 
 	in := c.InputPath
@@ -93,29 +95,17 @@ func (j *job) runCase(ctx context.Context, i int, c bundle.Case) (CaseResult, er
 	compareMD5 := cr.Result == codeOK && r.Checker == nil
 	wantOutput := r.Output && res.Error == 0
 	if compareMD5 || wantOutput {
-		limit := max(cfg.OutputResponseCap, 0) + 1
-		if compareMD5 {
-			limit = cfg.OutputFileCap + 1
-		}
-		data, err := readHead(outPath, limit)
+		got, err := j.readOutput(c.Name, outPath, compareMD5, wantOutput)
 		if err != nil {
-			return CaseResult{}, fmt.Errorf("read output of case %s: %w", c.Name, err)
+			return CaseResult{}, err
 		}
 		if compareMD5 {
-			if int64(len(data)) > cfg.OutputFileCap {
-				// RLIMIT_FSIZE keeps a program under the cap, so this is the sandbox failing.
-				return CaseResult{}, fmt.Errorf("output of case %s is over the %d byte file cap", c.Name, cfg.OutputFileCap)
-			}
-			var ok bool
-			if cr.OutputMD5, ok = compare.Matches(data, c.StrippedOutputMD5); !ok {
+			if cr.OutputMD5 = got.md5; cr.OutputMD5 != c.StrippedOutputMD5 {
 				cr.Result = codeWrongAnswer
 			}
 		}
 		if wantOutput {
-			if int64(len(data)) > cfg.OutputResponseCap {
-				data, cr.OutputTruncated = data[:max(cfg.OutputResponseCap, 0)], true
-			}
-			cr.Output = slices.Clone(data)
+			cr.Output, cr.OutputTruncated = got.head, got.truncated
 		}
 	}
 
@@ -125,6 +115,85 @@ func (j *job) runCase(ctx context.Context, i int, c bundle.Case) (CaseResult, er
 		}
 	}
 	return cr, nil
+}
+
+// outputRead is what readOutput took from a case's output file.
+type outputRead struct {
+	md5       string // md5 of the normalised content (compare.Hasher), when it was asked for
+	head      []byte // the first OutputResponseCap bytes, when they were asked for
+	truncated bool   // the file holds more than head
+}
+
+// readOutput reads the output file of case name once: the md5 of its normalised content
+// when hash is set, and the first OutputResponseCap bytes when head is set. The file goes
+// through compare.Hasher, a piece at a time, so the server never holds it (it can be as big as
+// OutputFileCap): what stays in memory is the 32 KiB copy buffer, the Hasher's bounded state
+// and at most OutputResponseCap+1 bytes of head. Without hash only that many bytes are read.
+// A file that does not exist reads as empty.
+func (j *job) readOutput(name, path string, hash, head bool) (outputRead, error) {
+	cfg := j.e.d.Cfg
+	var src io.Reader = eofReader{}
+	switch f, err := os.Open(path); {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return outputRead{}, fmt.Errorf("read output of case %s: %w", name, err)
+	default:
+		defer f.Close()
+		src = f
+	}
+
+	headLimit := max(cfg.OutputResponseCap, 0) + 1 // one byte more than is returned, to know that the file has more
+	var dst []io.Writer
+	var hasher *compare.Hasher
+	var first *headWriter
+	limit := headLimit
+	if hash {
+		hasher = compare.NewHasher()
+		dst = append(dst, hasher)
+		limit = cfg.OutputFileCap + 1
+	}
+	if head {
+		first = &headWriter{limit: headLimit}
+		dst = append(dst, first)
+	}
+	n, err := io.Copy(io.MultiWriter(dst...), io.LimitReader(src, limit))
+	if err != nil {
+		return outputRead{}, fmt.Errorf("read output of case %s: %w", name, err)
+	}
+	if hash && n > cfg.OutputFileCap {
+		// RLIMIT_FSIZE keeps a program under the cap, so this is the sandbox failing.
+		return outputRead{}, fmt.Errorf("output of case %s is over the %d byte file cap", name, cfg.OutputFileCap)
+	}
+
+	var out outputRead
+	if hash {
+		out.md5 = hasher.Hex()
+	}
+	if head {
+		out.head = first.buf
+		if int64(len(out.head)) > cfg.OutputResponseCap {
+			out.head, out.truncated = out.head[:max(cfg.OutputResponseCap, 0)], true
+		}
+	}
+	return out, nil
+}
+
+// eofReader is the empty file.
+type eofReader struct{}
+
+func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+// headWriter keeps the first limit bytes written to it and accepts, and drops, the rest.
+type headWriter struct {
+	buf   []byte
+	limit int64
+}
+
+func (w *headWriter) Write(p []byte) (int, error) {
+	if room := w.limit - int64(len(w.buf)); room > 0 {
+		w.buf = append(w.buf, p[:min(int64(len(p)), room)]...)
+	}
+	return len(p), nil
 }
 
 // runProgram runs the submission on one case, stdout into outPath. Its stderr goes

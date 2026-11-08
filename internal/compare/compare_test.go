@@ -52,33 +52,3 @@ func TestMD5Hex(t *testing.T) {
 		t.Errorf("MD5Hex(nil) = %s, want %s", got, want)
 	}
 }
-
-func TestMatches(t *testing.T) {
-	const one = "c4ca4238a0b923820dcc509a6f75849b"
-	tests := []struct {
-		name   string
-		actual string
-		want   string
-		wantOK bool
-	}{
-		{"exact", "1", one, true},
-		{"trailing newline", "1\n", one, true},
-		{"CRLF and trailing blanks", "1 \r\n", one, true},
-		{"different output", "2\n", one, false},
-		{"leading space matters", " 1", one, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			md5, ok := Matches([]byte(tt.actual), tt.want)
-			if ok != tt.wantOK {
-				t.Errorf("Matches ok = %v, want %v", ok, tt.wantOK)
-			}
-			if tt.wantOK && md5 != tt.want {
-				t.Errorf("Matches md5 = %s, want %s", md5, tt.want)
-			}
-			if !tt.wantOK && md5 == tt.want {
-				t.Errorf("Matches md5 = %s, must differ from the expected one", md5)
-			}
-		})
-	}
-}
