@@ -1,0 +1,522 @@
+//go:build ignore
+
+// The line above keeps the go tool from treating this C file as part of the Go
+// package (it refuses C files in a package that does not use cgo). gcc reads it
+// as a comment.
+
+/*
+ * judge-runner: the sandbox shim. It stands between a contestant's program and
+ * the host, so it is deliberately small and needs no capability beyond what the
+ * judge-server container already has (CHOWN DAC_OVERRIDE FOWNER SETGID SETUID
+ * KILL): no namespaces, no cgroups, no CAP_SYS_ADMIN.
+ *
+ * Build it static (gcc -static ... -lseccomp). It runs as root until the
+ * identity switch with the server-supplied environment, which a dynamic build
+ * would let LD_PRELOAD and friends reach.
+ *
+ *   judge-runner --uid U --gid G --cpu-ms N --as N --stack N --fsize N --nproc N
+ *                [--seccomp c_cpp|general] [--exe PATH] [--chdir DIR]
+ *                [--stdin P] [--stdout P] [--stderr P] -- argv...
+ *
+ * Two processes, like qduoj's Judger: the shim (the "runner") forks the program
+ * and wait4()s it, so the program's resource usage is its own. Were the program
+ * the shim itself after execve, wait4() in the Go server would report a peak
+ * resident set that starts at the server's own (the server vforks the shim and
+ * the kernel folds the parent's high-water mark into the child at exec).
+ *
+ * The child (the program) does, in this order: open the stdin/stdout/stderr
+ * files and dup2 them, chdir, write 1000 to oom_score_adj, setrlimit,
+ * setgroups(0) + setgid + setuid, PR_SET_NO_NEW_PRIVS, load the seccomp filter,
+ * execve. A failing step makes it write one signed byte, the judger error code,
+ * to an internal pipe and _exit(255).
+ *
+ * The runner reports to the server on fd 3 (a pipe the server created) with one
+ * line, written once, when the program is over or could not start:
+ *
+ *   <error> <wait status> <utime us> <stime us> <maxrss KB> <wall ns>\n
+ *
+ * The line is parsed in record.go. If the runner is killed first (the server's
+ * real-time limit kills the whole process group), nothing is written.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <limits.h>
+#include <seccomp.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Judger error codes, the numbers qduoj uses (-3 to -5 are not used here). */
+#define ERR_INVALID_CONFIG (-1)
+#define ERR_FORK_FAILED (-2)
+#define ERR_LOAD_SECCOMP_FAILED (-6)
+#define ERR_SETRLIMIT_FAILED (-7)
+#define ERR_DUP2_FAILED (-8)
+#define ERR_SETUID_FAILED (-9)
+#define ERR_EXECVE_FAILED (-10)
+
+#define REPORT_FD 3
+
+extern char **environ;
+
+struct config {
+    uid_t uid;
+    gid_t gid;
+    long long cpu_ms, as_bytes, stack_bytes, fsize_bytes, nproc;
+    const char *seccomp;
+    const char *exe;
+    const char *chdir_dir;
+    const char *stdin_path, *stdout_path, *stderr_path;
+    char **argv;
+};
+
+/* ---- command line ---- */
+
+static int parse_u64(const char *s, unsigned long long max, unsigned long long *out)
+{
+    char *end;
+    unsigned long long v;
+
+    if (*s == '\0' || *s == '-' || *s == '+' || *s == ' ')
+        return -1;
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (errno != 0 || *end != '\0' || v > max)
+        return -1;
+    *out = v;
+    return 0;
+}
+
+static int parse_args(int argc, char **argv, struct config *c)
+{
+    enum { HAVE_UID = 1, HAVE_GID = 2, HAVE_CPU = 4, HAVE_STACK = 8, HAVE_FSIZE = 16, HAVE_NPROC = 32 };
+    const int required = HAVE_UID | HAVE_GID | HAVE_CPU | HAVE_STACK | HAVE_FSIZE | HAVE_NPROC;
+    int have = 0, i;
+    unsigned long long v;
+
+    memset(c, 0, sizeof(*c));
+    c->stdin_path = c->stdout_path = c->stderr_path = "/dev/null";
+
+    for (i = 1; i < argc; i++) {
+        const char *flag = argv[i];
+        const char *val;
+
+        if (strcmp(flag, "--") == 0) {
+            i++;
+            break;
+        }
+        if (i + 1 >= argc)
+            return -1;
+        val = argv[++i];
+
+        if (strcmp(flag, "--uid") == 0) {
+            if (parse_u64(val, UINT32_MAX, &v) != 0) return -1;
+            c->uid = (uid_t)v;
+            have |= HAVE_UID;
+        } else if (strcmp(flag, "--gid") == 0) {
+            if (parse_u64(val, UINT32_MAX, &v) != 0) return -1;
+            c->gid = (gid_t)v;
+            have |= HAVE_GID;
+        } else if (strcmp(flag, "--cpu-ms") == 0) {
+            if (parse_u64(val, LLONG_MAX / 2, &v) != 0) return -1;
+            c->cpu_ms = (long long)v;
+            have |= HAVE_CPU;
+        } else if (strcmp(flag, "--as") == 0) {
+            if (parse_u64(val, LLONG_MAX, &v) != 0) return -1;
+            c->as_bytes = (long long)v;
+        } else if (strcmp(flag, "--stack") == 0) {
+            if (parse_u64(val, LLONG_MAX, &v) != 0) return -1;
+            c->stack_bytes = (long long)v;
+            have |= HAVE_STACK;
+        } else if (strcmp(flag, "--fsize") == 0) {
+            if (parse_u64(val, LLONG_MAX, &v) != 0) return -1;
+            c->fsize_bytes = (long long)v;
+            have |= HAVE_FSIZE;
+        } else if (strcmp(flag, "--nproc") == 0) {
+            if (parse_u64(val, LLONG_MAX, &v) != 0) return -1;
+            c->nproc = (long long)v;
+            have |= HAVE_NPROC;
+        } else if (strcmp(flag, "--seccomp") == 0) {
+            c->seccomp = val;
+        } else if (strcmp(flag, "--exe") == 0) {
+            c->exe = val;
+        } else if (strcmp(flag, "--chdir") == 0) {
+            c->chdir_dir = val;
+        } else if (strcmp(flag, "--stdin") == 0) {
+            c->stdin_path = val;
+        } else if (strcmp(flag, "--stdout") == 0) {
+            c->stdout_path = val;
+        } else if (strcmp(flag, "--stderr") == 0) {
+            c->stderr_path = val;
+        } else {
+            return -1;
+        }
+    }
+    if (have != required || i >= argc)
+        return -1;
+    c->argv = &argv[i];
+    if (c->exe == NULL)
+        c->exe = c->argv[0];
+    if (c->seccomp != NULL && strcmp(c->seccomp, "c_cpp") != 0 && strcmp(c->seccomp, "general") != 0)
+        return -1;
+    return 0;
+}
+
+/* ---- seccomp ----
+ *
+ * Syscalls are looked up by name for the native architecture. A name libseccomp
+ * has no number for at all (a syscall newer than the installed libseccomp) is
+ * skipped. One the architecture lacks (open, fork, vfork, creat, access,
+ * arch_prctl, readlink on aarch64) gets a pseudo number that seccomp_rule_add
+ * accepts and ignores for that architecture, so one source serves x86_64 and
+ * aarch64. See seccomp_rules.md for what each list is, where it comes from and why.
+ */
+
+/* c_cpp: default KILL_PROCESS, these are allowed. */
+static const char *const c_cpp_allow[] = {
+    /* QingdaoU/Judger src/rules/c_cpp.c, branch newnew */
+    "access", "arch_prctl", "brk", "clock_gettime", "close", "exit_group", "faccessat", "fstat",
+    "futex", "getrandom", "lseek", "mmap", "mprotect", "munmap", "newfstatat", "pread64",
+    "prlimit64", "read", "readlink", "readv", "rseq", "set_robust_list", "set_tid_address",
+    "write", "writev",
+    /* added here */
+    "mremap",     /* realloc of a large block */
+    "readlinkat", /* readlink on architectures without readlink */
+};
+
+/* general: default ALLOW, these are killed. */
+static const char *const general_deny[] = {
+    /* QingdaoU/Judger src/rules/general.c, branch newnew */
+    "clone", "fork", "vfork", "kill", "execveat",
+    "socket", /* upstream returns EACCES here; KILL_PROCESS per the spec */
+    /* added here */
+    "clone3",            /* glibc 2.34+ starts threads and processes with it */
+    "ptrace", "process_vm_readv", "process_vm_writev",
+    "tkill", "pidfd_send_signal", "pidfd_getfd", "pidfd_open",
+    "creat",   /* open for writing without flags to check */
+    "openat2", /* its flags are in a struct the filter cannot read */
+};
+
+/* general: killed when the target process is not the caller itself. */
+static const char *const general_deny_foreign_signal[] = {
+    "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo",
+};
+
+static int resolve(const char *name)
+{
+    return seccomp_syscall_resolve_name(name); /* __NR_SCMP_ERROR if unknown */
+}
+
+static int add_simple(scmp_filter_ctx ctx, uint32_t action, const char *name)
+{
+    int nr = resolve(name);
+
+    if (nr == __NR_SCMP_ERROR)
+        return 0;
+    return seccomp_rule_add(ctx, action, nr, 0);
+}
+
+/* The one execve the program may do, to its own executable: the pointer is
+ * compared, not the string, and it is the pointer main() passes to execve. */
+static int add_execve_rule(scmp_filter_ctx ctx, int allow_if_equal, const char *exe)
+{
+    int nr = resolve("execve");
+    uint32_t action = allow_if_equal ? SCMP_ACT_ALLOW : SCMP_ACT_KILL_PROCESS;
+    enum scmp_compare op = allow_if_equal ? SCMP_CMP_EQ : SCMP_CMP_NE;
+
+    if (nr == __NR_SCMP_ERROR)
+        return -1;
+    return seccomp_rule_add(ctx, action, nr, 1, SCMP_CMP(0, op, (scmp_datum_t)(uintptr_t)exe));
+}
+
+/* open/openat for reading only: the access mode bits (O_WRONLY, O_RDWR) must be
+ * clear. For the deny-list profile the two bits are killed separately. */
+static int add_open_rules(scmp_filter_ctx ctx, int allow_read_only)
+{
+    static const struct { const char *name; unsigned flags_arg; } calls[] = {
+        { "open", 1 }, { "openat", 2 },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+        int nr = resolve(calls[i].name);
+
+        if (nr == __NR_SCMP_ERROR)
+            continue;
+        if (allow_read_only) {
+            if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 1,
+                                 SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0)) != 0)
+                return -1;
+        } else {
+            if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1,
+                                 SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, O_WRONLY, O_WRONLY)) != 0)
+                return -1;
+            if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1,
+                                 SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, O_RDWR, O_RDWR)) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
+/* isatty(): glibc asks a character device stream (/dev/null, the default for a
+ * stream without a path) for its terminal attributes. TCGETS only reads. */
+static int add_ioctl_tcgets_rule(scmp_filter_ctx ctx)
+{
+    int nr = resolve("ioctl");
+
+    if (nr == __NR_SCMP_ERROR)
+        return 0;
+    return seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 1, SCMP_CMP(1, SCMP_CMP_EQ, (scmp_datum_t)TCGETS));
+}
+
+static int load_seccomp(const char *rule, const char *exe)
+{
+    int allow_list = strcmp(rule, "c_cpp") == 0;
+    scmp_filter_ctx ctx = seccomp_init(allow_list ? SCMP_ACT_KILL_PROCESS : SCMP_ACT_ALLOW);
+    size_t i;
+    int rc = -1;
+
+    if (ctx == NULL)
+        return -1;
+    /* A syscall made through another ABI (int 0x80, x32) kills the process. */
+    if (seccomp_attr_set(ctx, SCMP_FLTATR_ACT_BADARCH, SCMP_ACT_KILL_PROCESS) != 0)
+        goto out;
+
+    if (allow_list) {
+        for (i = 0; i < sizeof(c_cpp_allow) / sizeof(c_cpp_allow[0]); i++)
+            if (add_simple(ctx, SCMP_ACT_ALLOW, c_cpp_allow[i]) != 0)
+                goto out;
+        if (add_execve_rule(ctx, 1, exe) != 0 || add_open_rules(ctx, 1) != 0 || add_ioctl_tcgets_rule(ctx) != 0)
+            goto out;
+    } else {
+        for (i = 0; i < sizeof(general_deny) / sizeof(general_deny[0]); i++)
+            if (add_simple(ctx, SCMP_ACT_KILL_PROCESS, general_deny[i]) != 0)
+                goto out;
+        for (i = 0; i < sizeof(general_deny_foreign_signal) / sizeof(general_deny_foreign_signal[0]); i++) {
+            int nr = resolve(general_deny_foreign_signal[i]);
+
+            if (nr == __NR_SCMP_ERROR)
+                continue;
+            /* arg0 is the target's thread group id; the program's own id is the same
+             * before and after execve. */
+            if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1,
+                                 SCMP_CMP(0, SCMP_CMP_NE, (scmp_datum_t)getpid())) != 0)
+                goto out;
+        }
+        if (add_execve_rule(ctx, 0, exe) != 0 || add_open_rules(ctx, 0) != 0)
+            goto out;
+    }
+    rc = seccomp_load(ctx);
+out:
+    seccomp_release(ctx);
+    return rc == 0 ? 0 : -1;
+}
+
+/* ---- the program's side ---- */
+
+/* Report a failed setup step to the runner and leave. Only write and exit_group,
+ * both allowed by every filter, are used here. */
+static void child_fail(int pipe_fd, int code)
+{
+    signed char b = (signed char)code;
+
+    if (write(pipe_fd, &b, 1) < 0) {
+        /* nothing more to do: the runner sees EOF without a byte and the exit status */
+    }
+    _exit(255);
+}
+
+static int redirect(const char *path, int flags, mode_t mode, int target)
+{
+    int fd = open(path, flags | O_CLOEXEC, mode);
+
+    if (fd < 0)
+        return -1;
+    if (fd == target)
+        return fcntl(fd, F_SETFD, 0); /* clear O_CLOEXEC */
+    if (dup2(fd, target) < 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int set_limit(int resource, long long cur_and_max)
+{
+    struct rlimit rl;
+
+    rl.rlim_cur = rl.rlim_max = (rlim_t)cur_and_max;
+    return setrlimit(resource, &rl);
+}
+
+static void write_oom_score_adj(void)
+{
+    int fd = open("/proc/self/oom_score_adj", O_WRONLY | O_CLOEXEC);
+
+    if (fd < 0)
+        return; /* best effort */
+    if (write(fd, "1000", 4) < 0) {
+        /* best effort */
+    }
+    close(fd);
+}
+
+static void run_child(const struct config *c, int pipe_fd)
+{
+    if (redirect(c->stdin_path, O_RDONLY, 0, STDIN_FILENO) != 0 ||
+        redirect(c->stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDOUT_FILENO) != 0 ||
+        redirect(c->stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDERR_FILENO) != 0)
+        child_fail(pipe_fd, ERR_DUP2_FAILED);
+
+    if (c->chdir_dir != NULL && chdir(c->chdir_dir) != 0)
+        child_fail(pipe_fd, ERR_INVALID_CONFIG);
+
+    write_oom_score_adj();
+
+    /* RLIMIT_CPU counts whole seconds; +1 so the limit lands past cpu_ms. */
+    if (set_limit(RLIMIT_CPU, c->cpu_ms / 1000 + 1) != 0 ||
+        (c->as_bytes > 0 && set_limit(RLIMIT_AS, c->as_bytes) != 0) ||
+        set_limit(RLIMIT_STACK, c->stack_bytes) != 0 ||
+        set_limit(RLIMIT_FSIZE, c->fsize_bytes) != 0 ||
+        set_limit(RLIMIT_NPROC, c->nproc) != 0 ||
+        set_limit(RLIMIT_CORE, 0) != 0)
+        child_fail(pipe_fd, ERR_SETRLIMIT_FAILED);
+
+    if (setgroups(0, NULL) != 0 || setgid(c->gid) != 0 || setuid(c->uid) != 0)
+        child_fail(pipe_fd, ERR_SETUID_FAILED);
+
+    /* Needed for seccomp without CAP_SYS_ADMIN, and kept for every run. */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+        child_fail(pipe_fd, ERR_LOAD_SECCOMP_FAILED);
+    if (c->seccomp != NULL && load_seccomp(c->seccomp, c->exe) != 0)
+        child_fail(pipe_fd, ERR_LOAD_SECCOMP_FAILED);
+
+    execve(c->exe, c->argv, environ);
+    child_fail(pipe_fd, ERR_EXECVE_FAILED);
+}
+
+/* ---- the runner's side ---- */
+
+static long long now_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static long long timeval_us(const struct timeval *tv)
+{
+    return (long long)tv->tv_sec * 1000000LL + tv->tv_usec;
+}
+
+/* One write of well under PIPE_BUF bytes is atomic. */
+static void report(int err, int status, const struct rusage *ru, long long wall_ns)
+{
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf), "%d %d %lld %lld %lld %lld\n", err, status,
+                     ru ? timeval_us(&ru->ru_utime) : 0LL, ru ? timeval_us(&ru->ru_stime) : 0LL,
+                     ru ? (long long)ru->ru_maxrss : 0LL, wall_ns);
+    ssize_t w;
+
+    if (n <= 0 || (size_t)n >= sizeof(buf))
+        return;
+    do {
+        w = write(REPORT_FD, buf, (size_t)n);
+    } while (w < 0 && errno == EINTR);
+}
+
+static pid_t reap(pid_t pid, int *status, struct rusage *ru)
+{
+    pid_t r;
+
+    do {
+        r = wait4(pid, status, 0, ru);
+    } while (r < 0 && errno == EINTR);
+    return r;
+}
+
+int main(int argc, char **argv)
+{
+    struct config c;
+    int errpipe[2];
+    pid_t pid;
+    signed char code;
+    ssize_t n;
+    long long t0;
+    int status = 0;
+    struct rusage ru;
+
+    /* The report fd must not reach the program, which is forked from here. */
+    if (fcntl(REPORT_FD, F_SETFD, FD_CLOEXEC) != 0)
+        return 255; /* the server did not pass the pipe; there is nobody to tell */
+
+    if (parse_args(argc, argv, &c) != 0) {
+        report(ERR_INVALID_CONFIG, 0, NULL, 0);
+        return 255;
+    }
+
+    /* The server kills the whole group (this process, the program, whatever it
+     * started); Run also sets this before exec so the group exists from the start. */
+    if (setpgid(0, 0) != 0 && getpgrp() != getpid()) {
+        report(ERR_INVALID_CONFIG, 0, NULL, 0);
+        return 255;
+    }
+
+    if (pipe2(errpipe, O_CLOEXEC) != 0) {
+        report(ERR_FORK_FAILED, 0, NULL, 0);
+        return 255;
+    }
+    pid = fork();
+    if (pid < 0) {
+        report(ERR_FORK_FAILED, 0, NULL, 0);
+        return 255;
+    }
+    if (pid == 0) {
+        close(errpipe[0]);
+        run_child(&c, errpipe[1]);
+        _exit(255); /* not reached */
+    }
+    close(errpipe[1]);
+
+    /* EOF with no byte: execve closed the pipe, the program is running. */
+    do {
+        n = read(errpipe[0], &code, 1);
+    } while (n < 0 && errno == EINTR);
+    t0 = now_ns();
+
+    if (n == 1) {
+        reap(pid, &status, &ru);
+        report((int)code, 0, NULL, 0);
+        return 255;
+    }
+    if (n < 0) {
+        /* cannot happen for a pipe we own; do not leave the child running */
+        kill(pid, SIGKILL);
+        reap(pid, &status, &ru);
+        report(ERR_FORK_FAILED, 0, NULL, 0);
+        return 255;
+    }
+
+    if (reap(pid, &status, &ru) < 0) {
+        report(ERR_FORK_FAILED, 0, NULL, 0);
+        return 255;
+    }
+    report(0, status, &ru, now_ns() - t0);
+    return 0;
+}
