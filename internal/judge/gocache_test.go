@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -113,9 +114,9 @@ func TestWarmRunsGoBuildAsCompiler(t *testing.T) {
 		t.Fatalf("runner called %d times, want 1", len(calls))
 	}
 	got := calls[0]
-	warm := filepath.Join(dir, ".warm")
+	warm := dir + "-warm" // root-owned sibling: main.go and build.log
 	want := sandbox.Spec{
-		Argv:            []string{gc.goPath, "build", "-o", filepath.Join(warm, "hello"), filepath.Join(warm, "main.go")},
+		Argv:            []string{gc.goPath, "build", "-o", filepath.Join(dir, ".warm-bin", "hello"), filepath.Join(warm, "main.go")},
 		Env:             []string{"GOCACHE=" + dir, "GOPATH=" + dir + "/.gopath", "HOME=" + dir + "/.home", "PATH=/usr/local/bin:/usr/bin:/bin"},
 		Dir:             warm,
 		UID:             testCompilerUID,
@@ -147,8 +148,11 @@ func TestWarmRunsGoBuildAsCompiler(t *testing.T) {
 
 func TestWarmPreparesDirs(t *testing.T) {
 	gc, dir, _ := newTestCache(t, 128*mib)
-	if err := os.MkdirAll(dir, 0o777); err != nil {
-		t.Fatal(err)
+	warm := dir + "-warm"
+	for _, d := range []string{dir, warm} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.Chmod(dir, 0o777); err != nil {
 		t.Fatal(err)
@@ -160,13 +164,146 @@ func TestWarmPreparesDirs(t *testing.T) {
 		t.Fatalf("Warm: %v", err)
 	}
 
-	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o750 {
-		t.Errorf("cache dir: %v, err %v; want mode 0750", fi, err)
+	wantMode := map[string]os.FileMode{
+		dir:                             0o750,
+		filepath.Join(dir, ".gopath"):   0o750,
+		filepath.Join(dir, ".home"):     0o750,
+		filepath.Join(dir, ".warm-bin"): 0o750,
+		warm:                            0o755, // the compiler must be able to read main.go
 	}
-	for _, sub := range []string{".warm", ".gopath", ".home"} {
-		if fi, err := os.Stat(filepath.Join(dir, sub)); err != nil || !fi.IsDir() {
-			t.Errorf("%s was not created as a directory (err %v)", sub, err)
+	for d, mode := range wantMode {
+		fi, err := os.Stat(d)
+		if err != nil || !fi.IsDir() || fi.Mode().Perm() != mode {
+			t.Errorf("%s: %v, err %v; want a directory with mode %04o", d, fi, err, mode)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".warm")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the warm-up scaffold must not live inside the cache dir (stat err %v)", err)
+	}
+	if fi, err := os.Stat(filepath.Join(warm, "main.go")); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Errorf("main.go: %v, err %v; want mode 0644", fi, err)
+	}
+}
+
+func TestWarmOwnership(t *testing.T) {
+	gc, dir, _ := newTestCache(t, 128*mib)
+	if err := gc.Warm(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	uidOf := func(path string) int {
+		t.Helper()
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return int(fi.Sys().(*syscall.Stat_t).Uid)
+	}
+
+	// Only the cache tree goes to the compiler user, and only when we may chown.
+	wantTree := os.Getuid()
+	if os.Getuid() == 0 {
+		wantTree = testCompilerUID
+	}
+	for _, d := range []string{dir, filepath.Join(dir, ".gopath"), filepath.Join(dir, ".home"), filepath.Join(dir, ".warm-bin")} {
+		if got := uidOf(d); got != wantTree {
+			t.Errorf("%s owned by %d, want %d", d, got, wantTree)
+		}
+	}
+	// The warm-up's own dir and files are never given away.
+	for _, p := range []string{dir + "-warm", filepath.Join(dir+"-warm", "main.go")} {
+		if got := uidOf(p); got != os.Getuid() {
+			t.Errorf("%s owned by %d, want the server's own %d", p, got, os.Getuid())
+		}
+	}
+}
+
+func TestWarmDoesNotWriteThroughPlantedSymlinks(t *testing.T) {
+	for _, name := range []string{"main.go", "build.log"} {
+		t.Run(name, func(t *testing.T) {
+			gc, dir, fake := newTestCache(t, 128*mib)
+			warm := dir + "-warm"
+			if err := os.Mkdir(warm, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			victim := filepath.Join(t.TempDir(), "victim")
+			if err := os.WriteFile(victim, []byte("precious"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(victim, filepath.Join(warm, name)); err != nil {
+				t.Fatal(err)
+			}
+
+			err := gc.Warm(context.Background())
+
+			if got, rerr := os.ReadFile(victim); rerr != nil || string(got) != "precious" {
+				t.Errorf("the file the symlink pointed to was changed: %q, err %v", got, rerr)
+			}
+			if fi, lerr := os.Lstat(filepath.Join(warm, name)); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+				t.Errorf("%s is still a symlink after Warm (Warm err %v)", name, err)
+			}
+			if err != nil {
+				t.Fatalf("Warm: %v", err) // the stale link is replaced, not an obstacle
+			}
+			// The recorded Spec must still point at the warm-up's own files.
+			if got := fake.calls()[0].Stdout; got != filepath.Join(warm, "build.log") {
+				t.Errorf("Stdout = %q", got)
+			}
+		})
+	}
+}
+
+func TestWarmRefusesSymlinkedDirs(t *testing.T) {
+	// Each case replaces one directory Warm uses by a symlink to a 0777 dir
+	// elsewhere, as a hostile compile could inside the tree it owns.
+	tests := []struct {
+		name  string
+		plant func(t *testing.T, dir string, target string)
+	}{
+		{"cache dir", func(t *testing.T, dir, target string) { symlink(t, target, dir) }},
+		{".gopath", func(t *testing.T, dir, target string) { symlink(t, target, filepath.Join(dir, ".gopath")) }},
+		{".home", func(t *testing.T, dir, target string) { symlink(t, target, filepath.Join(dir, ".home")) }},
+		{".warm-bin", func(t *testing.T, dir, target string) { symlink(t, target, filepath.Join(dir, ".warm-bin")) }},
+		{"warm-up dir", func(t *testing.T, dir, target string) { symlink(t, target, dir+"-warm") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gc, dir, fake := newTestCache(t, 128*mib)
+			target := filepath.Join(t.TempDir(), "elsewhere")
+			if err := os.Mkdir(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(target, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			if tt.name != "cache dir" {
+				if err := os.Mkdir(dir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tt.plant(t, dir, target)
+
+			err := gc.Warm(context.Background())
+
+			if err == nil || !strings.Contains(err.Error(), "symlink") {
+				t.Errorf("Warm err = %v, want a refusal naming the symlink", err)
+			}
+			if n := len(fake.calls()); n != 0 {
+				t.Errorf("the build ran %d times although a directory was swapped for a symlink", n)
+			}
+			if fi, serr := os.Stat(target); serr != nil || fi.Mode().Perm() != 0o777 {
+				t.Errorf("the symlink target was chmod-ed through the link: %v, err %v", fi, serr)
+			}
+			if entries, rerr := os.ReadDir(target); rerr != nil || len(entries) != 0 {
+				t.Errorf("something was written through the link: %v, err %v", entries, rerr)
+			}
+		})
+	}
+}
+
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -182,6 +319,9 @@ func TestWarmIsNoOpWithoutGo(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("Warm without go touched the cache dir (stat err %v)", err)
+	}
+	if _, err := os.Stat(dir + "-warm"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Warm without go touched the warm-up dir (stat err %v)", err)
 	}
 }
 
@@ -210,7 +350,7 @@ func TestWarmFailures(t *testing.T) {
 			if tt.err != nil && !errors.Is(err, tt.err) {
 				t.Errorf("err = %v, want it to wrap %v", err, tt.err)
 			}
-			if logPath := filepath.Join(dir, ".warm", "build.log"); tt.wantLog && !strings.Contains(err.Error(), logPath) {
+			if logPath := filepath.Join(dir+"-warm", "build.log"); tt.wantLog && !strings.Contains(err.Error(), logPath) {
 				t.Errorf("err = %q, want it to name %s", err, logPath)
 			}
 		})
@@ -274,8 +414,8 @@ func TestTrimRemovesWhenOverCap(t *testing.T) {
 			t.Errorf("%s survived the trim (stat err %v)", p, err)
 		}
 	}
-	if got, want := entryNames(t, dir), []string{".gopath", ".home", ".warm"}; !slices.Equal(got, want) {
-		t.Errorf("cache dir holds %v after the trim, want only the warm scaffold %v", got, want)
+	if got, want := entryNames(t, dir), []string{".gopath", ".home", ".warm-bin"}; !slices.Equal(got, want) {
+		t.Errorf("cache dir holds %v after the trim, want only the scaffold Warm makes %v", got, want)
 	}
 	if n := len(fake.calls()); n != 1 {
 		t.Errorf("Warm ran %d times, want 1", n)
@@ -359,7 +499,7 @@ func TestTrimReturnsWarmFailure(t *testing.T) {
 	fake.result = sandbox.Result{ExitCode: 1}
 
 	err := gc.Trim()
-	if err == nil || !strings.Contains(err.Error(), filepath.Join(dir, ".warm", "build.log")) {
+	if err == nil || !strings.Contains(err.Error(), filepath.Join(dir+"-warm", "build.log")) {
 		t.Errorf("Trim err = %v, want the re-warm failure naming the build log", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "a")); !errors.Is(statErr, os.ErrNotExist) {
@@ -414,5 +554,131 @@ func TestTrimSkipsWhileAnotherWarmRuns(t *testing.T) {
 	close(finish)
 	if err := <-warmDone; err != nil {
 		t.Errorf("Warm: %v", err)
+	}
+}
+
+func TestTrimSkipsWhileCompileHeld(t *testing.T) {
+	gc, dir, fake := newTestCache(t, 1000)
+	writeFile(t, filepath.Join(dir, "ab", "entry"), 2000)
+	release := gc.HoldForCompile()
+
+	if err := gc.Trim(); err != nil {
+		t.Fatalf("Trim while a compile holds the cache: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ab", "entry")); err != nil {
+		t.Errorf("Trim deleted the cache under a running compile: %v", err)
+	}
+	if n := len(fake.calls()); n != 0 {
+		t.Errorf("Warm ran %d times while a compile held the cache, want 0", n)
+	}
+
+	release()
+	if err := gc.Trim(); err != nil {
+		t.Fatalf("Trim after the compile ended: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ab", "entry")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the over-cap cache survived a Trim with no compile running (stat err %v)", err)
+	}
+	if n := len(fake.calls()); n != 1 {
+		t.Errorf("Warm ran %d times, want 1", n)
+	}
+}
+
+func TestTrimSkipsUntilEveryCompileReleased(t *testing.T) {
+	gc, dir, _ := newTestCache(t, 1000)
+	writeFile(t, filepath.Join(dir, "entry"), 2000)
+	first, second := gc.HoldForCompile(), gc.HoldForCompile()
+
+	first()
+	if err := gc.Trim(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "entry")); err != nil {
+		t.Errorf("Trim deleted the cache while a second compile still held it: %v", err)
+	}
+
+	second()
+	if err := gc.Trim(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "entry")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Trim did not run once both compiles had released (stat err %v)", err)
+	}
+}
+
+func TestHoldForCompileReleaseIdempotent(t *testing.T) {
+	gc, dir, _ := newTestCache(t, 1000)
+	writeFile(t, filepath.Join(dir, "entry"), 2000)
+	first, second := gc.HoldForCompile(), gc.HoldForCompile()
+
+	// A cancel path and a deferred cleanup may both release the same hold. The
+	// extra call must neither panic nor end the other compile's hold.
+	first()
+	first()
+	first()
+
+	if err := gc.Trim(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "entry")); err != nil {
+		t.Errorf("a repeated release ended another compile's hold: %v", err)
+	}
+	second()
+}
+
+func TestWarmWaitsForHeldCompile(t *testing.T) {
+	gc, _, fake := newTestCache(t, 128*mib)
+	release := gc.HoldForCompile()
+	warmDone := make(chan error, 1)
+	go func() { warmDone <- gc.Warm(context.Background()) }()
+
+	select {
+	case err := <-warmDone:
+		t.Fatalf("Warm returned while a compile held the cache: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if n := len(fake.calls()); n != 0 {
+		t.Errorf("Warm built %d times while a compile held the cache, want 0", n)
+	}
+
+	release()
+	select {
+	case err := <-warmDone:
+		if err != nil {
+			t.Errorf("Warm: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Warm never ran after the compile released the cache")
+	}
+}
+
+func TestHoldForCompileWaitsForWarm(t *testing.T) {
+	gc, _, fake := newTestCache(t, 128*mib)
+	started, finish := make(chan struct{}), make(chan struct{})
+	fake.onRun = func(sandbox.Spec) {
+		close(started)
+		<-finish
+	}
+	warmDone := make(chan error, 1)
+	go func() { warmDone <- gc.Warm(context.Background()) }()
+	<-started
+
+	held := make(chan func(), 1)
+	go func() { held <- gc.HoldForCompile() }()
+	select {
+	case <-held:
+		t.Fatal("HoldForCompile returned while the cache was half built")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(finish)
+	if err := <-warmDone; err != nil {
+		t.Errorf("Warm: %v", err)
+	}
+	select {
+	case release := <-held:
+		release()
+	case <-time.After(5 * time.Second):
+		t.Fatal("HoldForCompile never returned after the Warm finished")
 	}
 }
