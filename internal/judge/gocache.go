@@ -163,7 +163,7 @@ func (g *GoCache) warm(ctx context.Context) error {
 
 	src := filepath.Join(warmDir, "main.go")
 	if err := writeNew(src, []byte(helloSource), 0o644); err != nil {
-		return err
+		return fmt.Errorf("go cache: %w", err)
 	}
 	// The shim creates and truncates the log as root. Dropping a leftover first
 	// means a stale file, or a link someone put in its place, is never reused.
@@ -211,7 +211,7 @@ func (g *GoCache) warm(ctx context.Context) error {
 func (g *GoCache) prepareOwnedDir(dir string) error {
 	f, err := mkdirOpen(dir, 0o750)
 	if err != nil {
-		return err
+		return fmt.Errorf("go cache: %w", err)
 	}
 	defer f.Close()
 	// fchown and fchmod act on the directory just opened, not on whatever the
@@ -234,7 +234,7 @@ func (g *GoCache) prepareOwnedDir(dir string) error {
 func prepareRootDir(dir string) error {
 	f, err := mkdirOpen(dir, 0o755)
 	if err != nil {
-		return err
+		return fmt.Errorf("go cache: %w", err)
 	}
 	defer f.Close()
 	if err := f.Chmod(0o755); err != nil {
@@ -244,17 +244,18 @@ func prepareRootDir(dir string) error {
 }
 
 // mkdirOpen makes dir if it is missing (not its parents) and opens it, refusing
-// a symlink or any other non-directory in its place.
+// a symlink or any other non-directory in its place. It is shared with the job
+// pipeline (the checker cache dir), so its errors carry no package prefix.
 func mkdirOpen(dir string, perm fs.FileMode) (*os.File, error) {
 	if err := os.Mkdir(dir, perm); err != nil && !errors.Is(err, fs.ErrExist) {
-		return nil, fmt.Errorf("go cache: create %s: %w", dir, err)
+		return nil, fmt.Errorf("create %s: %w", dir, err)
 	}
 	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
-			return nil, fmt.Errorf("go cache: %s is a symlink or not a directory, refusing to use it: %w", dir, err)
+			return nil, fmt.Errorf("%s is a symlink or not a directory, refusing to use it: %w", dir, err)
 		}
-		return nil, fmt.Errorf("go cache: open %s: %w", dir, err)
+		return nil, fmt.Errorf("open %s: %w", dir, err)
 	}
 	return f, nil
 }
@@ -262,19 +263,20 @@ func mkdirOpen(dir string, perm fs.FileMode) (*os.File, error) {
 // writeNew replaces path with a new file holding data. It removes what is there
 // (a symlink is removed, not followed) and creates the file with O_EXCL, which
 // also refuses a symlink, so nothing but the new file is ever written. perm is
-// set explicitly because the umask may have narrowed it.
+// set explicitly because the umask may have narrowed it. It is shared with the
+// job pipeline (sources, inline inputs), so its errors carry no package prefix.
 func writeNew(path string, data []byte, perm fs.FileMode) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("go cache: remove %s: %w", path, err)
+		return fmt.Errorf("remove %s: %w", path, err)
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
-		return fmt.Errorf("go cache: create %s: %w", path, err)
+		return fmt.Errorf("create %s: %w", path, err)
 	}
 	_, werr := f.Write(data)
 	cerr := f.Chmod(perm)
 	if err := errors.Join(werr, cerr, f.Close()); err != nil {
-		return fmt.Errorf("go cache: write %s: %w", path, err)
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
 }
