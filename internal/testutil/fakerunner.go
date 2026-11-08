@@ -203,5 +203,6 @@ func writeStreams(spec sandbox.Spec, step Step) error {
 func cloneSpec(s sandbox.Spec) sandbox.Spec {
 	s.Argv = slices.Clone(s.Argv)
 	s.Env = slices.Clone(s.Env)
+	s.Groups = slices.Clone(s.Groups)
 	return s
 }

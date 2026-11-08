@@ -22,6 +22,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -250,6 +252,7 @@ func buildProbe(dir string) (exe, errMsg string) {
 // architecture has no syscall for exits 77.
 const probeSource = `
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
@@ -315,9 +318,53 @@ int main(int argc, char **argv)
         r = open("probe-rw", O_RDWR | O_CREAT, 0644);
     } else if (!strcmp(what, "openat_w")) {
         r = openat(AT_FDCWD, "probe-at-w", O_WRONLY | O_CREAT, 0644);
+    } else if (!strcmp(what, "open_creat_rdonly")) {
+        /* read-only access mode, but O_CREAT makes the file: the access mode bits alone say nothing */
+        r = open("probe-creat-ro", O_RDONLY | O_CREAT, 0644);
+    } else if (!strcmp(what, "open_trunc_rdonly")) {
+        /* the test made the file: O_TRUNC empties it even though the descriptor is read-only */
+        r = open("probe-trunc-ro", O_RDONLY | O_TRUNC);
+    } else if (!strcmp(what, "open_tmpfile")) {
+        /* the kernel refuses O_TMPFILE without a write access mode (EINVAL), so the control run is
+         * not stopped; the filter still kills the bit */
+        r = open(".", O_RDONLY | O_TMPFILE, 0600);
+    } else if (!strcmp(what, "open_syscall_creat_rdonly")) {
+        /* the open(2) system call itself (flags are argument 1); glibc's open() is openat */
+#ifdef SYS_open
+        r = syscall(SYS_open, "probe-creat-ro-sys", O_RDONLY | O_CREAT, 0644);
+#else
+        return 77;
+#endif
     } else if (!strcmp(what, "open_r")) {
         r = open("/etc/passwd", O_RDONLY);
         if (r < 0) return 1;
+    } else if (!strcmp(what, "read_existing")) {
+        /* a read-only open of an existing file, then read() it: what every solution that reads a file does */
+        char buf[64];
+        ssize_t n;
+        int fd = open(argv[2], O_RDONLY);
+        if (fd < 0) return 1;
+        n = read(fd, buf, sizeof(buf) - 1);
+        if (n < 0) return 1;
+        buf[n] = 0;
+        printf("%s", buf);
+        return 0;
+    } else if (!strcmp(what, "opendir")) {
+        /* opendir() opens with O_RDONLY|O_DIRECTORY: the O_TMPFILE rule must not take it for O_TMPFILE */
+        DIR *d = opendir(".");
+        if (!d) return 1;
+        closedir(d);
+        return 0;
+    } else if (!strcmp(what, "listdir")) {
+        /* ... and the listing itself (getdents64, which the c_cpp allow-list does not have) */
+        struct dirent *e;
+        int n = 0;
+        DIR *d = opendir(".");
+        if (!d) return 1;
+        while ((e = readdir(d)) != NULL) n++;
+        closedir(d);
+        printf("%d\n", n);
+        return n >= 2 ? 0 : 1;
     } else if (!strcmp(what, "ptrace")) {
         r = syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
     } else if (!strcmp(what, "kill")) {
@@ -653,6 +700,92 @@ func TestRunSeccompDeniesWriteOpen(t *testing.T) {
 	}
 }
 
+// A read-only access mode is not enough: O_CREAT and O_TRUNC change the filesystem too, and O_TMPFILE
+// makes a file. Each probe makes or empties a file in the control run (so the probe does what it claims)
+// and is killed before the open under both filters, leaving the file as it was.
+func TestRunOpenRulesDenyCreatingAndEmptying(t *testing.T) {
+	needRoot(t)
+	exe := probe(t)
+	for _, tt := range []struct{ what, file string }{
+		{"open_creat_rdonly", "probe-creat-ro"},
+		{"open_trunc_rdonly", "probe-trunc-ro"},
+	} {
+		seed := func(t *testing.T) string {
+			dir := newDir(t)
+			if tt.what == "open_trunc_rdonly" {
+				if err := os.WriteFile(filepath.Join(dir, tt.file), []byte("keep\n"), 0o666); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(filepath.Join(dir, tt.file), 0o666); err != nil { // the umask may have narrowed it
+					t.Fatal(err)
+				}
+			}
+			return dir
+		}
+		t.Run(tt.what+"/control", func(t *testing.T) {
+			dir := seed(t)
+			if res := run(t, execSpec(dir, exe, SeccompNone, tt.what)); res.Signal != 0 || res.Error != 0 || res.ExitCode != 0 {
+				t.Fatalf("control run: %+v", res)
+			}
+			fi, err := os.Stat(filepath.Join(dir, tt.file))
+			switch {
+			case err != nil:
+				t.Fatalf("the probe did not create %s: %v", tt.file, err)
+			case tt.what == "open_trunc_rdonly" && fi.Size() != 0:
+				t.Fatalf("the probe did not empty %s (size %d)", tt.file, fi.Size())
+			}
+		})
+		for _, rule := range []string{SeccompCCpp, SeccompGen} {
+			t.Run(tt.what+"/"+rule, func(t *testing.T) {
+				dir := seed(t)
+				res := run(t, execSpec(dir, exe, rule, tt.what))
+				if res.Signal != int(syscall.SIGSYS) || res.Error != 0 {
+					t.Fatalf("result = %+v, want SIGSYS", res)
+				}
+				b, err := os.ReadFile(filepath.Join(dir, tt.file))
+				if tt.what == "open_creat_rdonly" && err == nil {
+					t.Fatalf("a denied open created %s", tt.file)
+				}
+				if tt.what == "open_trunc_rdonly" && string(b) != "keep\n" {
+					t.Fatalf("a denied open emptied %s: %q (%v)", tt.file, b, err)
+				}
+			})
+		}
+	}
+}
+
+// What the open rules must keep: a read-only open of an existing file, and opendir(), whose open has
+// O_DIRECTORY (the O_TMPFILE rule is the O_TMPFILE bit without it). Listing the entries needs
+// getdents64, which the c_cpp allow-list never had, so only general lists.
+func TestRunOpenRulesStillAllowReading(t *testing.T) {
+	needRoot(t)
+	exe := probe(t)
+	for _, rule := range []string{SeccompCCpp, SeccompGen} {
+		t.Run(rule, func(t *testing.T) {
+			dir := newDir(t)
+			existing := filepath.Join(dir, "existing")
+			if err := os.WriteFile(existing, []byte("hello\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			s := execSpec(dir, exe, rule, "read_existing", existing)
+			if res := run(t, s); res.Signal != 0 || res.ExitCode != 0 || res.Error != 0 {
+				t.Fatalf("read-only open and read: %+v", res)
+			}
+			if got := readFile(t, s.Stdout); got != "hello\n" {
+				t.Fatalf("read %q, want %q", got, "hello\n")
+			}
+			if res := run(t, execSpec(dir, exe, rule, "opendir")); res.Signal != 0 || res.ExitCode != 0 || res.Error != 0 {
+				t.Fatalf("opendir: %+v", res)
+			}
+			if rule == SeccompGen {
+				if res := run(t, execSpec(dir, exe, rule, "listdir")); res.Signal != 0 || res.ExitCode != 0 || res.Error != 0 {
+					t.Fatalf("listing a directory: %+v", res)
+				}
+			}
+		})
+	}
+}
+
 func TestRunStdlibCppUnderCCpp(t *testing.T) {
 	needRoot(t)
 	dir := newDir(t)
@@ -728,13 +861,19 @@ func TestRunPythonUnderGeneral(t *testing.T) {
 // shim's own checks. It returns the shim's report.
 func runShimDirect(t *testing.T, s Spec) (record, bool) {
 	t.Helper()
+	return runShimWithArgs(t, s.Env, shimArgs(s))
+}
+
+// runShimWithArgs is runShimDirect for a command line that shimArgs would not build.
+func runShimWithArgs(t *testing.T, env, args []string) (record, bool) {
+	t.Helper()
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pr.Close()
-	cmd := exec.Command(runnerPath(t), shimArgs(s)...)
-	cmd.Env = append([]string{}, s.Env...)
+	cmd := exec.Command(runnerPath(t), args...)
+	cmd.Env = append([]string{}, env...)
 	cmd.ExtraFiles = []*os.File{pw}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -903,13 +1042,19 @@ int main(){
 	}
 }
 
-// The program and the files it creates get umask 022 whatever umask the server has.
+// The program gets umask 022 whatever umask the server has, so a file it creates with 0666 is 0644; the
+// stream files the shim creates itself are 0640 (the server gives their directory to the job's group).
 func TestRunSetsUmask022(t *testing.T) {
 	needRoot(t)
 	dir := newDir(t)
-	exe := compileC(t, dir, "umaskprobe", `#include <stdio.h>
+	exe := compileC(t, dir, "umaskprobe", `#include <fcntl.h>
+#include <stdio.h>
 #include <sys/stat.h>
-int main(){ printf("%03o\n", (unsigned)umask(0)); return 0; }
+int main(){
+    int fd = open("made-by-program", O_WRONLY | O_CREAT, 0666);
+    printf("%03o\n", (unsigned)umask(0));
+    return fd < 0;
+}
 `)
 	old := syscall.Umask(0o077) // what the shim inherits from this process
 	defer syscall.Umask(old)
@@ -921,8 +1066,14 @@ int main(){ printf("%03o\n", (unsigned)umask(0)); return 0; }
 	if got := readFile(t, s.Stdout); got != "022\n" {
 		t.Fatalf("the program's umask = %q, want 022", got)
 	}
-	if fi, err := os.Stat(s.Stdout); err != nil || fi.Mode().Perm() != 0o644 {
-		t.Fatalf("stream file mode = %v (%v), want 0644", fi.Mode().Perm(), err)
+	if fi, err := os.Stat(s.Stdout); err != nil || fi.Mode().Perm() != 0o640 {
+		t.Fatalf("stdout file mode = %v (%v), want 0640", fi.Mode().Perm(), err)
+	}
+	if fi, err := os.Stat(s.Stderr); err != nil || fi.Mode().Perm() != 0o640 {
+		t.Fatalf("stderr file mode = %v (%v), want 0640", fi.Mode().Perm(), err)
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "made-by-program")); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("a file the program created with 0666: mode %v (%v), want 0644", fi.Mode().Perm(), err)
 	}
 }
 
@@ -1052,6 +1203,7 @@ func TestRunSeccompDenyTable(t *testing.T) {
 		"socket", "socket_netlink", "socket_wide", "fork", "clone3", "creat", "openat2", "ptrace", "kill", "tgkill_other", "exec_other",
 		"io_uring_setup", "io_uring_enter", "io_uring_register", "unshare", "setns", "userfaultfd", "bpf",
 		"prlimit_other", "prlimit_other_set",
+		"open_creat_rdonly", "open_trunc_rdonly", "open_tmpfile", "open_syscall_creat_rdonly",
 	}
 	for _, what := range denied {
 		t.Run(what, func(t *testing.T) {
@@ -1062,12 +1214,12 @@ func TestRunSeccompDenyTable(t *testing.T) {
 				t.Fatalf("control run (no seccomp) was stopped: %+v", control)
 			}
 			if control.ExitCode == 77 {
-				// The probe was built without that syscall. The only one allowed to be missing is
-				// creat on arm64 (the architecture has no such syscall, so there is nothing to deny):
-				// that passes, with the reason in the log, which keeps a JUDGE_REQUIRE_SANDBOX=1 run
-				// at zero skips. Any other 77 is a missing prerequisite: a skip, a failure under
-				// JUDGE_REQUIRE_SANDBOX=1.
-				if what == "creat" && runtime.GOARCH == "arm64" {
+				// The probe was built without that syscall. The only ones allowed to be missing are
+				// creat and open(2) on arm64 (the architecture has no such syscalls, so there is
+				// nothing to deny): those pass, with the reason in the log, which keeps a
+				// JUDGE_REQUIRE_SANDBOX=1 run at zero skips. Any other 77 is a missing prerequisite:
+				// a skip, a failure under JUDGE_REQUIRE_SANDBOX=1.
+				if (what == "creat" || what == "open_syscall_creat_rdonly") && runtime.GOARCH == "arm64" {
 					t.Logf("%s does not exist on %s: nothing to deny, not applicable", what, runtime.GOARCH)
 					return
 				}
@@ -1413,5 +1565,303 @@ func TestRunUnresolvableDenyNameFailsClosed(t *testing.T) {
 	s.Seccomp = SeccompGen
 	if res := run(t, s); res.Error != 0 || res.ExitCode != 0 || res.Signal != 0 {
 		t.Fatalf("real shim under general: %+v", res)
+	}
+}
+
+// ---- supplementary groups ----
+
+// groupsSource prints the supplementary groups it has and, given a path, whether it can open that file
+// read-only.
+const groupsSource = `#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv)
+{
+    gid_t g[64];
+    int i, n = getgroups(64, g);
+
+    printf("groups:");
+    for (i = 0; i < n; i++)
+        printf(" %u", (unsigned)g[i]);
+    printf("\n");
+    if (argc > 1) {
+        int fd = open(argv[1], O_RDONLY);
+        printf("open: %s\n", fd >= 0 ? "ok" : (errno == EACCES ? "EACCES" : "other"));
+    }
+    return 0;
+}
+`
+
+// Spec.Groups reaches setgroups in the shim: the program has exactly those supplementary groups (none by
+// default), and a file only one of them may read is readable only with it.
+func TestRunSupplementaryGroups(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	exe := compileC(t, dir, "groupsprobe", groupsSource)
+	const fileGroup = 12345
+	secret := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secret, []byte("x"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(secret, 0, fileGroup); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		groups []uint32
+		want   []uint32
+		open   string
+	}{
+		{"none", nil, nil, "EACCES"},
+		{"the file's group", []uint32{fileGroup}, []uint32{fileGroup}, "ok"},
+		{"another group", []uint32{12346}, []uint32{12346}, "EACCES"},
+		{"two, one of them the file's", []uint32{12346, fileGroup}, []uint32{12346, fileGroup}, "ok"},
+		{"eight", []uint32{12341, 12342, 12343, 12344, 12345, 12346, 12347, 12348},
+			[]uint32{12341, 12342, 12343, 12344, 12345, 12346, 12347, 12348}, "ok"},
+	}
+	for _, rule := range []string{SeccompNone, SeccompGen} {
+		for _, tt := range tests {
+			t.Run(rule+"/"+tt.name, func(t *testing.T) {
+				s := execSpec(dir, exe, rule, secret)
+				s.Groups = tt.groups
+				if res := run(t, s); res.ExitCode != 0 || res.Signal != 0 || res.Error != 0 {
+					t.Fatalf("result = %+v (stderr %q)", res, readFile(t, s.Stderr))
+				}
+				lines := strings.Split(strings.TrimSpace(readFile(t, s.Stdout)), "\n")
+				if len(lines) != 2 {
+					t.Fatalf("output = %q", lines)
+				}
+				var got []uint32
+				for _, f := range strings.Fields(strings.TrimPrefix(lines[0], "groups:")) {
+					g, err := strconv.ParseUint(f, 10, 32)
+					if err != nil {
+						t.Fatalf("groups line %q: %v", lines[0], err)
+					}
+					got = append(got, uint32(g))
+				}
+				slices.Sort(got)
+				want := slices.Clone(tt.want)
+				slices.Sort(want)
+				if !slices.Equal(got, want) {
+					t.Errorf("supplementary groups = %v, want %v", got, want)
+				}
+				if lines[1] != "open: "+tt.open {
+					t.Errorf("%s, want open: %s", lines[1], tt.open)
+				}
+			})
+		}
+	}
+}
+
+// The shim checks --groups itself too (Run validates the Spec first, so a bad list reaches the shim only
+// through runShimDirect and runShimWithArgs): group 0, more than eight groups and a malformed list are an
+// invalid configuration, and nothing runs.
+func TestRunShimRejectsBadGroups(t *testing.T) {
+	dir := newDir(t)
+	s := defaultSpec(dir, "/bin/sh", "-c", "echo ran")
+	s.Groups = []uint32{12003}
+	args := shimArgs(s)
+	at := slices.Index(args, "--groups") + 1
+	if at == 0 {
+		t.Fatalf("no --groups in %q", args)
+	}
+	for name, list := range map[string]string{
+		"group 0":        "12003,0",
+		"nine groups":    "1,2,3,4,5,6,7,8,9",
+		"empty":          "",
+		"empty entry":    "12003,,12004",
+		"trailing comma": "12003,",
+		"not a number":   "12003,abc",
+		"negative":       "-5",
+		"over 32 bits":   "4294967296",
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := slices.Clone(args)
+			bad[at] = list
+			rec, ok := runShimWithArgs(t, s.Env, bad)
+			if !ok || rec.err != -1 {
+				t.Fatalf("--groups %q: report = %+v (ok %v), want Error -1", list, rec, ok)
+			}
+			if _, err := os.Stat(s.Stdout); err == nil {
+				t.Fatal("the program's stdout file was created: nothing may run with a bad configuration")
+			}
+		})
+	}
+}
+
+// ---- the uid sweep ----
+
+// strayFixture leaves a process behind: it forks a child that moves to a session of its own and sleeps,
+// and exits once the child has done that (so the run's group kill, which comes after, cannot take it).
+const strayFixture = `#include <stdlib.h>
+#include <unistd.h>
+
+int main(void)
+{
+    int fds[2];
+    char c;
+    pid_t p;
+
+    if (pipe(fds) != 0)
+        return 2;
+    p = fork();
+    if (p < 0)
+        return 2;
+    if (p == 0) {
+        close(fds[0]);
+        setsid();
+        if (write(fds[1], "x", 1) != 1)
+            _exit(2);
+        close(fds[1]);
+        sleep(1000);
+        _exit(0);
+    }
+    close(fds[1]);
+    return read(fds[0], &c, 1) == 1 ? 0 : 1;
+}
+`
+
+// uidProcesses lists the processes whose real uid is uid, zombies included (what pgrep -U lists).
+func uidProcesses(uid uint32) []string {
+	var found []string
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		status, err := os.ReadFile(filepath.Join("/proc", e.Name(), "status"))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(status), "\n") {
+			if rest, ok := strings.CutPrefix(line, "Uid:"); ok {
+				if f := strings.Fields(rest); len(f) > 0 && f[0] == strconv.FormatUint(uint64(uid), 10) {
+					cmd, _ := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+					found = append(found, e.Name()+" "+strings.ReplaceAll(strings.TrimRight(string(cmd), "\x00"), "\x00", " "))
+				}
+				break
+			}
+		}
+	}
+	return found
+}
+
+// sweepClean removes whatever processes of uid an earlier test left, and again when the test is over.
+func sweepClean(t *testing.T, uid uint32) {
+	t.Helper()
+	if _, err := KillUID(uid); err != nil {
+		t.Fatalf("KillUID(%d) before the test: %v", uid, err)
+	}
+	t.Cleanup(func() { _, _ = KillUID(uid) })
+}
+
+// A background process that moved to a session of its own outlives Run (the group kill misses it);
+// KillUID ends it, and only the processes of that uid.
+func TestKillUIDEndsStrayProcesses(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	exe := compileC(t, dir, "stray", strayFixture)
+	sweepClean(t, uidCode)
+	sweepClean(t, uidCompiler)
+
+	for _, uid := range []uint32{uidCode, uidCompiler} {
+		s := execSpec(dir, exe, SeccompNone)
+		s.UID, s.GID = uid, uid
+		if res := run(t, s); res.ExitCode != 0 || res.Signal != 0 || res.Error != 0 {
+			t.Fatalf("stray fixture as %d: %+v", uid, res)
+		}
+	}
+	for _, uid := range []uint32{uidCode, uidCompiler} {
+		if got := uidProcesses(uid); len(got) != 1 {
+			t.Fatalf("after the run, processes of uid %d = %q, want the one stray sleeper", uid, got)
+		}
+	}
+
+	killed, err := KillUID(uidCode)
+	if err != nil || killed != 1 {
+		t.Fatalf("KillUID(%d) = %d, %v; want 1, nil", uidCode, killed, err)
+	}
+	if got := uidProcesses(uidCode); len(got) != 0 {
+		t.Fatalf("processes of uid %d after the sweep: %q", uidCode, got)
+	}
+	if got := uidProcesses(uidCompiler); len(got) != 1 {
+		t.Fatalf("a sweep of uid %d must leave uid %d alone, its processes = %q", uidCode, uidCompiler, got)
+	}
+	if killed, err := KillUID(uidCompiler); err != nil || killed != 1 {
+		t.Fatalf("KillUID(%d) = %d, %v; want 1, nil", uidCompiler, killed, err)
+	}
+	if killed, err := KillUID(uidCode); err != nil || killed != 0 {
+		t.Fatalf("a second sweep = %d, %v; want 0, nil", killed, err)
+	}
+}
+
+// A run still going is not a stray: a sweep of its uid, started while it sleeps, ends only what a
+// finished run left behind, and the live run completes as if nothing happened.
+func TestKillUIDSparesLiveRuns(t *testing.T) {
+	needRoot(t)
+	needTool(t, "/bin/sleep")
+	dir := newDir(t)
+	exe := compileC(t, dir, "stray", strayFixture)
+	sweepClean(t, uidCode)
+
+	type outcome struct {
+		res Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	liveSpec := defaultSpec(dir, "/bin/sleep", "3.500123")
+	go func() {
+		res, err := Run(context.Background(), runnerBinary(), liveSpec)
+		done <- outcome{res, err}
+	}()
+	// Wait until the program is running: a process of the uid that is not the shim (root).
+	for deadline := time.Now().Add(3 * time.Second); len(uidProcesses(uidCode)) == 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the live run's program did not start")
+		}
+	}
+
+	// A second run of the same uid ends and leaves a stray behind, while the first is still going.
+	s := execSpec(dir, exe, SeccompNone)
+	if res := run(t, s); res.ExitCode != 0 || res.Signal != 0 || res.Error != 0 {
+		t.Fatalf("stray fixture: %+v", res)
+	}
+	live.Lock()
+	registered := len(live.pids)
+	live.Unlock()
+	if registered != 1 {
+		t.Fatalf("%d runs registered as live before the sweep, want only the sleeping one", registered)
+	}
+	if got := uidProcesses(uidCode); len(got) != 2 {
+		t.Fatalf("processes of uid %d = %q, want the live sleeper and the stray", uidCode, got)
+	}
+
+	killed, err := KillUID(uidCode)
+	if err != nil || killed != 1 {
+		t.Fatalf("KillUID(%d) = %d, %v; want 1 (the stray), nil", uidCode, killed, err)
+	}
+	if got := uidProcesses(uidCode); len(got) != 1 || !strings.Contains(got[0], "3.500123") {
+		t.Fatalf("after the sweep, processes of uid %d = %q, want only the live sleeper", uidCode, got)
+	}
+
+	select {
+	case o := <-done:
+		if o.err != nil || o.res.ExitCode != 0 || o.res.Signal != 0 || o.res.Error != 0 || o.res.RealTimeMs < 3500 {
+			t.Fatalf("the live run = %+v, %v; want a normal exit after its 3.5 s", o.res, o.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the live run did not finish")
+	}
+	// Run is over: whatever is left of its session now is fair game, and nothing is registered.
+	if killed, err := KillUID(uidCode); err != nil || killed != 0 {
+		t.Fatalf("a sweep after the run = %d, %v; want 0, nil", killed, err)
+	}
+	live.Lock()
+	defer live.Unlock()
+	if len(live.pids) != 0 {
+		t.Fatalf("live registry after every run ended: %v", live.pids)
 	}
 }

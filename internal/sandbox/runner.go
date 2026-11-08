@@ -46,14 +46,18 @@ const resultGrace = 250 * time.Millisecond
 // program that spent its CPU until the limit read as CPU TLE and one that only
 // waited as real TLE.
 //
-// The shim runs in its own process group, which Run kills with SIGKILL as a
+// The shim runs in its own session (it is started with setsid, so it leads the
+// session and its process group), and Run kills that group with SIGKILL as a
 // backstop when MaxRealTimeMs+backstopGrace passes (a shim that is stuck, or a
 // child still starting up, never reports), when ctx is done, and once more when
-// the shim has exited, to take along anything the program left behind. A run
-// the backstop killed has RealTimeMs = max(measured, MaxRealTimeMs+1),
-// Signal = SIGKILL and no CPU time or memory: the program died with the shim
-// and nobody could collect them. If ctx ended the run, Run returns ctx.Err()
-// with Signal = SIGKILL.
+// the shim has exited, to take along anything the program left behind. While
+// the run is in progress the shim's pid is in the live-session registry that
+// KillUID consults, so a sweep leaves alone whatever is still in the session of
+// a run in progress; a process that left the session with setsid is outside it
+// and is swept. A run the backstop killed has RealTimeMs = max(measured,
+// MaxRealTimeMs+1), Signal = SIGKILL and no CPU time or memory: the program died
+// with the shim and nobody could collect them. If ctx ended the run, Run returns
+// ctx.Err() with Signal = SIGKILL.
 func Run(ctx context.Context, runnerPath string, s Spec) (Result, error) {
 	if err := s.validate(); err != nil {
 		return Result{}, err
@@ -72,15 +76,18 @@ func Run(ctx context.Context, runnerPath string, s Spec) (Result, error) {
 	// own environment (which holds the judge token).
 	cmd.Env = append([]string{}, s.Env...)
 	cmd.ExtraFiles = []*os.File{pw} // fd 3 in the shim: the report
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// A session leader is also a process group leader, so -pid is the group the
+	// kills below reach, and the pid is the session id of everything the run
+	// starts (see KillUID). Setpgid must not be set as well: setpgid fails for a
+	// session leader.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	start := time.Now()
-	err = cmd.Start()
+	pid, err := startLive(cmd)
 	_ = pw.Close() // the shim holds the only write end now
 	if err != nil {
 		return Result{}, fmt.Errorf("sandbox: start %s: %w", runnerPath, err)
 	}
-	pid := cmd.Process.Pid
 
 	// kill may fire from the backstop timer, from ctx, or both. It never signals once
 	// the shim has been reaped, when its pid (and so the group id) could
@@ -115,6 +122,9 @@ func Run(ctx context.Context, runnerPath string, s Spec) (Result, error) {
 	// recycled group.
 	exitErr := waitExited(pid)
 	_ = syscall.Kill(-pid, syscall.SIGKILL) // whatever the program left in the group
+	// Still a zombie, so its pid (the session id) cannot be reused yet: from here
+	// on a sweep may kill whatever is left in the session.
+	endLive(pid)
 	mu.Lock()
 	reaped = true // from here nothing signals the group: Wait reaps the shim
 	wasTimedOut, wasCanceled := timedOut, canceled

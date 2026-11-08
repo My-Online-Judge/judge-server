@@ -1496,7 +1496,7 @@ func TestJudgeJobDirLayout(t *testing.T) {
 		"":    fs.ModeDir | 0o711,
 		"src": fs.ModeDir | 0o775,
 		"in":  fs.ModeDir | 0o755,
-		"out": fs.ModeDir | 0o755,
+		"out": fs.ModeDir | fs.ModeSetgid | 0o755,
 		"tmp": fs.ModeDir | fs.ModeSticky | 0o777,
 	}
 	for name, want := range wantMode {
@@ -1512,6 +1512,9 @@ func TestJudgeJobDirLayout(t *testing.T) {
 			if e := seen[name]; e.uid != 0 {
 				t.Errorf("%q owner uid = %d, want root", name, e.uid)
 			}
+		}
+		if e := seen["out"]; e.gid != 12003 {
+			t.Errorf("out group = %d, want 12003 (the checker reads the shim's 0640 N.out through it)", e.gid)
 		}
 	}
 }

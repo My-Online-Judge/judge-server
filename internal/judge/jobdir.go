@@ -22,9 +22,11 @@ import (
 //	                                  (a program's working directory)
 //	<id>/in/       0755 root          inline inputs N.in (0644), written after the compile;
 //	                                  unlike src/ the compiler cannot touch them
-//	<id>/out/      0755 root          per-case N.out / N.err (and the checker's streams),
-//	                                  created by the shim as root (0644); never writable by
-//	                                  the run user, so the shim's root opens cannot be redirected
+//	<id>/out/      2755 root:spj      per-case N.out / N.err (and the checker's streams),
+//	                                  created by the shim as root (0640) and, the directory being
+//	                                  setgid, in group spj: the checker (gid 12003) reads N.out,
+//	                                  the run user cannot. Never writable by the run user, so the
+//	                                  shim's root opens cannot be redirected
 //	<id>/tmp/      1777               TMPDIR of every compile, run and checker run, and
 //	                                  HOME of every compile
 //	<id>/compile.out, spj-compile.out
@@ -86,7 +88,7 @@ func (j *job) prepareDirs() error {
 		{j.dir, 0o711, -1},
 		{j.srcDir, 0o775, int(uidCompiler)},
 		{j.inDir, 0o755, -1},
-		{j.outDir, 0o755, -1},
+		{j.outDir, os.ModeSetgid | 0o755, int(uidSPJ)},
 		{j.tmpDir, os.ModeSticky | 0o777, -1},
 	}
 	for _, d := range dirs {

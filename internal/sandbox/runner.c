@@ -14,8 +14,8 @@
  * identity switch with the server-supplied environment, which a dynamic build
  * would let LD_PRELOAD and friends reach.
  *
- *   judge-runner --uid U --gid G --cpu-ms N --real-ms N --as N --stack N --fsize N --nproc N
- *                [--seccomp c_cpp|general] [--exe PATH] [--chdir DIR]
+ *   judge-runner --uid U --gid G [--groups G1,G2...] --cpu-ms N --real-ms N --as N --stack N
+ *                --fsize N --nproc N [--seccomp c_cpp|general] [--exe PATH] [--chdir DIR]
  *                [--stdin P] [--stdout P] [--stderr P] -- argv...
  *
  * Two processes, like qduoj's Judger: the shim (the "runner") forks the program
@@ -25,13 +25,25 @@
  * the kernel folds the parent's high-water mark into the child at exec).
  *
  * The child (the program) does, in this order: refuse uid 0 / gid 0, umask(022),
- * open the stdin/stdout/stderr files (O_NOFOLLOW) and dup2 them (one file for
- * stdout and stderr when their paths are the same string), chdir, write 1000 to
- * oom_score_adj, setrlimit, setgroups(0) + setgid + setuid, PR_SET_PDEATHSIG,
- * PR_SET_NO_NEW_PRIVS, load the seccomp filter, execve. A failing step makes it
- * write one signed byte, the judger error code, to an internal pipe and _exit(255).
- * The runner waits until the program has exited or been killed: a ptrace stop is
- * not an end (see reap).
+ * open the stdin/stdout/stderr files (O_NOFOLLOW, created 0640) and dup2 them (one
+ * file for stdout and stderr when their paths are the same string), chdir, write
+ * 1000 to oom_score_adj, setrlimit, setgroups (the --groups list, no group at all
+ * when the flag is absent) + setgid + setuid, PR_SET_PDEATHSIG, PR_SET_NO_NEW_PRIVS,
+ * load the seccomp filter, execve. A failing step makes it write one signed byte,
+ * the judger error code, to an internal pipe and _exit(255). The runner waits
+ * until the program has exited or been killed: a ptrace stop is not an end (see
+ * reap).
+ *
+ * The server starts the runner as a session leader (setsid), so the runner's pid
+ * is the session id and the process group id of the program and of whatever the
+ * program starts without moving to a session of its own. The server kills that
+ * group when the run ends. Its sweep of a run uid (KillUID in sweep.go) spares the
+ * processes of the sessions of the runners still going and kills every other
+ * process of that uid: a program that left the group with setsid does not outlive
+ * its job.
+ *
+ * Under c_cpp and general the program may open files for reading and for nothing
+ * else: add_open_rules denies the write access modes, O_CREAT, O_TRUNC and O_TMPFILE.
  *
  * The runner enforces the real-time limit itself, as qduoj's Judger does: when the
  * program has started (execve done) it arms an interval timer for --real-ms, and the
@@ -91,11 +103,16 @@
 
 #define REPORT_FD 3
 
+/* The most supplementary groups --groups takes (Spec.Groups in spec.go has the same bound). */
+#define MAX_GROUPS 8
+
 extern char **environ;
 
 struct config {
     uid_t uid;
     gid_t gid;
+    gid_t groups[MAX_GROUPS];
+    size_t ngroups;
     long long cpu_ms, real_ms, as_bytes, stack_bytes, fsize_bytes, nproc;
     const char *seccomp;
     const char *exe;
@@ -119,6 +136,29 @@ static int parse_u64(const char *s, unsigned long long max, unsigned long long *
         return -1;
     *out = v;
     return 0;
+}
+
+/* --groups: a comma-separated list of 1..MAX_GROUPS group ids, none of them 0. */
+static int parse_groups(const char *s, struct config *c)
+{
+    char buf[16];
+    unsigned long long v;
+
+    c->ngroups = 0;
+    for (;;) {
+        size_t n = strcspn(s, ",");
+
+        if (n == 0 || n >= sizeof(buf) || c->ngroups >= MAX_GROUPS)
+            return -1;
+        memcpy(buf, s, n);
+        buf[n] = '\0';
+        if (parse_u64(buf, UINT32_MAX, &v) != 0 || v == 0)
+            return -1;
+        c->groups[c->ngroups++] = (gid_t)v;
+        if (s[n] == '\0')
+            return 0;
+        s += n + 1;
+    }
 }
 
 static int parse_args(int argc, char **argv, struct config *c)
@@ -151,6 +191,8 @@ static int parse_args(int argc, char **argv, struct config *c)
             if (parse_u64(val, UINT32_MAX, &v) != 0) return -1;
             c->gid = (gid_t)v;
             have |= HAVE_GID;
+        } else if (strcmp(flag, "--groups") == 0) {
+            if (parse_groups(val, c) != 0) return -1;
         } else if (strcmp(flag, "--cpu-ms") == 0) {
             if (parse_u64(val, LLONG_MAX / 2, &v) != 0) return -1;
             c->cpu_ms = (long long)v;
@@ -317,14 +359,29 @@ static int add_execve_rule(scmp_filter_ctx ctx, int allow_if_equal, const char *
     return seccomp_rule_add(ctx, action, nr, 1, SCMP_CMP(0, op, (scmp_datum_t)(uintptr_t)exe));
 }
 
-/* open/openat for reading only: the access mode bits (O_WRONLY, O_RDWR) must be
- * clear. For the deny-list profile the two bits are killed separately. */
+/* The open flags a run may not pass: writing (O_WRONLY, O_RDWR) and creating or
+ * emptying a file (O_CREAT, O_TRUNC, O_TMPFILE). O_TMPFILE is taken without its
+ * O_DIRECTORY part, which opendir() passes and must stay allowed. With these a
+ * program under c_cpp or general can open no file it could write to, so it cannot
+ * fill a filesystem through its TMPDIR. (general still allows mkdir, mknod,
+ * symlink, link, rename and truncate: they make or move entries that hold no
+ * data. c_cpp allows none of them.) */
+static const unsigned long open_denied_bits[] = {
+    O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_TMPFILE & ~O_DIRECTORY,
+};
+
+/* open/openat for reading only: every bit of open_denied_bits must be clear. For
+ * the deny-list profile each bit is killed by a rule of its own. */
 static int add_open_rules(scmp_filter_ctx ctx, int allow_read_only)
 {
     static const struct { const char *name; unsigned flags_arg; } calls[] = {
         { "open", 1 }, { "openat", 2 },
     };
-    size_t i;
+    size_t i, b;
+    scmp_datum_t any_denied = 0;
+
+    for (b = 0; b < sizeof(open_denied_bits) / sizeof(open_denied_bits[0]); b++)
+        any_denied |= open_denied_bits[b];
 
     for (i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
         int nr = resolve(calls[i].name);
@@ -336,15 +393,16 @@ static int add_open_rules(scmp_filter_ctx ctx, int allow_read_only)
         }
         if (allow_read_only) {
             if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 1,
-                                 SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, O_WRONLY | O_RDWR, 0)) != 0)
+                                 SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, any_denied, 0)) != 0)
                 return -1;
         } else {
-            if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1,
-                                 SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, O_WRONLY, O_WRONLY)) != 0)
-                return -1;
-            if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1,
-                                 SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, O_RDWR, O_RDWR)) != 0)
-                return -1;
+            for (b = 0; b < sizeof(open_denied_bits) / sizeof(open_denied_bits[0]); b++) {
+                scmp_datum_t bit = open_denied_bits[b];
+
+                if (seccomp_rule_add(ctx, SCMP_ACT_KILL_PROCESS, nr, 1,
+                                     SCMP_CMP(calls[i].flags_arg, SCMP_CMP_MASKED_EQ, bit, bit)) != 0)
+                    return -1;
+            }
         }
     }
     return 0;
@@ -467,22 +525,23 @@ static void run_child(const struct config *c, int pipe_fd, pid_t runner_pid)
     if (c->uid == 0 || c->gid == 0)
         child_fail(pipe_fd, ERR_SETUID_FAILED);
 
-    /* Whatever umask the server has, the stream files are 0644 (the checker reads
-     * the user's output) and so is every file the program creates (a compiler's
-     * artifact must be readable and runnable by the run user). The umask survives
-     * the execve. */
+    /* Whatever umask the server has, the stream files are 0640 (the server puts a
+     * run's output files in a setgid directory of the job's group, so the checker,
+     * which runs with that group, reads them) and every file the program creates
+     * is at most 0755 (a compiler's artifact must be readable and runnable by the
+     * run user). The umask survives the execve. */
     umask(022);
 
     /* One path for stdout and stderr means one open file description for both
      * (the shell's 2>&1): two opens would each write from offset 0 and overwrite
      * each other. Only the identical string counts, not two names of one file. */
     if (redirect(c->stdin_path, O_RDONLY, 0, STDIN_FILENO) != 0 ||
-        redirect(c->stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDOUT_FILENO) != 0)
+        redirect(c->stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0640, STDOUT_FILENO) != 0)
         child_fail(pipe_fd, ERR_DUP2_FAILED);
     if (strcmp(c->stderr_path, c->stdout_path) == 0) {
         if (dup2(STDOUT_FILENO, STDERR_FILENO) < 0)
             child_fail(pipe_fd, ERR_DUP2_FAILED);
-    } else if (redirect(c->stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0644, STDERR_FILENO) != 0) {
+    } else if (redirect(c->stderr_path, O_WRONLY | O_CREAT | O_TRUNC, 0640, STDERR_FILENO) != 0) {
         child_fail(pipe_fd, ERR_DUP2_FAILED);
     }
 
@@ -500,7 +559,7 @@ static void run_child(const struct config *c, int pipe_fd, pid_t runner_pid)
         set_limit(RLIMIT_CORE, 0) != 0)
         child_fail(pipe_fd, ERR_SETRLIMIT_FAILED);
 
-    if (setgroups(0, NULL) != 0 || setgid(c->gid) != 0 || setuid(c->uid) != 0)
+    if (setgroups(c->ngroups, c->ngroups ? c->groups : NULL) != 0 || setgid(c->gid) != 0 || setuid(c->uid) != 0)
         child_fail(pipe_fd, ERR_SETUID_FAILED);
 
     /* Die with the runner, so a program that leaves the runner's process group
@@ -685,7 +744,10 @@ int main(int argc, char **argv)
     }
 
     /* The server kills the whole group (this process, the program, whatever it
-     * started); Run also sets this before exec so the group exists from the start. */
+     * started). Run starts this process as a session leader (setsid), which is also
+     * a group leader, and setpgid then fails with EPERM: being the leader is what
+     * counts. The session matters too: the server's uid sweep spares the processes
+     * in the session of a live runner and kills the run user's others. */
     if (setpgid(0, 0) != 0 && getpgrp() != getpid()) {
         report(ERR_INVALID_CONFIG, 0, NULL, 0);
         return 255;

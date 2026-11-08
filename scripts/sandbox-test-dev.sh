@@ -12,7 +12,9 @@
 # BASE defaults to ubuntu:22.04 (glibc 2.35, what the runtime image uses). Go comes
 # from golang:1.23 either way. The container drops every capability except the six
 # the judge-server container has, sets no-new-privileges and mounts /work as an
-# exec tmpfs, like the real deployment. To see which syscalls a program makes (for
+# exec tmpfs and runs under an init (--init, so the processes a sweep kills are reaped), like the real
+# deployment. The image has the users compiler, code and spj and the per-slot users code0..code7
+# (uids and gids 12100-12107). To see which syscalls a program makes (for
 # seccomp_rules.md), run `strace -f` in the same image with `--cap-add SYS_PTRACE`.
 #
 # PLATFORM only means something on a host that runs that architecture natively. On an
@@ -41,10 +43,13 @@ ENV PATH=/usr/local/go/bin:${PATH}
 RUN useradd -u 12001 -M -s /usr/sbin/nologin compiler \
  && useradd -u 12002 -M -s /usr/sbin/nologin code \
  && useradd -u 12003 -M -s /usr/sbin/nologin spj \
+ && for i in 0 1 2 3 4 5 6 7; do \
+      groupadd -g $((12100 + i)) code$i && useradd -u $((12100 + i)) -g $((12100 + i)) -M -s /usr/sbin/nologin code$i; \
+    done \
  && mkdir /work
 DOCKERFILE
 
-docker run --rm ${platform_args[@]+"${platform_args[@]}"} \
+docker run --rm --init ${platform_args[@]+"${platform_args[@]}"} \
   --cap-drop ALL \
   --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID --cap-add KILL \
   --security-opt no-new-privileges:true \
