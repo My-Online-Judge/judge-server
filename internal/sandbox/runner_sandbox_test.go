@@ -270,6 +270,9 @@ int main(int argc, char **argv)
 
     if (!strcmp(what, "socket")) {
         r = socket(AF_INET, SOCK_STREAM, 0);
+    } else if (!strcmp(what, "socket_netlink")) {
+        /* a second network domain next to AF_INET: only AF_UNIX is answered, every other one is killed */
+        r = socket(AF_NETLINK, SOCK_RAW, 0);
     } else if (!strcmp(what, "socket_wide")) {
         /* AF_UNIX with a high bit set: the kernel truncates the family to an int and creates a
          * unix socket, so the filter must not mistake it for the AF_UNIX it answers with EACCES */
@@ -973,7 +976,7 @@ func TestRunSeccompDenyTable(t *testing.T) {
 	// probe must not be stopped (the control run), proving the probe does what
 	// it claims.
 	denied := []string{
-		"socket", "socket_wide", "fork", "clone3", "creat", "openat2", "ptrace", "kill", "tgkill_other", "exec_other",
+		"socket", "socket_netlink", "socket_wide", "fork", "clone3", "creat", "openat2", "ptrace", "kill", "tgkill_other", "exec_other",
 		"io_uring_setup", "io_uring_enter", "io_uring_register", "unshare", "setns", "userfaultfd", "bpf",
 		"prlimit_other", "prlimit_other_set",
 	}
@@ -986,11 +989,16 @@ func TestRunSeccompDenyTable(t *testing.T) {
 				t.Fatalf("control run (no seccomp) was stopped: %+v", control)
 			}
 			if control.ExitCode == 77 {
-				// Not a missing prerequisite: the architecture has no such syscall (creat on
-				// aarch64), so there is nothing to deny. Passing, with the reason in the log,
-				// keeps a JUDGE_REQUIRE_SANDBOX=1 run at zero skips.
-				t.Logf("%s does not exist on %s: nothing to deny, not applicable", what, runtime.GOARCH)
-				return
+				// The probe was built without that syscall. The only one allowed to be missing is
+				// creat on arm64 (the architecture has no such syscall, so there is nothing to deny):
+				// that passes, with the reason in the log, which keeps a JUDGE_REQUIRE_SANDBOX=1 run
+				// at zero skips. Any other 77 is a missing prerequisite: a skip, a failure under
+				// JUDGE_REQUIRE_SANDBOX=1.
+				if what == "creat" && runtime.GOARCH == "arm64" {
+					t.Logf("%s does not exist on %s: nothing to deny, not applicable", what, runtime.GOARCH)
+					return
+				}
+				skipOrFail(t, "%s does not exist on %s", what, runtime.GOARCH)
 			}
 			for _, rule := range []string{SeccompGen, SeccompCCpp} {
 				res := run(t, execSpec(dir, exe, rule, what))

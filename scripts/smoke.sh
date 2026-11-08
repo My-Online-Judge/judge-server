@@ -22,7 +22,10 @@ NAME=judge-server-smoke   # container name, host name and a name in the server c
 NET=judge-smoke-net
 TOKEN=smoke
 CLIENT_CN=judge-worker
-GRPCURL=fullstorydev/grpcurl
+# Pinned: the client the smoke test talks with must not move under it. The Go image only runs mktls;
+# the Makefile passes its GO_IMAGE so that both use one toolchain tag.
+GRPCURL=fullstorydev/grpcurl:v1.9.3
+GO_IMAGE="${GO_IMAGE:-golang:1.23}"
 
 [ -f "$PROTO_DIR/judge_server.proto" ] || { echo "judge_server.proto not found in $PROTO_DIR (set PROTO_DIR)" >&2; exit 2; }
 
@@ -42,7 +45,7 @@ docker image ls "$IMAGE" --format 'image {{.Repository}}:{{.Tag}}  {{.ID}}  size
 
 step "throw-away PKI (server names: judge-server, localhost, $NAME)"
 docker run --rm -v "$ROOT":/src -v judge-server-gomod:/go/pkg/mod -v "$tls":/tls -w /src \
-  -e GOFLAGS=-mod=mod -e GOCACHE=/tmp/gocache golang:1.23 \
+  -e GOFLAGS=-mod=mod -e GOCACHE=/tmp/gocache "$GO_IMAGE" \
   go run ./internal/testutil/cmd/mktls /tls "$NAME"
 chmod a+r "$tls"/*   # the grpcurl container runs as another user than the one that wrote them
 

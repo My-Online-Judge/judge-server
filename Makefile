@@ -33,4 +33,4 @@ sandbox-test:
 
 # Starts the shipped image over mutual TLS and talks to it with grpcurl. See scripts/smoke.sh.
 smoke:
-	scripts/smoke.sh
+	GO_IMAGE=$(GO_IMAGE) scripts/smoke.sh

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Runs inside the test image (Dockerfile, stage "test"): every sandbox-tagged test binary with -test.v.
-# Exit status is non-zero when a test failed, a binary could not run, or, under JUDGE_REQUIRE_SANDBOX=1,
-# when any test skipped. Prints a summary line per binary.
+# Exit status is non-zero when a test failed, a binary could not run or ran no passing test, or, under
+# JUDGE_REQUIRE_SANDBOX=1, when any test skipped. Prints a summary line per binary.
 set -u -o pipefail
 
 export JUDGE_TESTDATA=/tests/testdata
@@ -18,6 +18,10 @@ for pkg in sandbox judge; do
   fi
   pass=$(grep -c -- '--- PASS' "$log"); fail=$(grep -c -- '--- FAIL' "$log"); skip=$(grep -c -- '--- SKIP' "$log")
   echo "=== $pkg.test summary: $pass passed, $fail failed, $skip skipped ==="
+  if [ "$pass" -le 0 ]; then
+    echo "!!! $pkg.test ran no passing test: a binary that ran nothing is a failure"
+    status=1
+  fi
   if [ "${JUDGE_REQUIRE_SANDBOX:-}" = 1 ] && [ "$skip" -ne 0 ]; then
     echo "!!! $pkg.test skipped $skip test(s) under JUDGE_REQUIRE_SANDBOX=1"
     grep -- '--- SKIP' "$log"

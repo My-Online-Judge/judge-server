@@ -70,7 +70,7 @@ error.
 
 Upstream `general.c`: `clone fork vfork kill execveat` killed; `socket` is answered with `EACCES` upstream (its comment
 says the opposite; the controller's rule for this port is to kill, so a network `socket` is killed here, with the one
-exception in the table below); `execve` killed when `arg0 != exe`; `open`/`openat` killed when `flags & O_WRONLY` or
+exception described after the table below); `execve` killed when `arg0 != exe`; `open`/`openat` killed when `flags & O_WRONLY` or
 `flags & O_RDWR`.
 
 ### Additions in this port
@@ -100,7 +100,9 @@ SOCK_NONBLOCK)`) before it reads `/etc/passwd`, so any `getpwuid()` under a plai
 Python 3.10 makes that call at start-up whenever `HOME` is unset (it looks up the user site-packages directory), and the
 run environment has no `HOME` (Task 9: only a compile gets one). With the kill, every Python 3 program was a runtime
 error before its first line. No socket is created, so there is nothing to connect with: no capability is added.
-`TestRunGeneralAnswersAFUnixSocketWithEACCES`, `TestRunGeneralGetpwuidFallsBackToPasswdFile`, and the python rows of
+**`c_cpp` is unchanged:** it is an allow-list with no `socket` entry, so `socket(AF_UNIX)` is still `SIGSYS` there; only
+`general` has the exception. AF_NETLINK is probed next to AF_INET (`socket_netlink`) to show that another network domain is
+still killed. `TestRunGeneralAnswersAFUnixSocketWithEACCES`, `TestRunGeneralGetpwuidFallsBackToPasswdFile`, and the python rows of
 the engine corpus (`internal/judge/engine_sandbox_test.go`). Setting `HOME` in the run environment would avoid the
 lookup too, but a test of Task 9 pins "a run has no HOME", so the filter was changed instead; either is enough.
 

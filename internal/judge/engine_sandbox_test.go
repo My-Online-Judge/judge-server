@@ -14,15 +14,16 @@ package judge_test
 // The language rows are the ones submission-service sends: V2__seed_languages.sql,
 // changed by V3__languages_the_sandbox_can_judge.sql and V9__java_runs_under_the_
 // security_manager.sql, with the environments of JudgeService.java (the per-language
-// RUN_ENV and COMPILE_ENV, and AppProperties.JUDGE_ENV on every run). Three deviations,
-// each marked where it is:
+// RUN_ENV and COMPILE_ENV, and AppProperties.JUDGE_ENV on every run). Two deviations from
+// the migrations, each marked where it is, and one note:
 //   - (a) the Python 3 row is the part-2 V10 form (a flat solution.pyc), because the
 //     V2 row's __pycache__/solution.cpython-36.pyc names the qduoj image's Python;
 //   - (b) the java row's run command drops the security manager flags in the tests
 //     that have no /opt/oj/java.policy (a compose mount in part 2); the test
 //     TestEngineJavaWithPolicy mounts the policy and runs the V9 command unchanged;
-//   - (c) the javascript row is memory_limit_check_only, which JudgeService does not
-//     send yet: Node does not start under RLIMIT_AS of twice the limit.
+//   - (c) the javascript row is memory_limit_check_only, as JudgeService sends it
+//     (MEMORY_CHECK_ONLY_LANGUAGES: java, go, javascript): Node does not start under
+//     RLIMIT_AS of twice the limit.
 
 import (
 	"context"
@@ -104,8 +105,8 @@ func runEnv(perLanguage ...string) []string {
 }
 
 // languageRows are the rows as the tests judge them, keyed by language identifier.
-// memory_limit_check_only is 1 for java and go (JudgeService.MEMORY_CHECK_ONLY_LANGUAGES), and,
-// DEVIATION (c), for javascript too: see its row.
+// memory_limit_check_only is 1 for java, go and javascript (JudgeService.MEMORY_CHECK_ONLY_LANGUAGES);
+// see the javascript row for why that one is needed.
 var languageRows = map[string]languageRow{
 	// V2 + V3: c_cpp, 128 MiB compile memory.
 	"c": {LanguageConfig: judge.LanguageConfig{
@@ -117,7 +118,7 @@ var languageRows = map[string]languageRow{
 		Compile: compileCfg("main.cpp", "main", cppCompileCommand, 1073741824),
 		Run:     judge.RunConfig{Command: "{exe_path}", SeccompRule: "c_cpp", Env: runEnv()},
 	}, limit: memoryLimit},
-	// V2 + V3 + V9: V3 gives javac no memory limit (-1); V9 is javaRunV9. The seccomp rule is NULL: none.
+	// V2 + V9: V2 gives javac no memory limit (-1) and the row no seccomp rule (NULL: none); V9 is javaRunV9.
 	// The test deviation (no security manager) is applied by withoutJavaPolicy.
 	"java": {LanguageConfig: judge.LanguageConfig{
 		Compile: compileCfg("Main.java", "Main", "/usr/bin/javac {src_path} -d {exe_dir} -encoding UTF8", -1),
@@ -142,12 +143,11 @@ var languageRows = map[string]languageRow{
 		Run:     judge.RunConfig{Command: "{exe_path}", SeccompRule: "", Env: runEnv("GODEBUG=madvdontneed=1"), MemoryLimitCheckOnly: true},
 	}, limit: memoryLimit},
 	// V2 (V3 disables the row until part 2's V11 enables it): no compile step.
-	// DEVIATION (c): memory_limit_check_only is true, which JudgeService does not send for javascript
-	// today (its MEMORY_CHECK_ONLY_LANGUAGES is java and go). Node cannot run under RLIMIT_AS = 2 x the
-	// limit: V8 gives each of its ten threads a 128 MiB stack (RLIMIT_STACK) and reserves more address
-	// space on top, the second thread's mmap fails, and the program hangs on a futex until the real-time
-	// limit kills it (REAL_TLE for every program, even `throw`). Part 2 must add javascript to that list
-	// when it enables the row (V11).
+	// memory_limit_check_only is true: submission-service marks javascript check-only
+	// (JudgeService.MEMORY_CHECK_ONLY_LANGUAGES). Node cannot run under RLIMIT_AS = 2 x the limit: V8
+	// gives each of its ten threads a 128 MiB stack (RLIMIT_STACK) and reserves more address space on
+	// top, the second thread's mmap fails, and the program hangs on a futex until the real-time limit
+	// kills it (REAL_TLE for every program, even `throw`).
 	"javascript": {LanguageConfig: judge.LanguageConfig{
 		Compile: compileCfg("solution.js", "solution.js", "", 0),
 		Run:     judge.RunConfig{Command: "/usr/bin/node {exe_path}", SeccompRule: "", Env: runEnv(), MemoryLimitCheckOnly: true},
@@ -877,17 +877,28 @@ func TestEngineCheckerCorpus(t *testing.T) {
 		t.Logf("compiler said: %s", firstLine(out.SPJCompileError))
 	})
 	t.Run("the compiled checker is reused", func(t *testing.T) {
-		// The first judge compiles the checker (or finds it from an earlier subtest); the cached binary
-		// is a root-owned 0555 file the second judge runs without compiling again.
+		// The first judge compiles the checker (or finds it from an earlier subtest). The cached binary is a
+		// root-owned 0555 file; a compile publishes by renaming a new file into place, so a second judge that
+		// compiled again would leave a different inode (and a newer mtime) behind.
 		allResult(t, judgeWith(t, "ac", "ok.cpp", ac), 0)
 		cached := filepath.Join(env.work, "spj", "ok-ac", "spj-ok-ac")
-		fi, err := os.Stat(cached)
+		before, err := os.Stat(cached)
 		if err != nil {
 			t.Fatalf("no cached checker: %v", err)
 		}
-		if fi.Mode().Perm() != 0o555 {
-			t.Errorf("cached checker mode %v, want 0555", fi.Mode().Perm())
+		if before.Mode().Perm() != 0o555 {
+			t.Errorf("cached checker mode %v, want 0555", before.Mode().Perm())
 		}
 		allResult(t, judgeWith(t, "ac", "ok.cpp", ac), 0)
+		after, err := os.Stat(cached)
+		if err != nil {
+			t.Fatalf("the cached checker is gone after the second judge: %v", err)
+		}
+		if !os.SameFile(before, after) {
+			t.Errorf("the second judge replaced the cached checker (different inode): it compiled it again")
+		}
+		if !after.ModTime().Equal(before.ModTime()) {
+			t.Errorf("the cached checker's mtime changed from %v to %v: it was written again", before.ModTime(), after.ModTime())
+		}
 	})
 }

@@ -54,7 +54,7 @@ RUN groupadd -g 12001 compiler && useradd -u 12001 -g 12001 -M -s /usr/sbin/nolo
  && groupadd -g 12002 code && useradd -u 12002 -g 12002 -M -s /usr/sbin/nologin code \
  && groupadd -g 12003 spj && useradd -u 12003 -g 12003 -M -s /usr/sbin/nologin spj \
  && mkdir -p /work /test_case /etc/oj/tls
-COPY --from=builder-go /out/judge-server /usr/local/bin/judge-server
+COPY --from=builder-go --chmod=0755 /out/judge-server /usr/local/bin/judge-server
 COPY --from=builder-c --chmod=0755 /src/judge-runner /usr/local/bin/judge-runner
 ENV TZ=Asia/Ho_Chi_Minh
 # No HEALTHCHECK: the compose file declares it (`judge-server healthcheck`).

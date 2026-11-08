@@ -91,10 +91,10 @@ cancellation (the call returns in under a second, no process of the three users 
 
 The language rows the tests judge with are copied from submission-service (`V2`, `V3`, `V9`, with `JudgeService`'s
 environments), as the table `languageRows`; the file says where it deviates: Python 3 uses the part-2 `V10` command, and
-Java's run command loses the security manager flags except in `TestEngineJavaWithPolicy`. **Part 2 must also make
-`javascript` a `memory_limit_check_only` language** (JudgeService's `MEMORY_CHECK_ONLY_LANGUAGES` has `java` and `go`): Node
-cannot start two threads under `RLIMIT_AS` of twice the limit (each gets a 128 MiB stack), and hangs until the real-time
-limit instead of failing.
+Java's run command loses the security manager flags except in `TestEngineJavaWithPolicy`. The `javascript` row is
+`memory_limit_check_only`, as submission-service marks it (`JudgeService.MEMORY_CHECK_ONLY_LANGUAGES`: `java`, `go`,
+`javascript`): Node cannot start two threads under `RLIMIT_AS` of twice the limit (each gets a 128 MiB stack), and would
+hang until the real-time limit instead of failing.
 
 ## Seccomp
 
