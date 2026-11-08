@@ -40,7 +40,8 @@ What a job owns is closed to every other slot, with the slot's gid as the key (`
 - After every compile, run and checker run, and when a job ends or is cancelled (before its directories are removed), the
   server kills every process whose uid is the slot's (`sandbox.KillUID`, a `/proc` sweep): a child that left its run's
   session with `setsid` dies with the job, and `RLIMIT_NPROC` is per slot. The sweep spares the sessions of runs still in
-  progress and needs an init in the container (`init: true`, `docker run --init`) to reap what it kills.
+  progress. What it kills is reaped by the image's own init (`tini` is PID 1, see Image), so no `init: true` or
+  `docker run --init` is needed.
 - Disk: a run's stderr goes to `/dev/null` (it never affects the verdict; a compile's and a checker's stderr are still
   captured), a case's output file is deleted as soon as the case is judged (the checker's two stream files too) and
   `compile.out` once it is read, so a job holds at most one output file of at most `OUTPUT_FILE_CAP_BYTES` per case in flight
@@ -104,7 +105,7 @@ Everything runs in Docker: there is no Go toolchain on the development machine.
 | `make smoke` | `scripts/smoke.sh`: starts the shipped image over mutual TLS and talks to it with grpcurl |
 
 `scripts/sandbox-test.sh` is the proof that the real engine judges real programs. It runs
-`docker run --init --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID
+`docker run --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID
 --cap-add KILL --security-opt no-new-privileges:true --read-only --tmpfs /work:exec,mode=755,size=512m --tmpfs /tmp:size=64m
 --memory 1536m --cpus 2 -e JUDGE_REQUIRE_SANDBOX=1` on `judge-server:test` (the runtime image plus the test binaries, `strace`,
 `pgrep`), mounts `judge-deployment/sandbox/java.policy` at `/opt/oj/java.policy`, and runs `/tests/run-all.sh`, which runs
@@ -170,7 +171,10 @@ plain `docker build .` can never produce the test image. Base `ubuntu:22.04` (gl
 Toolchains, at the paths the language rows name: `gcc`/`g++` 11.4, `openjdk-17-jdk-headless` (17.0), `python2` 2.7.18 (with
 `/usr/bin/python`), `python3` 3.10, `golang-go` 1.18, `nodejs` 12.22, `php8.1-cli` 8.1. Users `compiler` 12001, `code` 12002,
 `spj` 12003 and the per-slot run users `code0`..`code7` (uids and gids 12100-12107); none has a login or a home. No
-`HEALTHCHECK`: the compose file declares `judge-server healthcheck`.
+`HEALTHCHECK`: the compose file declares `judge-server healthcheck`. The entrypoint is `tini -s -- judge-server`
+(`tini` from Ubuntu), so zombies are reaped wherever the image runs, with no `init: true` (a k3s pod has none); `-s`
+registers tini as a child subreaper, so under docker's own init as well (compose's `init: true`) it still reaps the
+orphans itself and logs no warning. The test image runs its tests under the same tini.
 
 Size of `judge-server:runtime` built on this machine (arm64): **1.71 GB** on disk, 435 MB compressed (Docker's content
 size); the largest parts are `golang-go` (315 MB), the JDK (258 MB) and the GCC toolchain (about 90 MB, plus `libstdc++`

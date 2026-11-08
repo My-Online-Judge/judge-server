@@ -40,7 +40,7 @@ RUN gcc -O2 -Wall -Wextra -Werror -static -o judge-runner internal/sandbox/runne
 FROM ubuntu:22.04 AS runtime
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      gcc g++ openjdk-17-jdk-headless python2 python3 golang-go nodejs php8.1-cli ca-certificates tzdata \
+      gcc g++ openjdk-17-jdk-headless python2 python3 golang-go nodejs php8.1-cli ca-certificates tzdata tini \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/python2 /usr/bin/python
 # Every path a language row names (V2/V3/V9 of submission-service) must exist: a missing one would only show
@@ -48,7 +48,8 @@ RUN apt-get update \
 RUN test -x /usr/bin/gcc && test -x /usr/bin/g++ \
  && test -x /usr/bin/javac && test -x /usr/bin/java \
  && test -x /usr/bin/python && test -x /usr/bin/python2 && test -x /usr/bin/python3 \
- && test -x /usr/bin/go && test -x /usr/bin/node && test -x /usr/bin/php
+ && test -x /usr/bin/go && test -x /usr/bin/node && test -x /usr/bin/php \
+ && test -x /usr/bin/tini
 # The identities the programs run as (spec 5.1, 5.1a): no login, no home. compiler, code and spj are the roles
 # (12001-12003); code0..code7 (uids and gids 12100-12107, one per job slot, so config.Validate's MAX_JOBS limit is
 # eight) are what a job's submission runs as: no two running jobs share a uid or a group.
@@ -63,7 +64,11 @@ COPY --from=builder-go --chmod=0755 /out/judge-server /usr/local/bin/judge-serve
 COPY --from=builder-c --chmod=0755 /src/judge-runner /usr/local/bin/judge-runner
 ENV TZ=Asia/Ho_Chi_Minh
 # No HEALTHCHECK: the compose file declares it (`judge-server healthcheck`).
-ENTRYPOINT ["/usr/local/bin/judge-server"]
+# tini is PID 1, so the processes a sweep or a group kill leaves behind (a compiler's helpers, a run's grandchildren)
+# are reaped wherever the image runs, with no `init: true` / `docker run --init` (a k3s pod has neither). -s makes
+# tini a child subreaper too: under docker's own init (compose's `init: true`) it is PID 2, and without -s it would
+# log a warning at every start and leave the reaping to docker's init; with -s it reaps the orphans itself.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/usr/local/bin/judge-server"]
 CMD ["serve"]
 
 FROM runtime AS test
@@ -78,7 +83,10 @@ COPY --from=builder-go /out/sandbox.test /out/judge.test /tests/
 COPY internal/sandbox/runner.c /tests/src/internal/sandbox/runner.c
 COPY testdata /tests/testdata
 COPY --chmod=0755 scripts/run-all.sh /tests/run-all.sh
-ENTRYPOINT []
+# Not the server: the test binaries. Still under tini, as in the image that ships, because the sweep tests need
+# what a sweep kills to be reaped (a zombie counts as a process of the uid until it is). Extra arguments of
+# `docker run` replace CMD (scripts/sandbox-test.sh passes a single binary and its flags that way).
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["/tests/run-all.sh"]
 
 FROM runtime AS release

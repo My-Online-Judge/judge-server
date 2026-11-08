@@ -3,7 +3,8 @@
 #
 #   1. builds the runtime image (the one that ships, not the test image);
 #   2. writes a throw-away PKI with internal/testutil/cmd/mktls (the server's names include the container's);
-#   3. runs the server with the production privileges (six capabilities, read-only root, /work tmpfs);
+#   3. runs the server with the production privileges (six capabilities, read-only root, /work tmpfs), under the
+#      image's own tini and no `--init` (a k3s pod has none), and checks that tini is PID 1;
 #   4. Ping with grpcurl and the judge-worker client certificate (and without the token, and Judge with a
 #      stranger's certificate, which must be refused);
 #   5. one real Judge call: a C++ a+b program with inline cases;
@@ -51,7 +52,7 @@ chmod a+r "$tls"/*   # the grpcurl container runs as another user than the one t
 
 step "start $NAME"
 docker network create "$NET" >/dev/null
-docker run -d --name "$NAME" --hostname "$NAME" --network "$NET" --init \
+docker run -d --name "$NAME" --hostname "$NAME" --network "$NET" \
   --cap-drop ALL \
   --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID --cap-add KILL \
   --security-opt no-new-privileges:true \
@@ -74,6 +75,9 @@ if [ -z "$up" ]; then
   exit 1
 fi
 docker logs "$NAME" 2>&1 | sed 's/^/  server: /' | tail -5
+
+# No `--init` above: the image's own tini is PID 1, which reaps what a sweep or a group kill leaves behind.
+[ "$(docker exec "$NAME" cat /proc/1/comm)" = tini ] || { echo "PID 1 of the container is not tini" >&2; exit 1; }
 
 # sha256 of the token, the value of the x-judge-server-token header
 token_hash=$(printf %s "$TOKEN" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)
