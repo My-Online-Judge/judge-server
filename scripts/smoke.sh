@@ -7,7 +7,8 @@
 #      image's own tini and no `--init` (a k3s pod has none), and checks that tini is PID 1;
 #   4. Ping with grpcurl and the judge-worker client certificate (and without the token, and Judge with a
 #      stranger's certificate, which must be refused);
-#   5. one real Judge call: a C++ a+b program with inline cases;
+#   5. two real Judge calls with inline cases: a C++ a+b program (filter c_cpp), and the Java ac.java of the corpus
+#      (a row with no seccomp filter, "") under the /tmp the server closed to 0711, where HotSpot cannot create hsperfdata;
 #   6. `judge-server healthcheck` inside the container exits 0;
 #   7. `docker stop` ends the server with exit status 0.
 #
@@ -135,6 +136,42 @@ echo "$out"
 # grpcurl leaves out fields that are zero: an AC case has no "result".
 [ "$(echo "$out" | grep -c '"testCase"')" = 3 ] || { echo "Judge: want 3 case results" >&2; exit 1; }
 if echo "$out" | grep -q '"result"'; then echo "Judge: a case is not AC" >&2; exit 1; fi
+
+step "Judge: Java ac.java of the corpus, a row with no seccomp filter, with /tmp closed to 0711"
+# The program and the row of the engine tests (V2 + V9), minus the two security manager flags: the policy file is a
+# compose mount, not part of the image. /tmp is the tmpfs above, which the server closed to 0711 at start, so HotSpot
+# cannot create /tmp/hsperfdata_<user> (its path is compiled in) and has to run without it.
+java_src=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$ROOT/testdata/corpus/java/ac.java" | awk '{ printf "%s%s", $0, "\\n" }')
+req=$(cat <<JSON
+{
+  "src": "$java_src",
+  "languageConfig": {
+    "compile": {"srcName": "Main.java", "exeName": "Main", "maxCpuTimeMs": 3000, "maxRealTimeMs": 5000,
+                "maxMemoryBytes": -1,
+                "compileCommand": "/usr/bin/javac {src_path} -d {exe_dir} -encoding UTF8"},
+    "run": {"command": "/usr/bin/java -cp {exe_dir} -Xss1M -Xmx256m -Djava.awt.headless=true -Dfile.encoding=UTF-8 Main",
+            "seccompRule": "", "memoryLimitCheckOnly": true}
+  },
+  "maxCpuTimeMs": 1000,
+  "maxMemoryBytes": 268435456,
+  "output": true,
+  "testCase": {"cases": [
+    {"input": "1 2\\n", "output": "3\\n"},
+    {"input": "10 20\\n", "output": "30\\n"},
+    {"input": "-5 5\\n", "output": "0\\n"}
+  ]}
+}
+JSON
+)
+out=$(grpcurl "$CLIENT_CN" -H "x-judge-server-token: $token_hash" -d "$req" "$NAME:8080" oj.judge.v1.JudgeServer/Judge)
+echo "$out"
+[ "$(echo "$out" | grep -c '"testCase"')" = 3 ] || { echo "Judge (Java): want 3 case results" >&2; exit 1; }
+if echo "$out" | grep -q '"result"'; then echo "Judge (Java): a case is not AC" >&2; exit 1; fi
+# The closed /tmp is what the call above ran under: mode 0711 and no perf-data directory in it.
+[ "$(docker exec "$NAME" stat -c %a /tmp)" = 711 ] || { echo "/tmp is not 0711" >&2; exit 1; }
+if docker exec "$NAME" sh -c 'ls -d /tmp/hsperfdata_*' >/dev/null 2>&1; then
+  echo "a JVM created hsperfdata in /tmp, which should have been closed" >&2; exit 1
+fi
 
 step "healthcheck inside the container"
 docker exec "$NAME" /usr/local/bin/judge-server healthcheck

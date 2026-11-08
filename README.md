@@ -36,7 +36,10 @@ What a job owns is closed to every other slot, with the slot's gid as the key (`
 - A run's and the checker's `TMPDIR` (and the checker's working directory) is `<TMP_DIR>/jobs/<id>` (`root:<slotgid> 0770`),
   on the separate small tmpfs mounted at `TMP_DIR` (default `/tmp`, 64 MiB in the compose file), so a run that fills its
   temporary files never fills `WORK_DIR`. At start-up the server wipes `<TMP_DIR>/jobs` and `<WORK_DIR>/jobs`, and sets
-  `WORK_DIR` to `0755` and `TMP_DIR` to `0711` (an emptyDir starts as `0777`).
+  `WORK_DIR` to `0755` and `TMP_DIR` to `0711` (an emptyDir starts as `0777`). With the default `TMP_DIR=/tmp` a run user
+  cannot create anything directly in `/tmp`: a JVM there cannot create its `/tmp/hsperfdata_<user>` (the path is compiled
+  into HotSpot, `TMPDIR` does not move it) and runs without it; `TestEngineJavaTmpRootClosed` and the smoke test judge
+  Java under exactly that.
 - After every compile, run and checker run, and when a job ends or is cancelled (before its directories are removed), the
   server kills every process whose uid is the slot's (`sandbox.KillUID`, a `/proc` sweep): a child that left its run's
   session with `setsid` dies with the job, and `RLIMIT_NPROC` is per slot. The sweep spares the sessions of runs still in
@@ -102,7 +105,7 @@ Everything runs in Docker: there is no Go toolchain on the development machine.
 | `make vet` | `go vet ./...` |
 | `make image` | the image that ships (`--target runtime`), tagged `judge-server:$(VERSION)` (default `dev`) |
 | `make sandbox-test` | `scripts/sandbox-test.sh`: builds the test image and runs every `sandbox`-tagged test in it, with the server's privileges |
-| `make smoke` | `scripts/smoke.sh`: starts the shipped image over mutual TLS and talks to it with grpcurl |
+| `make smoke` | `scripts/smoke.sh`: starts the shipped image over mutual TLS and talks to it with grpcurl (a C++ and a Java `Judge` call, the Java row having no seccomp filter) |
 
 `scripts/sandbox-test.sh` is the proof that the real engine judges real programs. It runs
 `docker run --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID

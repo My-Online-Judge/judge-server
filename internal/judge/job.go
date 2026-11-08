@@ -384,13 +384,16 @@ func (j *job) bundleName() string {
 func (j *job) slotID() uint32 { return SlotUIDBase + uint32(j.req.Slot) }
 
 // sweep kills what the job left running under its slot's uid (a process that
-// moved out of its run's session, which the run's own group kill cannot reach)
-// and logs it when it killed any. what says after which step it ran.
+// moved out of its run's session, which the run's own group kill cannot reach,
+// or a grandchild of the run that the group kill signalled and that had not
+// finished dying yet) and logs it, at Info, when it killed any. The sweep cannot
+// tell the two apart, so the line is no sign of an escape by itself. what says
+// after which step it ran.
 func (j *job) sweep(what string) {
 	uid := j.slotID()
 	killed, err := j.e.d.Sweep(uid)
 	if killed > 0 {
-		slog.Warn("job: killed stray processes of the slot's uid", "job", j.id, "slot", j.req.Slot, "uid", uid, "after", what, "killed", killed)
+		slog.Info("job: cleaned up processes of the slot's uid after a step", "job", j.id, "slot", j.req.Slot, "uid", uid, "after", what, "killed", killed)
 	}
 	if err != nil {
 		slog.Warn("job: sweep of the slot's uid", "job", j.id, "slot", j.req.Slot, "uid", uid, "after", what, "err", err)

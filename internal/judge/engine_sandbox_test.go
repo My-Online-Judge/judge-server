@@ -372,21 +372,32 @@ func inSlot(req judge.Request, n int) judge.Request {
 // judge runs one request to its end and returns the outcome and how long it took.
 func (env *sandboxEnv) judge(t *testing.T, req judge.Request) (judge.Outcome, time.Duration) {
 	t.Helper()
+	return env.judgeOn(t, env.eng, req)
+}
+
+// judgeOn is judge on eng, an engine built from env's (see engineWith).
+func (env *sandboxEnv) judgeOn(t *testing.T, eng *judge.Engine, req judge.Request) (judge.Outcome, time.Duration) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), judgeTimeout)
 	defer cancel()
 	start := time.Now()
-	out, err := env.eng.Judge(ctx, env.jobID(), req)
+	out, err := eng.Judge(ctx, env.jobID(), req)
 	if err != nil {
 		t.Fatalf("Judge: %v", err)
 	}
 	return out, time.Since(start)
 }
 
-// assertNoJobs fails when a job directory, a run TMPDIR or a stray process of the run
-// users outlived its Judge call.
+// assertNoJobs fails when a job directory or a run TMPDIR outlived its Judge call.
 func (env *sandboxEnv) assertNoJobs(t *testing.T) {
 	t.Helper()
-	for _, dir := range []string{filepath.Join(env.work, "jobs"), filepath.Join(env.tmp, "jobs")} {
+	env.assertNoJobsIn(t, env.tmp)
+}
+
+// assertNoJobsIn is assertNoJobs for an engine whose TMP_DIR is tmp (see engineWith).
+func (env *sandboxEnv) assertNoJobsIn(t *testing.T, tmp string) {
+	t.Helper()
+	for _, dir := range []string{filepath.Join(env.work, "jobs"), filepath.Join(tmp, "jobs")} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatalf("read %s: %v", dir, err)
@@ -489,8 +500,14 @@ func firstFailure(cases []judge.CaseResult) *judge.CaseResult {
 // verdict line of the log (VERDICT ...) carries the measurements of every case.
 func (env *sandboxEnv) checkEntry(t *testing.T, tag string, row languageRow, e corpusEntry) (judge.Outcome, time.Duration) {
 	t.Helper()
+	return env.checkEntryOn(t, env.eng, tag, row, e)
+}
+
+// checkEntryOn is checkEntry on eng, an engine built from env's (see engineWith).
+func (env *sandboxEnv) checkEntryOn(t *testing.T, eng *judge.Engine, tag string, row languageRow, e corpusEntry) (judge.Outcome, time.Duration) {
+	t.Helper()
 	src := readSource(t, e.Lang, e.File)
-	out, wall := env.judge(t, env.request(row, src, env.bundle(t, ""), nil))
+	out, wall := env.judgeOn(t, eng, env.request(row, src, env.bundle(t, ""), nil))
 	t.Logf("VERDICT %s lang=%s file=%s expect=%s wall=%dms %s",
 		tag, e.Lang, e.File, expectName(e.Expect), wall.Milliseconds(), describe(out))
 
@@ -638,6 +655,83 @@ func TestEngineJavaWithPolicy(t *testing.T) {
 			env.assertNoJobs(t)
 		})
 	}
+}
+
+// TestEngineJavaTmpRootClosed judges the java corpus program the way production runs it: TMP_DIR is /tmp itself
+// (the default, and the tmpfs the compose file mounts there), which api.PrepareTmpDir closes to 0711, so no run
+// user can create anything directly in it. HotSpot keeps its perf-data file in /tmp/hsperfdata_<user> whatever
+// TMPDIR is (the path is compiled in), so here it cannot create that directory and must fall back to anonymous
+// memory and run the program anyway. The other tests give the engine a TMP_DIR of its own under /tmp and leave
+// /tmp open, where HotSpot does create hsperfdata_code0, so they cannot show this. The test closes the
+// container's /tmp for its own duration and opens it again afterwards.
+func TestEngineJavaTmpRootClosed(t *testing.T) {
+	env := engineEnv(t)
+	var st syscall.Statfs_t
+	if err := syscall.Statfs("/tmp", &st); err != nil {
+		t.Fatalf("statfs /tmp: %v", err)
+	}
+	if total := int64(st.Blocks) * int64(st.Bsize); total > 256<<20 {
+		skipOrFail(t, "/tmp is %d MiB: the test closes /tmp itself and needs the small tmpfs of scripts/sandbox-test.sh (--tmpfs /tmp:size=64m), not a host's /tmp", total>>20)
+	}
+	var entry corpusEntry
+	for _, e := range loadCorpus(t) {
+		if e.Lang == "java" && e.File == "ac.java" {
+			entry = e
+		}
+	}
+	if entry.File == "" {
+		t.Fatal("corpus.json has no java/ac.java entry")
+	}
+
+	before, err := os.Stat("/tmp")
+	if err != nil {
+		t.Fatalf("stat /tmp: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod("/tmp", before.Mode()&(os.ModePerm|os.ModeSticky)); err != nil {
+			t.Errorf("open /tmp again: %v", err)
+		}
+		if err := os.RemoveAll("/tmp/jobs"); err != nil {
+			t.Errorf("remove /tmp/jobs: %v", err)
+		}
+	})
+	// A JVM of an earlier test left hsperfdata_<user> directories behind while /tmp was open; with one in place a
+	// JVM would use it through the closed /tmp, and a fresh container (production) has none.
+	hsperf := func() []string {
+		dirs, err := filepath.Glob("/tmp/hsperfdata_*")
+		if err != nil {
+			t.Fatalf("glob /tmp/hsperfdata_*: %v", err)
+		}
+		return dirs
+	}
+	for _, d := range hsperf() {
+		if err := os.RemoveAll(d); err != nil {
+			t.Fatalf("remove stale %s: %v", d, err)
+		}
+	}
+	if err := api.PrepareTmpDir("/tmp"); err != nil { // exactly what Serve does with the default TMP_DIR
+		t.Fatalf("PrepareTmpDir(/tmp): %v", err)
+	}
+	if fi, err := os.Stat("/tmp"); err != nil || fi.Mode().Perm() != 0o711 || fi.Mode()&os.ModeSticky != 0 {
+		t.Fatalf("/tmp after PrepareTmpDir: %v, %v; want root's 0711", fi, err)
+	}
+	eng := env.engineWith(func(d *judge.Deps) { d.Cfg.TmpDir = "/tmp" })
+
+	// The row without the security manager runs anywhere; the row of V9 needs the policy mount.
+	t.Run("without the security manager", func(t *testing.T) {
+		env.checkEntryOn(t, eng, "java-tmp-closed", rowFor(t, "java"), entry)
+	})
+	t.Run("with the V9 policy", func(t *testing.T) {
+		if _, err := os.Stat(policyPath); err != nil {
+			skipOrFail(t, "%s is not mounted: %v", policyPath, err)
+		}
+		env.checkEntryOn(t, eng, "java-tmp-closed", languageRows["java"], entry)
+	})
+	// Neither run (nor the compile) could create its perf-data directory in the closed /tmp, and no job is left.
+	if dirs := hsperf(); len(dirs) != 0 {
+		t.Errorf("%v exist: a JVM created its perf-data directory in /tmp, which was meant to be closed", dirs)
+	}
+	env.assertNoJobsIn(t, "/tmp")
 }
 
 // ---- extra assertions ----
