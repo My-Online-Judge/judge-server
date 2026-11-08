@@ -2,9 +2,12 @@ package api
 
 import (
 	"context"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +52,89 @@ func TestServeRefusesBadConfigBeforeTouchingDisk(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The disk bound of spec 5.1a: MAX_JOBS x 8 cases at once x OUTPUT_FILE_CAP_BYTES + GOCACHE_CAP_BYTES
+// must fit in the work filesystem.
+func TestCheckWorkCapacity(t *testing.T) {
+	const mib = 1 << 20
+	cfg := func(jobs int, fileCap, goCache int64) config.Config {
+		return config.Config{WorkDir: "/work", MaxJobs: jobs, OutputFileCap: fileCap, GoCacheCap: goCache}
+	}
+	tests := []struct {
+		name  string
+		cfg   config.Config
+		total uint64
+		need  uint64 // what the check must compute
+		ok    bool
+	}{
+		{"the defaults fit the 512 MiB tmpfs", cfg(2, 16*mib, 128*mib), 512 * mib, 384 * mib, true},
+		{"the old 32 MiB cap would not", cfg(2, 32*mib, 128*mib), 512 * mib, 640 * mib, false},
+		{"exactly full is allowed", cfg(2, 16*mib, 128*mib), 384 * mib, 384 * mib, true},
+		{"one byte short is refused", cfg(2, 16*mib, 128*mib), 384*mib - 1, 384 * mib, false},
+		{"all eight jobs", cfg(8, 16*mib, 128*mib), 512 * mib, 1152 * mib, false},
+		{"one job", cfg(1, 16*mib, 128*mib), 512 * mib, 256 * mib, true},
+		{"the arithmetic does not wrap", cfg(8, math.MaxInt64, 128*mib), math.MaxUint64, math.MaxUint64, true},
+		{"nor does the sum", cfg(1, math.MaxInt64/8, math.MaxInt64), math.MaxUint64 - 1, uint64(math.MaxInt64/8)*8 + math.MaxInt64, true},
+		{"a carry in the sum saturates", cfg(1, 1<<61-1, 100*mib), math.MaxUint64, math.MaxUint64, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workBytesNeeded(tc.cfg); got != tc.need {
+				t.Errorf("workBytesNeeded = %d, want %d", got, tc.need)
+			}
+			err := checkWorkCapacity(tc.cfg, tc.total)
+			if tc.ok && err != nil {
+				t.Fatalf("checkWorkCapacity = %v, want it to fit", err)
+			}
+			if !tc.ok {
+				if err == nil {
+					t.Fatal("checkWorkCapacity accepted a configuration that does not fit")
+				}
+				// The message names the filesystem, its size, the size needed and every setting.
+				for _, want := range []string{"/work", "MAX_JOBS", "OUTPUT_FILE_CAP_BYTES", "GOCACHE_CAP_BYTES", itoa(tc.total), itoa(tc.need)} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not mention %q", err, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func itoa(n uint64) string { return strconv.FormatUint(n, 10) }
+
+// Serve checks the work filesystem after it has prepared it and before it opens the port.
+func TestServeRefusesAWorkDirThatCannotHoldTheOutputs(t *testing.T) {
+	quietLogs(t)
+	prev := fsTotal
+	t.Cleanup(func() { fsTotal = prev })
+	fsTotal = func(string) (uint64, error) { return 100 << 20, nil } // 100 MiB: far under 2 x 8 x 16 MiB + 128 MiB
+
+	cfg := testConfig(t, testutil.TLS(t))
+	cfg.OutputFileCap, cfg.GoCacheCap = 16<<20, 128<<20
+	cfg.Listen = freeListen(t)
+	err := Serve(context.Background(), cfg, "v")
+	if err == nil {
+		t.Fatal("Serve started on a work dir that is too small")
+	}
+	for _, want := range []string{cfg.WorkDir, "104857600", "402653184", "MAX_JOBS", "OUTPUT_FILE_CAP_BYTES"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if l, lerr := net.Listen("tcp", cfg.Listen); lerr != nil {
+		t.Errorf("the port %s is taken: Serve listened although it refused", cfg.Listen)
+	} else {
+		l.Close()
+	}
+
+	t.Run("a failing statfs stops it too", func(t *testing.T) {
+		fsTotal = func(string) (uint64, error) { return 0, os.ErrPermission }
+		if err := Serve(context.Background(), cfg, "v"); err == nil {
+			t.Fatal("Serve started although the filesystem size is unknown")
+		}
+	})
 }
 
 func TestServeRefusesMissingTLS(t *testing.T) {

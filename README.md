@@ -41,6 +41,16 @@ What a job owns is closed to every other slot, with the slot's gid as the key (`
   server kills every process whose uid is the slot's (`sandbox.KillUID`, a `/proc` sweep): a child that left its run's
   session with `setsid` dies with the job, and `RLIMIT_NPROC` is per slot. The sweep spares the sessions of runs still in
   progress and needs an init in the container (`init: true`, `docker run --init`) to reap what it kills.
+- Disk: a run's stderr goes to `/dev/null` (it never affects the verdict; a compile's and a checker's stderr are still
+  captured), a case's output file is deleted as soon as the case is judged (the checker's two stream files too) and
+  `compile.out` once it is read, so a job holds at most one output file of at most `OUTPUT_FILE_CAP_BYTES` per case in flight
+  (up to 8), not one per case. At start-up `serve` reads the size of `WORK_DIR`'s filesystem (`statfs`) and refuses to start
+  when `MAX_JOBS` x 8 x `OUTPUT_FILE_CAP_BYTES` + `GOCACHE_CAP_BYTES` does not fit, naming the numbers. The checker's stream
+  files are trusted and not in the formula.
+- Under the `c_cpp` and `general` filters a run cannot open a file for writing and, under `general`, cannot make, link,
+  rename or truncate an entry (`mkdir`, `mknod`, `symlink`, `link`, `rename`, `truncate`, `memfd_create` and their at-forms are
+  denied; see `internal/sandbox/seccomp_rules.md`); the rows that run with no filter (Java, Go, JavaScript, PHP) can write
+  only in their own `TMPDIR`, on the small tmpfs.
 - Residual, accepted (spec 5.1a): the uids 12001 and 12003 are shared by both sandbox containers and both slots; the slot
   uids are the same numbers in both sandbox containers.
 
@@ -68,7 +78,7 @@ the three TLS files, or with an empty client list; it never listens in plaintext
 | `RUN_POOL_BUDGET_BYTES` | `1073741824` (1 GiB) | memory handed to running programs, shared by all jobs; sizes each job's case pool |
 | `COMPILE_MAX_MEMORY_BYTES` | `536870912` (512 MiB) | ceiling over a request's compile memory limit |
 | `GOCACHE_CAP_BYTES` | `134217728` (128 MiB) | the shared Go build cache is emptied and re-warmed above this |
-| `OUTPUT_FILE_CAP_BYTES` | `33554432` (32 MiB) | `RLIMIT_FSIZE` of every program: the most a case's output file can hold |
+| `OUTPUT_FILE_CAP_BYTES` | `16777216` (16 MiB) | `RLIMIT_FSIZE` of every program: the most a case's output file can hold. `serve` refuses to start unless `MAX_JOBS` x 8 x this + `GOCACHE_CAP_BYTES` fits in `WORK_DIR`'s filesystem (the default 2 x 8 x 16 MiB + 128 MiB = 384 MiB fits the 512 MiB tmpfs) |
 | `OUTPUT_RESPONSE_CAP_BYTES` | `65536` (64 KiB) | output per case returned when the request asks for it |
 | `COMPILE_MESSAGE_CAP_BYTES` | `65536` (64 KiB) | compiler output returned in a compile error |
 | `INLINE_INPUT_CAP_BYTES` | `1048576` (1 MiB) | total input of a Run's inline cases |
@@ -133,7 +143,8 @@ judged through the real engine in the slots the test names; not listed in `corpu
   hands over as the input: EACCES or ENOENT, never the marker's content; the own slot's marker is readable;
 - `signal_other_slot.go`: `kill(-1, SIGKILL)` in slot 0 while a victim job runs in slot 1 (the victim is AC; the control, both
   in one slot, is killed);
-- `tmp_fill.go` (ENOSPC inside `/tmp`, `/work` unchanged, a neighbour job unaffected).
+- `flood_many.cpp` on a 20-case bundle next to a second job (`du /work` stays within the bound; the second job is AC) and
+  `tmp_fill.go` (ENOSPC inside `/tmp`, `/work` unchanged, a neighbour job unaffected).
 
 The language rows the tests judge with are copied from submission-service (`V2`, `V3`, `V9`, with `JudgeService`'s
 environments), as the table `languageRows`; the file says where it deviates: Python 3 uses the part-2 `V10` command, and

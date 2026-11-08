@@ -15,8 +15,9 @@ const (
 	// not what it can touch.
 	checkOnlySlack = int64(256) << 20
 
-	// maxPoolSize is the most cases one job runs at once.
-	maxPoolSize = 8
+	// MaxPoolSize is the most cases one job runs at once. api.Serve sizes the disk
+	// check on it: each case in flight holds one output file.
+	MaxPoolSize = 8
 )
 
 // Budget is the memory the sandbox hands out to running programs, in bytes. One
@@ -48,7 +49,7 @@ func PoolSize(budget, reservation int64) int {
 	if reservation <= 0 {
 		return 1
 	}
-	return int(min(max(budget/reservation, 1), maxPoolSize))
+	return int(min(max(budget/reservation, 1), MaxPoolSize))
 }
 
 // CompileReservation is the memory a compile reserves from the Budget: the whole

@@ -28,7 +28,7 @@ func TestLoadDefaults(t *testing.T) {
 		RunPoolBudget:     1073741824,
 		CompileMaxMemory:  536870912,
 		GoCacheCap:        134217728,
-		OutputFileCap:     33554432,
+		OutputFileCap:     16777216,
 		OutputResponseCap: 65536,
 		CompileMessageCap: 65536,
 		InlineInputCap:    1048576,

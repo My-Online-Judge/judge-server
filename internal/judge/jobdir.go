@@ -28,7 +28,8 @@ import (
 //	<id>/out/      2750 root:<slot>   per-case N.out and the checker's streams N.chk.out and
 //	                                  N.chk.err, created by the shim as root (0640) and, the
 //	                                  directory being setgid, in group <slot>: the job's checker
-//	                                  reads N.out through that group; nobody can write here
+//	                                  reads N.out through that group; no job user can write
+//	                                  here. Each file is deleted as soon as its case is judged
 //	<id>/tmp/      0770 root:<slot>   TMPDIR and HOME of the compiles; deleted before the first run
 //	<id>/compile.out, spj-compile.out
 //	               0640 root:root     the compile's output, written by the shim as root (the job

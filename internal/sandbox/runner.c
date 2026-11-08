@@ -43,7 +43,10 @@
  * its job.
  *
  * Under c_cpp and general the program may open files for reading and for nothing
- * else: add_open_rules denies the write access modes, O_CREAT, O_TRUNC and O_TMPFILE.
+ * else: add_open_rules denies the write access modes, O_CREAT, O_TRUNC and O_TMPFILE,
+ * and general_deny the calls that make, link, rename or truncate filesystem entries and
+ * memfd_create (c_cpp is an allow-list that never had them), so a filtered run cannot
+ * create or change anything on a filesystem.
  *
  * The runner enforces the real-time limit itself, as qduoj's Judger does: when the
  * program has started (execve done) it arms an interval timer for --real-ms, and the
@@ -281,6 +284,13 @@ static const char *const general_deny[] = {
     "openat2", /* its flags are in a struct the filter cannot read */
     /* io_uring can open files and create sockets without the calls denied above */
     "io_uring_setup", "io_uring_enter", "io_uring_register",
+    /* The open rules keep a run from opening a file for writing; these make or move filesystem
+     * entries without opening one (a flood of inodes is kernel memory charged to the container,
+     * and spec 5.1a wants a filtered run unable to create or rename anything), or make a
+     * file of memory. Each name has its at-form: x86_64 has both, aarch64 only the at-form
+     * (the other name resolves to a pseudo number there and is ignored). */
+    "mkdir", "mkdirat", "mknod", "mknodat", "symlink", "symlinkat", "link", "linkat",
+    "rename", "renameat", "renameat2", "truncate", "memfd_create",
     /* defense in depth: kernel attack surface a program has no use for */
     "unshare", "setns", "userfaultfd", "bpf",
 #ifdef JUDGE_RUNNER_TEST_UNKNOWN_DENY
@@ -363,9 +373,9 @@ static int add_execve_rule(scmp_filter_ctx ctx, int allow_if_equal, const char *
  * emptying a file (O_CREAT, O_TRUNC, O_TMPFILE). O_TMPFILE is taken without its
  * O_DIRECTORY part, which opendir() passes and must stay allowed. With these a
  * program under c_cpp or general can open no file it could write to, so it cannot
- * fill a filesystem through its TMPDIR. (general still allows mkdir, mknod,
- * symlink, link, rename and truncate: they make or move entries that hold no
- * data. c_cpp allows none of them.) */
+ * fill a filesystem through its TMPDIR. The calls that make, link, rename or truncate
+ * an entry without opening one are denied under general by general_deny and are not
+ * on the c_cpp allow-list. */
 static const unsigned long open_denied_bits[] = {
     O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_TMPFILE & ~O_DIRECTORY,
 };

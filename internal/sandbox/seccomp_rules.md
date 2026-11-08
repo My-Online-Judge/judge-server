@@ -90,6 +90,8 @@ or by ordinary programs.
 | `creat` | opens for writing with no flags to check. |
 | `openat2` | its flags are inside a struct, so the open-flag checks (below) cannot see them. |
 | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | io_uring can open files (`IORING_OP_OPENAT`) and create sockets (`IORING_OP_SOCKET`) without ever making the calls denied above, bypassing both the `socket` kill and the write-flag check. |
+| `mkdir`, `mkdirat`, `mknod`, `mknodat`, `symlink`, `symlinkat`, `link`, `linkat`, `rename`, `renameat`, `renameat2`, `truncate` | make, link, move or cut an entry without opening a file, so the open rules do not see them. A flood of them is a flood of inodes (kernel memory charged to the container's cgroup), and spec section 5.1a wants a filtered run unable to create or rename anything on a filesystem: with the open rules and these, a run under `general` changes nothing on disk (`unlink` and `chmod` stay allowed, but its uid owns no file to apply them to). Each name has an at-form: x86_64 has both, aarch64 only the at-form (the plain name resolves to a pseudo number there and is ignored, as `creat` and `fork` are), so the probes call both. `c_cpp` never allowed them. |
+| `memfd_create` | a file made of memory: no name, no directory, outside every filesystem, so `RLIMIT_FSIZE` is the only bound on it and nothing in the job layout is. A program has no use for it. |
 | `unshare`, `setns`, `userfaultfd`, `bpf` | defense in depth: kernel attack surface (namespaces, page-fault handling, eBPF) that no program needs. |
 | `prlimit64` unless `arg0 == 0` | same as under `c_cpp`: only the caller's own limits. |
 
@@ -128,16 +130,19 @@ allow-list (killed), under `general` each bit has its own kill rule:
 | `O_TRUNC` | empties an existing file the user may write, again with the read-only access mode. |
 | `O_TMPFILE` without `O_DIRECTORY` (the `__O_TMPFILE` bit) | makes an unnamed file. The kernel only accepts it with a write access mode, which is denied already; the bit is denied as defence in depth. `O_TMPFILE` is `__O_TMPFILE\|O_DIRECTORY`, and `opendir()` passes `O_DIRECTORY` alone, so testing the `O_DIRECTORY` bit would break every directory listing. |
 
-The point: since the server runs two jobs at a time, a submission that could create files could fill the work
-filesystem for both (spec section 5.1a). With the rules a program under these filters opens nothing for writing; its
-output goes through the stdout and stderr descriptors the shim opened before it loaded the filter. `general` still allows `mkdir`, `mknod`, `symlink`, `link`, `rename`,
-`truncate`, `unlink` and `chmod`, which make, move or remove entries that hold no data (and `memfd_create`, memory the
-container's cgroup limit and `RLIMIT_FSIZE` bound); `c_cpp` allows none of them. Tests:
+The point: since the server runs several jobs at a time (`MAX_JOBS`), a submission that could create files could fill
+the work filesystem for all of them (spec section 5.1a). With the rules a program under these filters opens nothing for writing; its
+output goes through the stdout and stderr descriptors the shim opened before it loaded the filter. The calls that make, link,
+rename or truncate an entry without opening a file are denied under `general` (the last rows of its table above, with
+`memfd_create`) and are not on the `c_cpp` allow-list, so a filtered run creates nothing on any filesystem. Tests:
 `TestRunSeccompDenyTable/open_creat_rdonly`, `open_trunc_rdonly`, `open_tmpfile`, `open_syscall_creat_rdonly` (the
 `open(2)` system call itself; glibc's `open()` is `openat`; not on aarch64), `TestRunOpenRulesDenyCreatingAndEmptying`
 (the control run really creates and empties the file, the filtered run leaves it as it was) and
 `TestRunOpenRulesStillAllowReading` (a read-only open and `read`, `opendir`, and under `general` the listing itself;
-`getdents64` has never been on the `c_cpp` allow-list).
+`getdents64` has never been on the `c_cpp` allow-list), and `TestRunSeccompDenyTable` for each of the calls above (`mkdir` ..
+`memfd_create`: the control run is not stopped, both filters end the probe with `SIGSYS`). The Python 2 and Python 3 programs
+of the corpus, run under `general` by `TestEngineCorpus`, still pass: an interpreter that runs a `.pyc` writes no bytecode
+and makes no directory.
 
 ## What the shim does around the filters
 
@@ -201,9 +206,10 @@ Not seccomp, but part of the same boundary, each with a test:
 It is not a container. A program under `general` can still make any call not listed (`ptrace`-like things not named
 above, `perf_event_open`, `keyctl`, `mount`, ...; `bpf` is denied), but runs as an unprivileged uid with no capabilities
 (`setuid` from a root with the six container capabilities clears them; `TestRunDropsPrivileges`), `no_new_privs`, and
-the container's own default Docker seccomp profile underneath. Neither filter limits `unlink`, `rename`, `mkdir`,
-`chmod` or `truncate` (they touch entries, not data: the open rules above keep a program from writing any file);
-file permissions of the job directory limit them.
+the container's own default Docker seccomp profile underneath. Neither filter limits `unlink`, `unlinkat`, `chmod`
+or `chown` (they remove or relabel entries the program's uid can reach; file permissions of the job directories limit
+them, and the program's uid owns nothing); `mkdir`, `rename`, `truncate` and the other calls
+of the `general` table above are denied there.
 
 ## Ubuntu 22.04 (Task 13): the real image
 

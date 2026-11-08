@@ -11,9 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/bits"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -52,6 +55,13 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 	if err := PrepareWorkDir(cfg.WorkDir); err != nil {
 		return err
 	}
+	total, err := fsTotal(cfg.WorkDir)
+	if err != nil {
+		return err
+	}
+	if err := checkWorkCapacity(cfg, total); err != nil {
+		return err
+	}
 	if err := PrepareTmpDir(cfg.TmpDir); err != nil {
 		return err
 	}
@@ -81,6 +91,49 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 	slog.Info("judge-server listening", "addr", lis.Addr().String(), "version", version,
 		"max_jobs", cfg.MaxJobs, "max_queue", cfg.MaxQueue, "token_required", cfg.Token != "")
 	return RunGRPC(ctx, gs, lis, shutdownGrace)
+}
+
+// fsTotal is the size in bytes of the filesystem that holds a path; a variable so
+// a test can stand in a filesystem of any size.
+var fsTotal = fsTotalBytes
+
+func fsTotalBytes(path string) (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, fmt.Errorf("statfs %s: %w", path, err)
+	}
+	return uint64(st.Bsize) * uint64(st.Blocks), nil
+}
+
+// workBytesNeeded is the room the work filesystem must have for the worst case of
+// spec 5.1a: every job runs MaxPoolSize cases at once, each of them holds an
+// output file up to OUTPUT_FILE_CAP_BYTES until it is judged, and the Go build cache
+// sits at its cap. (The checker's own stream files are trusted and not counted.) A
+// result that does not fit in 64 bits saturates.
+func workBytesNeeded(cfg config.Config) uint64 {
+	files := uint64(cfg.MaxJobs) * judge.MaxPoolSize
+	hi, lo := bits.Mul64(files, uint64(cfg.OutputFileCap))
+	if hi != 0 {
+		return math.MaxUint64
+	}
+	sum, carry := bits.Add64(lo, uint64(cfg.GoCacheCap), 0)
+	if carry != 0 {
+		return math.MaxUint64
+	}
+	return sum
+}
+
+// checkWorkCapacity refuses a configuration whose worst case does not fit in the
+// work filesystem, which is total bytes: the output files that can exist at once
+// plus the Go build cache. The error names the numbers and the settings to change.
+func checkWorkCapacity(cfg config.Config, total uint64) error {
+	need := workBytesNeeded(cfg)
+	if need <= total {
+		return nil
+	}
+	return fmt.Errorf("WORK_DIR %s is a %d byte filesystem but MAX_JOBS (%d) x %d cases at once x OUTPUT_FILE_CAP_BYTES (%d) "+
+		"+ GOCACHE_CAP_BYTES (%d) = %d bytes can be in use at once: lower MAX_JOBS, OUTPUT_FILE_CAP_BYTES or GOCACHE_CAP_BYTES, or give WORK_DIR a bigger filesystem",
+		cfg.WorkDir, total, cfg.MaxJobs, judge.MaxPoolSize, cfg.OutputFileCap, cfg.GoCacheCap, need)
 }
 
 // PrepareWorkDir makes workDir what the engine expects and wipes what a crashed

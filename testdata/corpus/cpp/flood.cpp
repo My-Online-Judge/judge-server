@@ -1,7 +1,7 @@
 #include <cstdio>
 #include <cstring>
 
-// Prints 1 GiB. RLIMIT_FSIZE (32 MiB) ends it with SIGXFSZ after the output file
+// Prints 1 GiB. RLIMIT_FSIZE (16 MiB) ends it with SIGXFSZ after the output file
 // has reached the cap: runtime error, a truncated response output, no tmpfs left over.
 int main()
 {

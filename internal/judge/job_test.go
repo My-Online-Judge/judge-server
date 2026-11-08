@@ -337,8 +337,8 @@ func TestJudgeCompileThenRunsEveryCase(t *testing.T) {
 		if s.MaxAddressSpace != 256*mib || s.MaxStack != 128*mib || s.MaxProcs != 256 || s.MaxOutputBytes != 32*mib {
 			t.Errorf("run %s: as=%d stack=%d procs=%d fsize=%d", cs.Name, s.MaxAddressSpace, s.MaxStack, s.MaxProcs, s.MaxOutputBytes)
 		}
-		if s.Dir != src || s.Stdout != filepath.Join(jobDir, "out", cs.Name+".out") || s.Stderr != filepath.Join(jobDir, "out", cs.Name+".err") {
-			t.Errorf("run %s: dir=%q stdout=%q stderr=%q", cs.Name, s.Dir, s.Stdout, s.Stderr)
+		if s.Dir != src || s.Stdout != filepath.Join(jobDir, "out", cs.Name+".out") || s.Stderr != "" {
+			t.Errorf("run %s: dir=%q stdout=%q stderr=%q, want stderr \"\" (/dev/null)", cs.Name, s.Dir, s.Stdout, s.Stderr)
 		}
 		if !slices.Contains(s.Env, "TMPDIR="+runTmp) || !slices.Contains(s.Env, "PATH=/usr/local/bin:/usr/bin:/bin") {
 			t.Errorf("run %s: env = %v, want TMPDIR=%s (the job's directory under TMP_DIR, not the compile's)", cs.Name, s.Env, runTmp)
@@ -575,6 +575,8 @@ func TestJudgeResultCodesFollowTheRequestLimits(t *testing.T) {
 	}
 }
 
+// A run's stderr goes to /dev/null (an empty path in the Spec): it never affects the verdict, and no
+// file is made for a program to fill. The compile's stderr is still captured, with its stdout.
 func TestJudgeStderrIgnored(t *testing.T) {
 	f := newFixture(t)
 	b := f.bundle([]bundleCase{{"1", "in\n", "1"}}, "")
@@ -587,8 +589,104 @@ func TestJudgeStderrIgnored(t *testing.T) {
 	if got := out.Cases[0]; got.Result != 0 {
 		t.Errorf("Result = %d, want 0: stderr must not reach the comparison", got.Result)
 	}
-	if s := f.fake.CallsFor(f.exe("job1"))[0]; s.Stderr == s.Stdout || s.Stderr == "" {
-		t.Errorf("stdout %q and stderr %q must be separate files", s.Stdout, s.Stderr)
+	if s := f.fake.CallsFor(f.exe("job1"))[0]; s.Stderr != "" || s.Stdout == "" {
+		t.Errorf("stdout %q and stderr %q: stderr must be \"\" (/dev/null) and stdout a file", s.Stdout, s.Stderr)
+	}
+	if c := f.fake.CallsFor(gpp)[0]; c.Stderr == "" || c.Stderr != c.Stdout {
+		t.Errorf("compile stdout %q and stderr %q: both must go to the compile's output file", c.Stdout, c.Stderr)
+	}
+}
+
+// listOut lists the files in a job's out/ directory.
+func listOut(t *testing.T, f *fixture, id string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(f.jobDir(id), "out"))
+	if err != nil {
+		t.Errorf("read out dir: %v", err)
+		return nil
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	return names
+}
+
+// A case's output file (and the checker's two streams) is deleted as soon as the case is judged, so the
+// job holds one per case in flight and not one per case: with a pool of one, the out/ directory is empty
+// when every run starts and when the job ends, whatever the verdicts were.
+func TestJudgeOutputFilesAreDeletedOnceJudged(t *testing.T) {
+	tests := []struct {
+		name    string
+		checker bool // judged by a checker instead of by md5
+	}{
+		{name: "md5 compare, right answers"},
+		{name: "md5 compare, wrong answers"},
+		{name: "a failing program"},
+		{name: "checker", checker: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.deps.Cfg.RunPoolBudget = 256 * mib // a pool of one: the cases run one after the other
+			f.deps.Budget = NewBudget(256 * mib)
+			exe := f.exe("job1")
+			var mu sync.Mutex
+			var atRun, atChecker [][]string
+			step := prints("1\n")
+			switch tt.name {
+			case "md5 compare, wrong answers":
+				step = prints("2\n")
+			case "a failing program":
+				step.Result = sandbox.Result{ExitCode: 1}
+			}
+			step.Inspect = func(sandbox.Spec) { mu.Lock(); atRun = append(atRun, listOut(t, f, "job1")); mu.Unlock() }
+			f.fake.Script(exe, step)
+
+			req := cppRequest(f.bundle(threeCases, ""))
+			if tt.checker {
+				spjExe := filepath.Join(f.spjDir("v1"), "spj-v1")
+				req = cppRequest(f.bundle(threeCases, "v1"))
+				req.Checker = testChecker("v1")
+				f.fake.Script(gcc, testutil.Step{Files: map[string][]byte{tmpExe(spjExe, "job1"): []byte("binary")}})
+				f.fake.Script(spjExe, testutil.Step{
+					Stdout:  []byte("checker said something\n"),
+					Stderr:  []byte("and something else\n"),
+					Inspect: func(sandbox.Spec) { mu.Lock(); atChecker = append(atChecker, listOut(t, f, "job1")); mu.Unlock() },
+				})
+			}
+			var atEnd []string
+			f.onSweep = func(uint32) { mu.Lock(); atEnd = listOut(t, f, "job1"); mu.Unlock() }
+			if _, err := f.judge("job1", req); err != nil {
+				t.Fatalf("Judge: %v", err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			for i, got := range atRun {
+				if len(got) != 0 {
+					t.Errorf("when run %d started out/ held %v: the earlier cases' files must be gone", i+1, got)
+				}
+			}
+			if len(atRun) != 3 {
+				t.Errorf("%d runs, want 3", len(atRun))
+			}
+			if tt.checker {
+				// While a checker runs, the program's output of its case is still there (it reads it), the
+				// checker's own streams are made by the shim after the Inspect hook, and nothing of earlier cases.
+				for i, got := range atChecker {
+					if len(got) != 1 || !strings.HasSuffix(got[0], ".out") {
+						t.Errorf("when checker run %d started out/ held %v, want only its case's output", i+1, got)
+					}
+				}
+				if len(atChecker) != 3 {
+					t.Errorf("%d checker runs, want 3", len(atChecker))
+				}
+			}
+			if len(atEnd) != 0 {
+				t.Errorf("out/ holds %v when the job ends, want it empty", atEnd)
+			}
+		})
 	}
 }
 

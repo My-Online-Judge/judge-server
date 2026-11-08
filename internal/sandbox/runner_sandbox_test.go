@@ -262,6 +262,7 @@ const probeSource = `
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -332,6 +333,47 @@ int main(int argc, char **argv)
         /* the open(2) system call itself (flags are argument 1); glibc's open() is openat */
 #ifdef SYS_open
         r = syscall(SYS_open, "probe-creat-ro-sys", O_RDONLY | O_CREAT, 0644);
+#else
+        return 77;
+#endif
+    } else if (!strcmp(what, "mkdir")) {
+        /* the entries-without-opening calls of general_deny: the plain name is glibc's mkdir() (the mkdir
+         * syscall on x86_64, mkdirat on aarch64), the at-forms are raw syscalls so that both
+         * architectures exercise every name in the deny-list */
+        r = mkdir("probe-dir", 0755);
+    } else if (!strcmp(what, "mkdirat")) {
+        r = syscall(SYS_mkdirat, AT_FDCWD, "probe-dirat", 0755);
+    } else if (!strcmp(what, "mknod")) {
+        r = mknod("probe-node", S_IFREG | 0644, 0);
+    } else if (!strcmp(what, "mknodat")) {
+        r = syscall(SYS_mknodat, AT_FDCWD, "probe-nodeat", S_IFREG | 0644, 0);
+    } else if (!strcmp(what, "symlink")) {
+        r = symlink("/etc/passwd", "probe-symlink");
+    } else if (!strcmp(what, "symlinkat")) {
+        r = syscall(SYS_symlinkat, "/etc/passwd", AT_FDCWD, "probe-symlinkat");
+    } else if (!strcmp(what, "link")) {
+        r = link("/etc/passwd", "probe-link");
+    } else if (!strcmp(what, "linkat")) {
+        r = syscall(SYS_linkat, AT_FDCWD, "/etc/passwd", AT_FDCWD, "probe-linkat", 0);
+    } else if (!strcmp(what, "rename")) {
+        r = rename("probe-from", "probe-to");
+    } else if (!strcmp(what, "renameat")) {
+#ifdef SYS_renameat
+        r = syscall(SYS_renameat, AT_FDCWD, "probe-from", AT_FDCWD, "probe-to");
+#else
+        return 77;
+#endif
+    } else if (!strcmp(what, "renameat2")) {
+#ifdef SYS_renameat2
+        r = syscall(SYS_renameat2, AT_FDCWD, "probe-from", AT_FDCWD, "probe-to", 0);
+#else
+        return 77;
+#endif
+    } else if (!strcmp(what, "truncate")) {
+        r = truncate("probe-file", 0);
+    } else if (!strcmp(what, "memfd_create")) {
+#ifdef SYS_memfd_create
+        r = syscall(SYS_memfd_create, "probe", 0);
 #else
         return 77;
 #endif
@@ -1204,6 +1246,9 @@ func TestRunSeccompDenyTable(t *testing.T) {
 		"io_uring_setup", "io_uring_enter", "io_uring_register", "unshare", "setns", "userfaultfd", "bpf",
 		"prlimit_other", "prlimit_other_set",
 		"open_creat_rdonly", "open_trunc_rdonly", "open_tmpfile", "open_syscall_creat_rdonly",
+		// general_deny's entries-without-opening calls (none is on the c_cpp allow-list either)
+		"mkdir", "mkdirat", "mknod", "mknodat", "symlink", "symlinkat", "link", "linkat",
+		"rename", "renameat", "renameat2", "truncate", "memfd_create",
 	}
 	for _, what := range denied {
 		t.Run(what, func(t *testing.T) {

@@ -660,7 +660,7 @@ func workUsageKiB(t *testing.T) int64 {
 	return kib
 }
 
-// A program that prints 1 GiB stops at RLIMIT_FSIZE (the output file cap, 32 MiB) with
+// A program that prints 1 GiB stops at RLIMIT_FSIZE (the output file cap, 16 MiB) with
 // SIGXFSZ, so it is a runtime error; the response carries only the first
 // OUTPUT_RESPONSE_CAP_BYTES bytes, flagged as truncated; and when the job is over nothing is
 // left on the /work tmpfs.
@@ -1251,6 +1251,11 @@ func TestEngineSignalOtherSlot(t *testing.T) {
 	})
 }
 
+// poolOf is the number of cases the engine runs at once for the cpp row.
+func poolOf() int {
+	return judge.PoolSize(budgetBytes, judge.Reservation(memoryLimit, false))
+}
+
 // duKiB is the size of everything under dir, in KiB.
 func duKiB(dir string) (int64, error) {
 	out, err := exec.Command("du", "-sk", dir).Output()
@@ -1262,6 +1267,94 @@ func duKiB(dir string) (int64, error) {
 		return 0, fmt.Errorf("du %s printed nothing", dir)
 	}
 	return strconv.ParseInt(f[0], 10, 64)
+}
+
+// A job whose every case floods its output cannot fill the work filesystem: each case's output file is
+// capped (16 MiB) and deleted as soon as the case is judged, so the job holds at most pool of them at
+// once. A second job judging next to it is AC on all its cases, and /work, sampled while both run,
+// stays within pool x 16 MiB + the Go build cache cap + 32 MiB.
+func TestEngineFloodMany(t *testing.T) {
+	env := engineEnv(t)
+	cpp := rowFor(t, "cpp")
+	const cases = 20
+	inputs := make([]string, cases)
+	sums := make([]struct{ Name, In, Out string }, cases)
+	for i := range inputs {
+		inputs[i] = "1 2\n"
+		sums[i] = struct{ Name, In, Out string }{strconv.Itoa(i + 1), "1 2\n", "3\n"}
+	}
+	floodBundle := env.bundleOf(t, inputs...)
+	acBundle := testutil.WriteBundle(t, env.bundles, fmt.Sprintf("sum20__%08x", env.seq.Add(1)), sums, "")
+
+	budgetKiB := int64(poolOf())*int64(env.cfg.OutputFileCap)/1024 + gocacheCap/1024 + 32*1024
+	var peak atomic.Int64
+	var sampleErr atomic.Value
+	stop := make(chan struct{})
+	sampled := make(chan struct{})
+	go func() { // /work, over and over, until both jobs are done
+		defer close(sampled)
+		for {
+			kib, err := duKiB("/work")
+			if err != nil {
+				sampleErr.Store(err)
+				return
+			}
+			if kib > peak.Load() {
+				peak.Store(kib)
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	}()
+
+	type result struct {
+		out judge.Outcome
+		err error
+	}
+	floodDone, acDone := make(chan result, 1), make(chan result, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*judgeTimeout)
+	defer cancel()
+	floodReq := inSlot(env.request(cpp, readSource(t, "isolation", "flood_many.cpp"), floodBundle, nil), 0)
+	acReq := inSlot(env.request(cpp, readSource(t, "cpp", "ac.cpp"), acBundle, nil), 1)
+	floodID, acID := env.jobID(), env.jobID()
+	go func() {
+		out, err := env.eng.Judge(ctx, floodID, floodReq)
+		floodDone <- result{out, err}
+	}()
+	go func() {
+		out, err := env.eng.Judge(ctx, acID, acReq)
+		acDone <- result{out, err}
+	}()
+	flood, ac := <-floodDone, <-acDone
+	close(stop)
+	<-sampled
+	if err, _ := sampleErr.Load().(error); err != nil {
+		t.Fatalf("sampling /work: %v", err)
+	}
+
+	if flood.err != nil || ac.err != nil {
+		t.Fatalf("Judge: flood %v, second job %v", flood.err, ac.err)
+	}
+	if len(ac.out.Cases) != cases || firstFailure(ac.out.Cases) != nil {
+		t.Errorf("the job next to the flood must be AC on all %d cases: %s", cases, describe(ac.out))
+	}
+	if len(flood.out.Cases) != cases {
+		t.Fatalf("flood job has %d cases, want %d: %s", len(flood.out.Cases), cases, describe(flood.out))
+	}
+	for _, c := range flood.out.Cases {
+		if c.Result != 4 || c.Signal != int32(syscall.SIGXFSZ) || !c.OutputTruncated {
+			t.Errorf("flood case %s: result %s signal %d truncated %v, want RE by SIGXFSZ with a truncated response", c.Name, resultName(c.Result), c.Signal, c.OutputTruncated)
+		}
+	}
+	t.Logf("du /work peaked at %d KiB while both jobs ran; the bound is %d KiB (pool %d x %d MiB + gocache %d MiB + 32 MiB)",
+		peak.Load(), budgetKiB, poolOf(), env.cfg.OutputFileCap>>20, gocacheCap>>20)
+	if peak.Load() > budgetKiB {
+		t.Errorf("du /work reached %d KiB, over the bound of %d KiB: the cases' output files pile up", peak.Load(), budgetKiB)
+	}
+	env.assertNoJobs(t)
 }
 
 // A program that fills its TMPDIR (a run under seccomp "" may create files there) hits ENOSPC inside

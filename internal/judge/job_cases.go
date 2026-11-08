@@ -48,7 +48,9 @@ func (j *job) runCases(ctx context.Context) ([]CaseResult, error) {
 
 // runCase runs case i (0-based; its files are named by the 1-based position, so
 // no case name ever reaches a path) and judges it: derive the result from the
-// run, then compare the output by md5 or ask the checker.
+// run, then compare the output by md5 or ask the checker. The case's output file
+// is deleted as soon as it is judged, however it ended, so a job holds at most
+// one (capped at OutputFileCap) per case in flight, not one per case.
 func (j *job) runCase(ctx context.Context, i int, c bundle.Case) (CaseResult, error) {
 	if err := ctx.Err(); err != nil {
 		return CaseResult{}, err
@@ -65,9 +67,9 @@ func (j *job) runCase(ctx context.Context, i int, c bundle.Case) (CaseResult, er
 		}
 	}
 	outPath := filepath.Join(j.outDir, n+".out")
-	errPath := filepath.Join(j.outDir, n+".err")
+	defer removeFile(outPath)
 
-	res, err := j.runProgram(ctx, c.Name, in, outPath, errPath)
+	res, err := j.runProgram(ctx, c.Name, in, outPath)
 	if err != nil {
 		return CaseResult{}, err
 	}
@@ -125,10 +127,13 @@ func (j *job) runCase(ctx context.Context, i int, c bundle.Case) (CaseResult, er
 	return cr, nil
 }
 
-// runProgram runs the submission on one case. It holds the case's reservation
-// from the shared budget for the run only, so the checker's own reservation is
-// never requested while this one is held.
-func (j *job) runProgram(ctx context.Context, name, in, outPath, errPath string) (sandbox.Result, error) {
+// runProgram runs the submission on one case, stdout into outPath. Its stderr goes
+// to /dev/null: it never affects the verdict (spec 4.3), and a file for it would be
+// one more thing a program can fill (the compile's and the checker's stderr are still
+// kept). It holds the case's reservation from the shared budget for the run only, so
+// the checker's own reservation is never requested while this one is held. The slot's
+// uid is swept when the run is over.
+func (j *job) runProgram(ctx context.Context, name, in, outPath string) (sandbox.Result, error) {
 	r := j.req
 	cfg := j.e.d.Cfg
 	checkOnly := r.Lang.Run.MemoryLimitCheckOnly
@@ -158,7 +163,7 @@ func (j *job) runProgram(ctx context.Context, name, in, outPath, errPath string)
 		GID:             j.slotID(),
 		Stdin:           in,
 		Stdout:          outPath,
-		Stderr:          errPath,
+		Stderr:          "", // /dev/null
 		MaxCPUTimeMs:    r.MaxCPUTimeMs,
 		MaxRealTimeMs:   timeFactor * r.MaxCPUTimeMs,
 		MaxAddressSpace: addressSpace,

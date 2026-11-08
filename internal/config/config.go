@@ -69,7 +69,7 @@ func Load(getenv func(string) string) (Config, error) {
 		{"RUN_POOL_BUDGET_BYTES", 1073741824, &cfg.RunPoolBudget},
 		{"COMPILE_MAX_MEMORY_BYTES", 536870912, &cfg.CompileMaxMemory},
 		{"GOCACHE_CAP_BYTES", 134217728, &cfg.GoCacheCap},
-		{"OUTPUT_FILE_CAP_BYTES", 33554432, &cfg.OutputFileCap},
+		{"OUTPUT_FILE_CAP_BYTES", 16777216, &cfg.OutputFileCap},
 		{"OUTPUT_RESPONSE_CAP_BYTES", 65536, &cfg.OutputResponseCap},
 		{"COMPILE_MESSAGE_CAP_BYTES", 65536, &cfg.CompileMessageCap},
 		{"INLINE_INPUT_CAP_BYTES", 1048576, &cfg.InlineInputCap},
