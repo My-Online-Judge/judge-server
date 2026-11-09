@@ -482,3 +482,136 @@ func TestConcurrentJudgesGetDifferentSlots(t *testing.T) {
 	close(release)
 	wg.Wait()
 }
+
+func TestJudgeStreamSendsEachCaseThenDone(t *testing.T) {
+	r := startRig(t, rigOptions{})
+	cases := []judge.CaseResult{
+		{Name: "2", Result: -1, CPUTimeMs: 21, RealTimeMs: 25, MemoryBytes: 4096, OutputMD5: "c81e", Output: []byte("22\n"), OutputTruncated: true},
+		{Name: "1", Result: 0, CPUTimeMs: 12, RealTimeMs: 15, MemoryBytes: 3624960, OutputMD5: "c4ca", Output: []byte("1\n")},
+	}
+	r.fake.fn = streaming(cases, judge.Outcome{Cases: []judge.CaseResult{cases[1], cases[0]}})
+
+	events, err := r.judgeStream(t, validRequest())
+	if err != nil {
+		t.Fatalf("JudgeStream: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("got %d events, want 2 cases + done: %v", len(events), events)
+	}
+	// The cases come in finishing order, without the output, and nothing else.
+	want := []*judgev1.CaseResult{
+		{TestCase: "2", Result: -1, CpuTimeMs: 21, RealTimeMs: 25, MemoryBytes: 4096, OutputMd5: "c81e"},
+		{TestCase: "1", Result: 0, CpuTimeMs: 12, RealTimeMs: 15, MemoryBytes: 3624960, OutputMd5: "c4ca"},
+	}
+	for i, w := range want {
+		if got := events[i].GetCase(); !proto.Equal(got, w) {
+			t.Errorf("event %d = %v, want case %v", i, events[i], w)
+		}
+	}
+	// done is the unary answer, output included and in bundle order.
+	unary, err := r.judge(t, validRequest())
+	if err != nil {
+		t.Fatalf("Judge: %v", err)
+	}
+	if done := events[2].GetDone(); done == nil || !proto.Equal(done, unary) {
+		t.Fatalf("last event = %v, want done equal to the unary response %v", events[2], unary)
+	}
+	if cs := events[2].GetDone().GetResults().GetCases(); len(cs) != 2 || cs[0].GetTestCase() != "1" || string(cs[0].GetOutput()) != "1\n" {
+		t.Fatalf("done cases = %v, want bundle order with output", events[2].GetDone())
+	}
+}
+
+func TestJudgeStreamCompileErrorSendsOnlyDone(t *testing.T) {
+	r := startRig(t, rigOptions{})
+	r.fake.fn = answers(judge.Outcome{CompileError: "main.cpp:1: error"})
+
+	events, err := r.judgeStream(t, validRequest())
+	if err != nil {
+		t.Fatalf("JudgeStream: %v", err)
+	}
+	if len(events) != 1 || events[0].GetDone().GetCompileError().GetMessage() != "main.cpp:1: error" {
+		t.Fatalf("events = %v, want one done carrying the compile error", events)
+	}
+}
+
+// A call that fails ends with its status code and never a done: the client must
+// not use the cases it saw.
+func TestJudgeStreamFailureEndsWithoutDone(t *testing.T) {
+	r := startRig(t, rigOptions{maxJobs: 1, maxQueue: 0})
+	tests := []struct {
+		name string
+		err  error
+		code codes.Code
+	}{
+		{"internal", errors.New("disk on fire"), codes.Internal},
+		{"invalid request", errors.Join(judge.ErrInvalidRequest, errors.New("x")), codes.InvalidArgument},
+		{"cancelled", context.Canceled, codes.Canceled},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r.fake.fn = func(_ context.Context, _ string, q judge.Request) (judge.Outcome, error) {
+				q.OnCase(judge.CaseResult{Name: "1"})
+				return judge.Outcome{}, tc.err
+			}
+			events, err := r.judgeStream(t, validRequest())
+			wantCode(t, err, tc.code)
+			for _, ev := range events {
+				if ev.GetDone() != nil {
+					t.Fatalf("a failed stream sent done: %v", events)
+				}
+			}
+			if n := r.adm.Running(); n != 0 {
+				t.Fatalf("running = %d after the call, the slot leaked", n)
+			}
+		})
+	}
+	// The empty outcome is the engine's bug, INTERNAL like for Judge.
+	r.fake.fn = answers(judge.Outcome{})
+	events, err := r.judgeStream(t, validRequest())
+	wantCode(t, err, codes.Internal)
+	if len(events) != 0 {
+		t.Fatalf("events = %v, want none", events)
+	}
+}
+
+// The request-mapping and admission refusals of Judge apply to the stream too.
+func TestJudgeStreamRefusesLikeJudge(t *testing.T) {
+	r := startRig(t, rigOptions{})
+	req := validRequest()
+	req.Cases = &judgev1.JudgeRequest_TestCaseId{TestCaseId: "../etc/passwd"}
+	_, err := r.judgeStream(t, req)
+	wantCode(t, err, codes.InvalidArgument)
+	if n := r.fake.calls(); n != 0 {
+		t.Fatalf("engine called %d times for a rejected id", n)
+	}
+}
+
+// A client that goes away mid-stream cancels the job, like a unary deadline.
+func TestJudgeStreamClientGoneCancelsTheJob(t *testing.T) {
+	r := startRig(t, rigOptions{})
+	engineCtxDone := make(chan error, 1)
+	r.fake.fn = func(ctx context.Context, _ string, q judge.Request) (judge.Outcome, error) {
+		q.OnCase(judge.CaseResult{Name: "1"})
+		<-ctx.Done()
+		engineCtxDone <- ctx.Err()
+		return judge.Outcome{}, ctx.Err()
+	}
+	ctx, cancel := ctxWithToken(testToken)
+	stream, err := r.client(t, testutil.WorkerCN).JudgeStream(ctx, validRequest())
+	if err != nil {
+		t.Fatalf("JudgeStream: %v", err)
+	}
+	if ev, err := stream.Recv(); err != nil || ev.GetCase().GetTestCase() != "1" {
+		t.Fatalf("first event = %v, %v, want case 1", ev, err)
+	}
+	cancel()
+	select {
+	case err := <-engineCtxDone:
+		if err == nil {
+			t.Fatal("engine ctx ended without an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the engine's context never ended after the client left")
+	}
+	waitFor(t, "the slot to be released", func() bool { return r.adm.Running() == 0 })
+}

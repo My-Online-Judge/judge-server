@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -2060,4 +2061,56 @@ func TestJudgeConcurrentJobsShareOneBudget(t *testing.T) {
 		}
 	}
 	f.assertBudgetFree()
+}
+
+// OnCase sees every judged case, each before Judge returns, and the same results
+// Judge returns; a compile error means no case was judged, so no call.
+func TestJudgeOnCaseSeesEveryCaseBeforeReturn(t *testing.T) {
+	f := newFixture(t)
+	b := f.bundle(threeCases, "")
+	f.fake.Script(gpp, testutil.Step{})
+	f.fake.Handle(f.exe("job1"), func(s sandbox.Spec) testutil.Step {
+		return testutil.Step{Stdout: []byte("1\n"), Result: sandbox.Result{CPUTimeMs: int64(10 * (filepath.Base(s.Stdin)[0] - '0'))}}
+	})
+
+	var mu sync.Mutex
+	var seen []CaseResult
+	returned := false
+	r := cppRequest(b)
+	r.OnCase = func(c CaseResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		if returned {
+			t.Error("OnCase called after Judge returned")
+		}
+		seen = append(seen, c)
+	}
+	out, err := f.judge("job1", r)
+	mu.Lock()
+	returned = true
+	mu.Unlock()
+	if err != nil {
+		t.Fatalf("Judge: %v", err)
+	}
+	byName := func(cs []CaseResult) map[string]CaseResult {
+		m := map[string]CaseResult{}
+		for _, c := range cs {
+			m[c.Name] = c
+		}
+		return m
+	}
+	if len(seen) != 3 || !reflect.DeepEqual(byName(seen), byName(out.Cases)) {
+		t.Fatalf("OnCase saw %+v, Judge returned %+v", seen, out.Cases)
+	}
+
+	f.fake.Script(gpp, testutil.Step{Result: sandbox.Result{ExitCode: 1}, Stderr: []byte("boom\n")})
+	calls := 0
+	r.OnCase = func(CaseResult) { calls++ }
+	out, err = f.judge("job2", r)
+	if err != nil || out.CompileError == "" {
+		t.Fatalf("Judge = %+v, %v, want a compile error", out, err)
+	}
+	if calls != 0 {
+		t.Fatalf("OnCase called %d times for a compile error", calls)
+	}
 }

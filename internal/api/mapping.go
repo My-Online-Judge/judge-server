@@ -128,24 +128,37 @@ func toResponse(out judge.Outcome) (*judgev1.JudgeResponse, error) {
 	case len(out.Cases) > 0:
 		cases := make([]*judgev1.CaseResult, len(out.Cases))
 		for i, c := range out.Cases {
-			cases[i] = &judgev1.CaseResult{
-				TestCase:        c.Name,
-				Result:          c.Result,
-				Error:           c.Error,
-				CpuTimeMs:       c.CPUTimeMs,
-				RealTimeMs:      c.RealTimeMs,
-				MemoryBytes:     c.MemoryBytes,
-				Signal:          c.Signal,
-				ExitCode:        c.ExitCode,
-				OutputMd5:       c.OutputMD5,
-				Output:          c.Output,
-				OutputTruncated: c.OutputTruncated,
-			}
+			cases[i] = toCaseResult(c)
 		}
 		return &judgev1.JudgeResponse{Outcome: &judgev1.JudgeResponse_Results{
 			Results: &judgev1.CaseResults{Cases: cases}}}, nil
 	}
 	return nil, errors.New("engine returned an outcome with no cases and no compile error")
+}
+
+// toCaseResult maps one case of the engine's outcome, output included.
+func toCaseResult(c judge.CaseResult) *judgev1.CaseResult {
+	return &judgev1.CaseResult{
+		TestCase:        c.Name,
+		Result:          c.Result,
+		Error:           c.Error,
+		CpuTimeMs:       c.CPUTimeMs,
+		RealTimeMs:      c.RealTimeMs,
+		MemoryBytes:     c.MemoryBytes,
+		Signal:          c.Signal,
+		ExitCode:        c.ExitCode,
+		OutputMd5:       c.OutputMD5,
+		Output:          c.Output,
+		OutputTruncated: c.OutputTruncated,
+	}
+}
+
+// toCaseEvent maps a case for a JudgeStream `case` event: the verdict and its
+// measurements, without the program's output, which travels once, in `done`.
+func toCaseEvent(c judge.CaseResult) *judgev1.CaseResult {
+	ev := toCaseResult(c)
+	ev.Output, ev.OutputTruncated = nil, false
+	return ev
 }
 
 // outcomeKind names which outcome a response carries, for the job's log line.

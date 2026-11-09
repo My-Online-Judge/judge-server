@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
 
 	"github.com/My-Online-Judge/judge-server/internal/api"
@@ -138,6 +139,40 @@ func (s *server) Judge(ctx context.Context, in *judgev1.JudgeRequest) (*judgev1.
 			CompileError: &judgev1.CompileError{Message: compileMessage}}}, nil
 	}
 	return resultsResponse(s.cases(src, in)), nil
+}
+
+// JudgeStream answers like Judge, one `case` event per case (without the mock's
+// output) and then `done`. A TRIGGER_SLOW pause is spread evenly over the cases,
+// so the development stack shows the portal's ladder filling in; a compile error
+// pauses once and sends only `done`.
+func (s *server) JudgeStream(in *judgev1.JudgeRequest, stream grpc.ServerStreamingServer[judgev1.JudgeEvent]) error {
+	ctx := stream.Context()
+	src := in.GetSrc()
+	slow := strings.Contains(src, markerSlow)
+	if strings.Contains(src, markerCE) {
+		if slow {
+			if err := pause(ctx, s.slow); err != nil {
+				return status.FromContextError(err).Err()
+			}
+		}
+		return stream.Send(&judgev1.JudgeEvent{Event: &judgev1.JudgeEvent_Done{Done: &judgev1.JudgeResponse{
+			Outcome: &judgev1.JudgeResponse_CompileError{CompileError: &judgev1.CompileError{Message: compileMessage}}}}})
+	}
+	cases := s.cases(src, in)
+	for _, c := range cases {
+		if slow {
+			if err := pause(ctx, s.slow/time.Duration(len(cases))); err != nil {
+				return status.FromContextError(err).Err()
+			}
+		}
+		ev := &judgev1.CaseResult{TestCase: c.GetTestCase(), Result: c.GetResult(), Error: c.GetError(),
+			CpuTimeMs: c.GetCpuTimeMs(), RealTimeMs: c.GetRealTimeMs(), MemoryBytes: c.GetMemoryBytes(),
+			Signal: c.GetSignal(), ExitCode: c.GetExitCode(), OutputMd5: c.GetOutputMd5()}
+		if err := stream.Send(&judgev1.JudgeEvent{Event: &judgev1.JudgeEvent_Case{Case: ev}}); err != nil {
+			return err
+		}
+	}
+	return stream.Send(&judgev1.JudgeEvent{Event: &judgev1.JudgeEvent_Done{Done: resultsResponse(cases)}})
 }
 
 // pause waits d, or until ctx ends, in which case it returns ctx's error.

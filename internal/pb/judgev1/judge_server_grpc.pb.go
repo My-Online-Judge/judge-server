@@ -26,8 +26,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	JudgeServer_Judge_FullMethodName = "/oj.judge.v1.JudgeServer/Judge"
-	JudgeServer_Ping_FullMethodName  = "/oj.judge.v1.JudgeServer/Ping"
+	JudgeServer_Judge_FullMethodName       = "/oj.judge.v1.JudgeServer/Judge"
+	JudgeServer_JudgeStream_FullMethodName = "/oj.judge.v1.JudgeServer/JudgeStream"
+	JudgeServer_Ping_FullMethodName        = "/oj.judge.v1.JudgeServer/Ping"
 )
 
 // JudgeServerClient is the client API for JudgeServer service.
@@ -48,6 +49,13 @@ type JudgeServerClient interface {
 	// DEADLINE_EXCEEDED (client-side): the client's deadline passed while the sandbox judges. The server observes the call's
 	// context: when the client goes away it kills the running children, frees the slot and discards the job.
 	Judge(ctx context.Context, in *JudgeRequest, opts ...grpc.CallOption) (*JudgeResponse, error)
+	// Judge, streamed: the same request, the same checks and the same status codes, but each case's result is sent as it
+	// is judged (JudgeEvent.case, in finishing order, not bundle order), then exactly one JudgeEvent.done carrying the
+	// whole JudgeResponse the unary call would have returned (its cases in bundle order). A compile error sends only
+	// `done`. A call that fails sends no `done`: the stream ends with the status code instead, and the client must not
+	// use the cases it has seen (the next sandbox judges from scratch). Added 2026-11-08 so the portal can show the test
+	// ladder fill live; `Judge` stays for callers that do not need it (the run lane).
+	JudgeStream(ctx context.Context, in *JudgeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[JudgeEvent], error)
 	// Health and load probe for the worker's sandbox registry.
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
 }
@@ -69,6 +77,25 @@ func (c *judgeServerClient) Judge(ctx context.Context, in *JudgeRequest, opts ..
 	}
 	return out, nil
 }
+
+func (c *judgeServerClient) JudgeStream(ctx context.Context, in *JudgeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[JudgeEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &JudgeServer_ServiceDesc.Streams[0], JudgeServer_JudgeStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[JudgeRequest, JudgeEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type JudgeServer_JudgeStreamClient = grpc.ServerStreamingClient[JudgeEvent]
 
 func (c *judgeServerClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -98,6 +125,13 @@ type JudgeServerServer interface {
 	// DEADLINE_EXCEEDED (client-side): the client's deadline passed while the sandbox judges. The server observes the call's
 	// context: when the client goes away it kills the running children, frees the slot and discards the job.
 	Judge(context.Context, *JudgeRequest) (*JudgeResponse, error)
+	// Judge, streamed: the same request, the same checks and the same status codes, but each case's result is sent as it
+	// is judged (JudgeEvent.case, in finishing order, not bundle order), then exactly one JudgeEvent.done carrying the
+	// whole JudgeResponse the unary call would have returned (its cases in bundle order). A compile error sends only
+	// `done`. A call that fails sends no `done`: the stream ends with the status code instead, and the client must not
+	// use the cases it has seen (the next sandbox judges from scratch). Added 2026-11-08 so the portal can show the test
+	// ladder fill live; `Judge` stays for callers that do not need it (the run lane).
+	JudgeStream(*JudgeRequest, grpc.ServerStreamingServer[JudgeEvent]) error
 	// Health and load probe for the worker's sandbox registry.
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
 	mustEmbedUnimplementedJudgeServerServer()
@@ -112,6 +146,9 @@ type UnimplementedJudgeServerServer struct{}
 
 func (UnimplementedJudgeServerServer) Judge(context.Context, *JudgeRequest) (*JudgeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Judge not implemented")
+}
+func (UnimplementedJudgeServerServer) JudgeStream(*JudgeRequest, grpc.ServerStreamingServer[JudgeEvent]) error {
+	return status.Errorf(codes.Unimplemented, "method JudgeStream not implemented")
 }
 func (UnimplementedJudgeServerServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Ping not implemented")
@@ -155,6 +192,17 @@ func _JudgeServer_Judge_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _JudgeServer_JudgeStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(JudgeRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(JudgeServerServer).JudgeStream(m, &grpc.GenericServerStream[JudgeRequest, JudgeEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type JudgeServer_JudgeStreamServer = grpc.ServerStreamingServer[JudgeEvent]
+
 func _JudgeServer_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PingRequest)
 	if err := dec(in); err != nil {
@@ -189,6 +237,12 @@ var JudgeServer_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _JudgeServer_Ping_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "JudgeStream",
+			Handler:       _JudgeServer_JudgeStream_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "judge_server.proto",
 }

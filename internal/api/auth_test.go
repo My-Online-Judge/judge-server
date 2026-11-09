@@ -258,3 +258,71 @@ func TestAuthInterceptor(t *testing.T) {
 		})
 	}
 }
+
+// JudgeStream runs behind the stream interceptor: the same token and CN checks
+// as Judge, and the engine is never reached by a refused call.
+func TestAuthCoversJudgeStream(t *testing.T) {
+	r := startRig(t, rigOptions{})
+	r.fake.fn = answers(judge.Outcome{Cases: []judge.CaseResult{{Name: "1"}}})
+
+	noToken, cancel := ctxWithToken("")
+	defer cancel()
+	_, err := collect(r.client(t, testutil.WorkerCN).JudgeStream(noToken, validRequest()))
+	wantCode(t, err, codes.Unauthenticated)
+
+	wrong := metadata.AppendToOutgoingContext(noToken, TokenHeader, digest("not-the-token"))
+	_, err = collect(r.client(t, testutil.WorkerCN).JudgeStream(wrong, validRequest()))
+	wantCode(t, err, codes.Unauthenticated)
+
+	ctx, cancel2 := ctxWithToken(testToken)
+	defer cancel2()
+	_, err = collect(r.client(t, testutil.StrangerCN).JudgeStream(ctx, validRequest()))
+	wantCode(t, err, codes.PermissionDenied)
+	if n := r.fake.calls(); n != 0 {
+		t.Fatalf("engine called %d times for refused streams", n)
+	}
+
+	if _, err := r.judgeStream(t, validRequest()); err != nil {
+		t.Fatalf("JudgeStream as the worker with the right token: %v", err)
+	}
+}
+
+// The stream interceptor is the unary one's checks on a ServerStream.
+func TestAuthStreamInterceptor(t *testing.T) {
+	sum := digest("tok")
+	info := &grpc.StreamServerInfo{FullMethod: judgev1.JudgeServer_JudgeStream_FullMethodName}
+	tests := []struct {
+		name    string
+		allowed []string
+		token   string
+		ctx     context.Context
+		want    codes.Code
+	}{
+		{"allowed CN, right token", []string{"w"}, sum, peerCtx("w", sum), codes.OK},
+		{"allowed CN, no token", []string{"w"}, sum, peerCtx("w"), codes.Unauthenticated},
+		{"other CN", []string{"w"}, "", peerCtx("s"), codes.PermissionDenied},
+		{"no peer at all", []string{"w"}, "", context.Background(), codes.PermissionDenied},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			quietLogs(t)
+			called := false
+			handler := func(any, grpc.ServerStream) error { called = true; return nil }
+			err := AuthStreamInterceptor(tc.allowed, tc.token)(nil, ctxStream{ctx: tc.ctx}, info, handler)
+			if got := status.Code(err); got != tc.want {
+				t.Fatalf("code = %v (%v), want %v", got, err, tc.want)
+			}
+			if called != (tc.want == codes.OK) {
+				t.Fatalf("handler called = %v with code %v", called, tc.want)
+			}
+		})
+	}
+}
+
+// ctxStream is a ServerStream that only knows its context.
+type ctxStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s ctxStream) Context() context.Context { return s.ctx }

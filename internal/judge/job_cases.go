@@ -18,8 +18,10 @@ import (
 )
 
 // runCases runs every case through a pool of PoolSize(budget, reservation)
-// workers and returns the results in bundle order. The first failure (an internal
-// error, or ctx ending) cancels the cases still running and is what comes back.
+// workers and returns the results in bundle order. Each judged case is also
+// handed to the request's OnCase hook, when there is one, before its worker
+// moves on. The first failure (an internal error, or ctx ending) cancels the
+// cases still running and is what comes back.
 func (j *job) runCases(ctx context.Context) ([]CaseResult, error) {
 	r := j.req
 	reservation := Reservation(r.MaxMemory, r.Lang.Run.MemoryLimitCheckOnly)
@@ -35,8 +37,14 @@ func (j *job) runCases(ctx context.Context) ([]CaseResult, error) {
 		}
 		g.Go(func() error {
 			res, err := j.runCase(gctx, i, cases[i])
+			if err != nil {
+				return err
+			}
 			results[i] = res
-			return err
+			if r.OnCase != nil {
+				r.OnCase(res)
+			}
+			return nil
 		})
 	}
 	err := g.Wait()

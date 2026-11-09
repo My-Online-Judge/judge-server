@@ -236,3 +236,43 @@ func validRequest() *judgev1.JudgeRequest {
 		}}},
 	}
 }
+
+// judgeStream sends req to JudgeStream as the worker with the right token and
+// collects every event until the stream ends; err is how it ended (nil for a
+// clean end).
+func (r *rig) judgeStream(t *testing.T, req *judgev1.JudgeRequest) ([]*judgev1.JudgeEvent, error) {
+	t.Helper()
+	ctx, cancel := ctxWithToken(testToken)
+	defer cancel()
+	return collect(r.client(t, testutil.WorkerCN).JudgeStream(ctx, req))
+}
+
+// collect reads a JudgeStream to its end.
+func collect(stream grpc.ServerStreamingClient[judgev1.JudgeEvent], err error) ([]*judgev1.JudgeEvent, error) {
+	if err != nil {
+		return nil, err
+	}
+	var events []*judgev1.JudgeEvent
+	for {
+		ev, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return events, nil
+		}
+		if err != nil {
+			return events, err
+		}
+		events = append(events, ev)
+	}
+}
+
+// streaming makes the fake call r.OnCase with each of cases, then answer out.
+func streaming(cases []judge.CaseResult, out judge.Outcome) func(context.Context, string, judge.Request) (judge.Outcome, error) {
+	return func(_ context.Context, _ string, r judge.Request) (judge.Outcome, error) {
+		for _, c := range cases {
+			if r.OnCase != nil {
+				r.OnCase(c)
+			}
+		}
+		return out, nil
+	}
+}

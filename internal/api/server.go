@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -47,13 +48,15 @@ func NewServer(cfg config.Config, eng Judger, adm *Admission, version string) *S
 }
 
 // NewGRPCServer builds the gRPC server Serve runs: TLS from tlsCfg, the auth
-// interceptor with cfg's allow-list and token digest, and srv registered. It is
-// exported so the mock subcommand (internal/mock) authenticates its callers
-// exactly as the real server does.
+// interceptors (unary and stream) with cfg's allow-list and token digest, and
+// srv registered. It is exported so the mock subcommand (internal/mock)
+// authenticates its callers exactly as the real server does.
 func NewGRPCServer(tlsCfg *tls.Config, cfg config.Config, srv judgev1.JudgeServerServer) *grpc.Server {
+	digest := tokenDigest(cfg.Token)
 	gs := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.UnaryInterceptor(AuthInterceptor(cfg.AllowedClients, tokenDigest(cfg.Token))),
+		grpc.UnaryInterceptor(AuthInterceptor(cfg.AllowedClients, digest)),
+		grpc.StreamInterceptor(AuthStreamInterceptor(cfg.AllowedClients, digest)),
 	)
 	judgev1.RegisterJudgeServerServer(gs, srv)
 	return gs
@@ -71,6 +74,42 @@ func (s *Server) Ping(context.Context, *judgev1.PingRequest) (*judgev1.PingRespo
 // running job has. A judge outcome, compile errors included, is a response; the
 // errors are statusFor's.
 func (s *Server) Judge(ctx context.Context, in *judgev1.JudgeRequest) (*judgev1.JudgeResponse, error) {
+	return s.run(ctx, in, nil)
+}
+
+// JudgeStream is Judge with each case's result sent as the engine finishes it
+// (a `case` event, without the output), then the whole response as the final
+// `done` event. The engine's per-case hook runs from its pool goroutines, so the
+// sends are serialised here; once a send fails the client is gone, later cases
+// are dropped and the call ends with that error instead of `done`. A call that
+// fails ends with its status and no `done`, like Judge.
+func (s *Server) JudgeStream(in *judgev1.JudgeRequest, stream grpc.ServerStreamingServer[judgev1.JudgeEvent]) error {
+	var mu sync.Mutex
+	var sendErr error
+	onCase := func(c judge.CaseResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		if sendErr != nil {
+			return
+		}
+		sendErr = stream.Send(&judgev1.JudgeEvent{Event: &judgev1.JudgeEvent_Case{Case: toCaseEvent(c)}})
+	}
+	resp, err := s.run(stream.Context(), in, onCase)
+	if err != nil {
+		return err
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if sendErr != nil {
+		slog.Warn("judge stream lost its client before the verdict", "err", sendErr)
+		return sendErr
+	}
+	return stream.Send(&judgev1.JudgeEvent{Event: &judgev1.JudgeEvent_Done{Done: resp}})
+}
+
+// run is the body of Judge and JudgeStream: onCase (nil for Judge) becomes the
+// engine's Request.OnCase.
+func (s *Server) run(ctx context.Context, in *judgev1.JudgeRequest, onCase func(judge.CaseResult)) (*judgev1.JudgeResponse, error) {
 	start := time.Now()
 	jobID, err := newJobID()
 	if err != nil {
@@ -87,6 +126,7 @@ func (s *Server) Judge(ctx context.Context, in *judgev1.JudgeRequest) (*judgev1.
 	}
 	defer release()
 	req.Slot = slot
+	req.OnCase = onCase
 
 	out, err := s.eng.Judge(ctx, jobID, req)
 	if err != nil {

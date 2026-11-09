@@ -70,9 +70,9 @@ func tokenDigest(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// AuthInterceptor admits a call only when it carries the service token and comes
-// from an allowed client. Both checks run on top of the TLS handshake, which has
-// already proved the peer holds a certificate signed by the CA.
+// AuthInterceptor admits a unary call only when it carries the service token and
+// comes from an allowed client. Both checks run on top of the TLS handshake,
+// which has already proved the peer holds a certificate signed by the CA.
 //
 //   - tokenSHA256Hex != "": the call must carry TokenHeader with exactly that
 //     value, else UNAUTHENTICATED. "" turns the token check off.
@@ -81,7 +81,34 @@ func tokenDigest(token string) string {
 //     (the healthcheck dials with the server's own certificate). The token is
 //     still required for Ping. An empty allowedCNs therefore refuses every call
 //     but Ping; Serve refuses to start with one.
+//
+// AuthStreamInterceptor applies the same checks to the streaming methods
+// (JudgeStream); a server must install both, or a stream would skip them.
 func AuthInterceptor(allowedCNs []string, tokenSHA256Hex string) grpc.UnaryServerInterceptor {
+	authorize := authorizer(allowedCNs, tokenSHA256Hex)
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if err := authorize(ctx, info.FullMethod); err != nil {
+			return nil, err
+		}
+		return handler(ctx, req)
+	}
+}
+
+// AuthStreamInterceptor is AuthInterceptor for streaming methods: the same token
+// and CN checks, on the stream's context, before the handler runs.
+func AuthStreamInterceptor(allowedCNs []string, tokenSHA256Hex string) grpc.StreamServerInterceptor {
+	authorize := authorizer(allowedCNs, tokenSHA256Hex)
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if err := authorize(ss.Context(), info.FullMethod); err != nil {
+			return err
+		}
+		return handler(srv, ss)
+	}
+}
+
+// authorizer returns the check both interceptors run: nil when the call to
+// fullMethod from ctx's peer may proceed, else the status error for the client.
+func authorizer(allowedCNs []string, tokenSHA256Hex string) func(ctx context.Context, fullMethod string) error {
 	allowed := make(map[string]struct{}, len(allowedCNs))
 	for _, cn := range allowedCNs {
 		if cn != "" { // a blank entry must never admit a certificate with an empty CN
@@ -90,18 +117,18 @@ func AuthInterceptor(allowedCNs []string, tokenSHA256Hex string) grpc.UnaryServe
 	}
 	want := []byte(tokenSHA256Hex)
 
-	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	return func(ctx context.Context, fullMethod string) error {
 		if len(want) > 0 && !hasToken(ctx, want) {
 			cn, _ := peerCN(ctx) // for the log only
-			return nil, rejectAuth(info.FullMethod, cn, status.Error(codes.Unauthenticated, "missing or wrong "+TokenHeader))
+			return rejectAuth(fullMethod, cn, status.Error(codes.Unauthenticated, "missing or wrong "+TokenHeader))
 		}
-		if info.FullMethod != judgev1.JudgeServer_Ping_FullMethodName {
+		if fullMethod != judgev1.JudgeServer_Ping_FullMethodName {
 			cn, ok := peerCN(ctx)
 			if _, in := allowed[cn]; !ok || !in {
-				return nil, rejectAuth(info.FullMethod, cn, status.Error(codes.PermissionDenied, "client certificate CN is not allowed"))
+				return rejectAuth(fullMethod, cn, status.Error(codes.PermissionDenied, "client certificate CN is not allowed"))
 			}
 		}
-		return handler(ctx, req)
+		return nil
 	}
 }
 

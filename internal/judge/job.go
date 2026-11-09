@@ -107,6 +107,13 @@ type Checker struct {
 // Checker is nil when the problem compares output by md5. Slot is the job slot
 // the caller took for it, in [0, MaxSlots): the job runs under that slot's uid
 // and gid, so two jobs running at the same time must have different slots.
+//
+// OnCase, when set, is called with each case's result as soon as that case is
+// judged, from the run pool's goroutines (so concurrently, and in finishing
+// order, not bundle order), and every call returns before Judge does. It is not
+// called for a case that failed to run (Judge then fails as a whole) nor when the
+// job ends in a compile error. Judge's Outcome still carries every case, so a
+// caller may ignore it.
 type Request struct {
 	Slot         int
 	Src          string
@@ -116,6 +123,7 @@ type Request struct {
 	Output       bool
 	Bundle       *bundle.Bundle
 	Checker      *Checker
+	OnCase       func(CaseResult)
 }
 
 // CaseResult is the verdict of one case.

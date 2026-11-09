@@ -489,6 +489,16 @@ func TestServeOverMutualTLS(t *testing.T) {
 	if _, err := dial(testutil.StrangerCN).Judge(withToken(good), inlineReq("x", "a")); status.Code(err) != codes.PermissionDenied {
 		t.Errorf("Judge from a CN off the allow-list: %v, want PermissionDenied", err)
 	}
+	if stream, err := dial(testutil.StrangerCN).JudgeStream(withToken(good), inlineReq("x", "a")); err == nil {
+		if _, err = stream.Recv(); status.Code(err) != codes.PermissionDenied {
+			t.Errorf("JudgeStream from a CN off the allow-list: %v, want PermissionDenied", err)
+		}
+	}
+	if stream, err := dial(testutil.WorkerCN).JudgeStream(withToken(""), inlineReq("x", "a")); err == nil {
+		if _, err = stream.Recv(); status.Code(err) != codes.Unauthenticated {
+			t.Errorf("JudgeStream with no token: %v, want Unauthenticated", err)
+		}
+	}
 
 	resp, err := dial(testutil.WorkerCN).Judge(withToken(good), inlineReq("x # TRIGGER_CE", "a"))
 	if err != nil || resp.GetCompileError().GetMessage() != "mock: error: expected ';' before '}'" {
@@ -540,4 +550,73 @@ func TestServeRefusesWhatItCannotAuthenticate(t *testing.T) {
 			t.Fatal("Serve started on a taken port")
 		}
 	})
+}
+
+// recStream is a JudgeStream server stream that records what is sent on it.
+type recStream struct {
+	grpc.ServerStream
+	ctx    context.Context
+	events []*judgev1.JudgeEvent
+}
+
+func (s *recStream) Context() context.Context { return s.ctx }
+func (s *recStream) Send(ev *judgev1.JudgeEvent) error {
+	s.events = append(s.events, ev)
+	return nil
+}
+
+func TestJudgeStreamSendsEachCaseThenDone(t *testing.T) {
+	srv := NewServer(t.TempDir(), 0)
+	st := &recStream{ctx: context.Background()}
+	if err := srv.JudgeStream(inlineReq("x # TRIGGER_WA", "a", "b", "c"), st); err != nil {
+		t.Fatalf("JudgeStream: %v", err)
+	}
+	if len(st.events) != 4 {
+		t.Fatalf("got %d events, want 3 cases + done: %v", len(st.events), st.events)
+	}
+	var cases []*judgev1.CaseResult
+	for _, ev := range st.events[:3] {
+		c := ev.GetCase()
+		if c == nil || len(c.GetOutput()) != 0 {
+			t.Fatalf("event %v, want a case without output", ev)
+		}
+		cases = append(cases, c)
+	}
+	wantNames(t, cases, "1", "2", "3")
+	wantCodes(t, cases, 0, -1, 0)
+	done := st.events[3].GetDone().GetResults().GetCases()
+	wantNames(t, done, "1", "2", "3")
+	wantCodes(t, done, 0, -1, 0)
+	if done[1].GetOutputMd5() != cases[1].GetOutputMd5() || done[1].GetCpuTimeMs() != cases[1].GetCpuTimeMs() {
+		t.Errorf("done case %v differs from its event %v", done[1], cases[1])
+	}
+}
+
+func TestJudgeStreamCompileErrorIsOnlyDone(t *testing.T) {
+	srv := NewServer(t.TempDir(), 0)
+	st := &recStream{ctx: context.Background()}
+	if err := srv.JudgeStream(inlineReq("x # TRIGGER_CE", "a", "b"), st); err != nil {
+		t.Fatalf("JudgeStream: %v", err)
+	}
+	if len(st.events) != 1 || st.events[0].GetDone().GetCompileError().GetMessage() != compileMessage {
+		t.Fatalf("events = %v, want one done with the compile error", st.events)
+	}
+}
+
+// The slow pause is spread over the cases, and a cancelled call ends mid-stream
+// without a done.
+func TestJudgeStreamSlowPauseEndsWhenTheCallIsCancelled(t *testing.T) {
+	srv := NewServer(t.TempDir(), 2*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	st := &recStream{ctx: ctx}
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	err := srv.JudgeStream(inlineReq("x # TRIGGER_SLOW", "a", "b"), st)
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("JudgeStream = %v, want Canceled", err)
+	}
+	for _, ev := range st.events {
+		if ev.GetDone() != nil {
+			t.Fatalf("a cancelled stream sent done: %v", st.events)
+		}
+	}
 }
