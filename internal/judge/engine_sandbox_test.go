@@ -46,6 +46,7 @@ import (
 
 	"github.com/My-Online-Judge/judge-server/internal/api"
 	"github.com/My-Online-Judge/judge-server/internal/bundle"
+	"github.com/My-Online-Judge/judge-server/internal/cgroup"
 	"github.com/My-Online-Judge/judge-server/internal/config"
 	"github.com/My-Online-Judge/judge-server/internal/judge"
 	"github.com/My-Online-Judge/judge-server/internal/sandbox"
@@ -214,7 +215,8 @@ func checkerFor(version, src string) *judge.Checker {
 // Go build cache (warmed once), one memory budget, like the server's.
 type sandboxEnv struct {
 	eng     *judge.Engine
-	deps    judge.Deps // what eng was built from, for a second engine that differs in one thing
+	deps    judge.Deps      // what eng was built from, for a second engine that differs in one thing
+	cg      *cgroup.Manager // the delegated cgroup subtree (JUDGE_CGROUP_ROOT), nil without one; eng uses it only under JUDGE_ENGINE_CGROUPS=1
 	cfg     config.Config
 	work    string // WorkDir, under /work
 	tmp     string // TMP_DIR, under /tmp: the run's TMPDIR is <tmp>/jobs/<id>
@@ -322,7 +324,21 @@ func buildEnv() (env *sandboxEnv, skip, fail string) {
 		Cfg:        cfg,
 		GoCache:    cache,
 	}
-	return &sandboxEnv{eng: judge.NewEngine(deps), deps: deps, cfg: cfg, work: work, tmp: tmp, bundles: bundles}, "", ""
+	var cg *cgroup.Manager
+	if v := os.Getenv("CGROUP_JOB_CPUS"); v != "" { // the job cgroups' cpu.max, as the server reads it
+		if cfg.CgroupJobCPUs, err = strconv.ParseFloat(v, 64); err != nil {
+			return nil, "", "CGROUP_JOB_CPUS: " + err.Error()
+		}
+	}
+	if root := os.Getenv("JUDGE_CGROUP_ROOT"); root != "" {
+		if cg, err = cgroup.Open(root, cgroup.Options{JobCPUs: cfg.CgroupJobCPUs}); err != nil {
+			return nil, "", "cgroup.Open(" + root + "): " + err.Error()
+		}
+		if os.Getenv("JUDGE_ENGINE_CGROUPS") == "1" {
+			deps.Cgroups = cg // every engine test below then runs under job cgroups
+		}
+	}
+	return &sandboxEnv{eng: judge.NewEngine(deps), deps: deps, cg: cg, cfg: cfg, work: work, tmp: tmp, bundles: bundles}, "", ""
 }
 
 func isDir(p string) bool {
@@ -1159,8 +1175,12 @@ func TestEngineCleanupDetached(t *testing.T) {
 		})
 
 		t.Run(tc.lang+"/control without the sweep", func(t *testing.T) {
-			noSweep := env.engineWith(func(d *judge.Deps) { d.Sweep = func(uint32) (int, error) { return 0, nil } })
-			t.Cleanup(func() { _, _ = sandbox.KillUID(uint32(slot0UID)) })
+			// No sweep and no cgroup: a job cgroup would end the stray at the job's end all the same.
+			noSweep := env.engineWith(func(d *judge.Deps) {
+				d.Sweep = func(uint32) (int, error) { return 0, nil }
+				d.Cgroups = nil
+			})
+			t.Cleanup(func() { _, _ = sandbox.KillSlot(uint32(slot0UID)) })
 			ctx, cancel := context.WithTimeout(context.Background(), judgeTimeout)
 			defer cancel()
 			out, err := noSweep.Judge(ctx, env.jobID(), env.request(row, src, env.bundle(t, ""), nil))
@@ -1172,8 +1192,8 @@ func TestEngineCleanupDetached(t *testing.T) {
 				t.Fatal("the program left no process behind, so the test above proves nothing")
 			}
 			t.Logf("without the sweep: %s outlived the job", describeProcs(left))
-			if _, err := sandbox.KillUID(uint32(slot0UID)); err != nil {
-				t.Errorf("KillUID: %v", err)
+			if _, err := sandbox.KillSlot(uint32(slot0UID)); err != nil {
+				t.Errorf("KillSlot: %v", err)
 			}
 		})
 

@@ -75,6 +75,7 @@ func (j *job) compile(ctx context.Context, c compileStep) (string, error) {
 	}
 
 	defer removeFile(c.logPath)
+	oomBefore := j.oomKills()
 	res, err := j.e.d.Runner(ctx, sandbox.Spec{
 		Argv:            argv,
 		Env:             j.env(c.cfg.Env, true),
@@ -89,10 +90,12 @@ func (j *job) compile(ctx context.Context, c compileStep) (string, error) {
 		MaxAddressSpace: addressSpace,
 		MaxStack:        maxStack,
 		MaxOutputBytes:  cfg.OutputFileCap,
-		MaxProcs:        maxProcs,
+		MaxProcs:        j.procsOfSharedUID(),
 		Seccomp:         sandbox.SeccompNone, // compilers fork and exec
+		Cgroup:          j.cgFile(),
 	})
 	j.sweep("compile")
+	res, err, _ = j.oomEnded(ctx, res, err, oomBefore) // a compile the job's memory.max ended reads as a compiler killed by SIGKILL
 	if err != nil {
 		return "", runnerFailure(ctx, "compile", err)
 	}

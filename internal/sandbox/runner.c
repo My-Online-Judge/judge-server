@@ -8,7 +8,8 @@
  * judge-runner: the sandbox shim. It stands between a contestant's program and
  * the host, so it is deliberately small and needs no capability beyond what the
  * judge-server container already has (CHOWN DAC_OVERRIDE FOWNER SETGID SETUID
- * KILL): no namespaces, no cgroups, no CAP_SYS_ADMIN.
+ * KILL): no namespaces, no CAP_SYS_ADMIN, and no cgroup of its own: the server puts the
+ * shim into the job's cgroup from outside (--wait-fd).
  *
  * Build it static (gcc -static ... -lseccomp). It runs as root until the
  * identity switch with the server-supplied environment, which a dynamic build
@@ -16,7 +17,11 @@
  *
  *   judge-runner --uid U --gid G [--groups G1,G2...] --cpu-ms N --real-ms N --as N --stack N
  *                --fsize N --nproc N [--seccomp c_cpp|general] [--exe PATH] [--chdir DIR]
- *                [--stdin P] [--stdout P] [--stderr P] -- argv...
+ *                [--stdin P] [--stdout P] [--stderr P] [--wait-fd N] -- argv...
+ *
+ * --wait-fd N: before it forks the program the shim reads one byte from fd N and closes
+ * it; EOF without a byte is an invalid-config report and nothing runs. The server uses
+ * it to move the shim into the job's cgroup first.
  *
  * Two processes, like qduoj's Judger: the shim (the "runner") forks the program
  * and wait4()s it, so the program's resource usage is its own. Were the program
@@ -121,6 +126,7 @@ struct config {
     const char *exe;
     const char *chdir_dir;
     const char *stdin_path, *stdout_path, *stderr_path;
+    int wait_fd; /* -1, or an fd to read one byte from before the program is forked */
     char **argv;
 };
 
@@ -173,6 +179,7 @@ static int parse_args(int argc, char **argv, struct config *c)
 
     memset(c, 0, sizeof(*c));
     c->stdin_path = c->stdout_path = c->stderr_path = "/dev/null";
+    c->wait_fd = -1;
 
     for (i = 1; i < argc; i++) {
         const char *flag = argv[i];
@@ -220,6 +227,10 @@ static int parse_args(int argc, char **argv, struct config *c)
             if (parse_u64(val, LLONG_MAX, &v) != 0) return -1;
             c->nproc = (long long)v;
             have |= HAVE_NPROC;
+        } else if (strcmp(flag, "--wait-fd") == 0) {
+            /* 0-3 are the standard streams and the report; the fd is the server's pipe */
+            if (parse_u64(val, 1023, &v) != 0 || v < 4) return -1;
+            c->wait_fd = (int)v;
         } else if (strcmp(flag, "--seccomp") == 0) {
             c->seccomp = val;
         } else if (strcmp(flag, "--exe") == 0) {
@@ -761,6 +772,24 @@ int main(int argc, char **argv)
     if (setpgid(0, 0) != 0 && getpgrp() != getpid()) {
         report(ERR_INVALID_CONFIG, 0, NULL, 0);
         return 255;
+    }
+
+    /* The server puts this process into the job's cgroup after it has started it, and
+     * writes one byte to say so: the program is forked only then, so it and everything
+     * it starts count against the job's limits from its first instruction. EOF with no
+     * byte means the server could not do it (or died): nothing runs. */
+    if (c.wait_fd >= 0) {
+        char go;
+        ssize_t r;
+
+        do {
+            r = read(c.wait_fd, &go, 1);
+        } while (r < 0 && errno == EINTR);
+        close(c.wait_fd);
+        if (r != 1) {
+            report(ERR_INVALID_CONFIG, 0, NULL, 0);
+            return 255;
+        }
     }
 
     if (pipe2(errpipe, O_CLOEXEC) != 0) {

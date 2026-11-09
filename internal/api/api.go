@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"github.com/My-Online-Judge/judge-server/internal/cgroup"
 	"github.com/My-Online-Judge/judge-server/internal/config"
 	"github.com/My-Online-Judge/judge-server/internal/judge"
 	"github.com/My-Online-Judge/judge-server/internal/sandbox"
@@ -66,6 +67,19 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 		return err
 	}
 
+	// The cgroups are checked here, with everything else, so that CGROUP_MODE=required never
+	// opens the port on a host that cannot give them (spec 14).
+	cgMode, err := cgroup.ParseMode(cfg.CgroupMode)
+	if err != nil {
+		return err
+	}
+	cgroups, err := cgroup.Setup(cgMode, cfg.CgroupRoot, cgroup.Options{
+		JobCPUs: cfg.CgroupJobCPUs, RootMemoryMax: cfg.CgroupRootMemoryMax, RootPidsMax: cfg.CgroupRootPidsMax, RootCPUMillis: cfg.CgroupRootCPUMillis,
+	})
+	if err != nil {
+		return err
+	}
+
 	runner := func(ctx context.Context, s sandbox.Spec) (sandbox.Result, error) {
 		return sandbox.Run(ctx, sandbox.DefaultRunnerPath, s)
 	}
@@ -80,6 +94,7 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 		Budget:     judge.NewBudget(cfg.RunPoolBudget),
 		Cfg:        cfg,
 		GoCache:    goCache,
+		Cgroups:    cgroups,
 	})
 	adm := NewAdmission(cfg.MaxJobs, cfg.MaxQueue)
 	gs := NewGRPCServer(tlsCfg, cfg, NewServer(cfg, eng, adm, version))
@@ -89,7 +104,8 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 		return fmt.Errorf("listen on %s: %w", cfg.Listen, err)
 	}
 	slog.Info("judge-server listening", "addr", lis.Addr().String(), "version", version,
-		"max_jobs", cfg.MaxJobs, "max_queue", cfg.MaxQueue, "token_required", cfg.Token != "")
+		"max_jobs", cfg.MaxJobs, "max_queue", cfg.MaxQueue, "token_required", cfg.Token != "",
+		"cgroup_isolation", cgroups != nil, "cgroup_mode", cfg.CgroupMode)
 	return RunGRPC(ctx, gs, lis, shutdownGrace)
 }
 

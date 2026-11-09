@@ -232,6 +232,7 @@ func (j *job) runProgram(ctx context.Context, name, in, outPath string) (sandbox
 	if !checkOnly {
 		addressSpace = Reservation(r.MaxMemory, false)
 	}
+	oomBefore := j.oomKills()
 	res, err := j.e.d.Runner(ctx, sandbox.Spec{
 		Argv:            argv,
 		Env:             j.env(r.Lang.Run.Env, false),
@@ -248,10 +249,19 @@ func (j *job) runProgram(ctx context.Context, name, in, outPath string) (sandbox
 		MaxOutputBytes:  cfg.OutputFileCap,
 		MaxProcs:        maxProcs,
 		Seccomp:         r.Lang.Run.SeccompRule,
+		Cgroup:          j.cgFile(),
 	})
 	j.sweep("run of case " + name)
+	// The job's cgroup went over memory.max while this run was going: a memory limit exceeded, as the
+	// shim's own measurement would say (the peak is raised above the limit so that Derive does; a time
+	// limit still wins over it). A concurrent case of the same job that was running at that moment is taken
+	// for the same reason: the job as a whole went over.
+	res, err, oom := j.oomEnded(ctx, res, err, oomBefore)
 	if err != nil {
 		return sandbox.Result{}, runnerFailure(ctx, "run case "+name, err)
+	}
+	if oom {
+		res.MemoryBytes = max(res.MemoryBytes, r.MaxMemory+1)
 	}
 	return res, nil
 }

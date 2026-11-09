@@ -71,6 +71,9 @@ func testConfig(t testing.TB, mat *testutil.TLSMaterial) config.Config {
 		CompileMessageCap: 64 << 10,
 		InlineInputCap:    1 << 20,
 		LogFormat:         "json",
+		CgroupMode:        "off",
+		CgroupRoot:        "/oj-cgroup",
+		CgroupJobCPUs:     1.5,
 	}
 }
 

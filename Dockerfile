@@ -25,7 +25,8 @@ ARG VERSION
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/judge-server ./cmd/judge-server \
  && go test -c -tags sandbox -o /out/sandbox.test ./internal/sandbox \
- && go test -c -tags sandbox -o /out/judge.test ./internal/judge
+ && go test -c -tags sandbox -o /out/judge.test ./internal/judge \
+ && go test -c -tags sandbox -o /out/cgroup.test ./internal/cgroup
 
 FROM ubuntu:22.04 AS builder-c
 RUN apt-get update \
@@ -77,8 +78,8 @@ FROM runtime AS test
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends strace procps libseccomp-dev \
  && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /opt/oj /tests/src/internal/judge
-COPY --from=builder-go /out/sandbox.test /out/judge.test /tests/
+ && mkdir -p /opt/oj /tests/src/internal/judge /tests/src/internal/cgroup /oj-cgroup
+COPY --from=builder-go /out/sandbox.test /out/judge.test /out/cgroup.test /tests/
 # The tests run in their package directory; TestRunUnresolvableDenyNameFailsClosed compiles runner.c from there.
 COPY internal/sandbox/runner.c /tests/src/internal/sandbox/runner.c
 COPY testdata /tests/testdata

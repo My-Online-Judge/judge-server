@@ -35,6 +35,7 @@ import (
 const (
 	uidCompiler = 12001
 	uidCode     = 12002
+	uidSPJ      = 12003
 )
 
 var (
@@ -1770,7 +1771,13 @@ int main(void)
 `
 
 // uidProcesses lists the processes whose real uid is uid, zombies included (what pgrep -U lists).
-func uidProcesses(uid uint32) []string {
+func uidProcesses(uid uint32) []string { return idProcesses("Uid:", uid) }
+
+// gidProcesses lists the processes whose real gid is gid, zombies included (what pgrep -G lists).
+func gidProcesses(gid uint32) []string { return idProcesses("Gid:", gid) }
+
+// idProcesses lists the processes whose real id on the given status line (Uid: or Gid:) is id.
+func idProcesses(field string, id uint32) []string {
 	var found []string
 	entries, _ := os.ReadDir("/proc")
 	for _, e := range entries {
@@ -1782,8 +1789,8 @@ func uidProcesses(uid uint32) []string {
 			continue
 		}
 		for _, line := range strings.Split(string(status), "\n") {
-			if rest, ok := strings.CutPrefix(line, "Uid:"); ok {
-				if f := strings.Fields(rest); len(f) > 0 && f[0] == strconv.FormatUint(uint64(uid), 10) {
+			if rest, ok := strings.CutPrefix(line, field); ok {
+				if f := strings.Fields(rest); len(f) > 0 && f[0] == strconv.FormatUint(uint64(id), 10) {
 					cmd, _ := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
 					found = append(found, e.Name()+" "+strings.ReplaceAll(strings.TrimRight(string(cmd), "\x00"), "\x00", " "))
 				}
@@ -1797,15 +1804,15 @@ func uidProcesses(uid uint32) []string {
 // sweepClean removes whatever processes of uid an earlier test left, and again when the test is over.
 func sweepClean(t *testing.T, uid uint32) {
 	t.Helper()
-	if _, err := KillUID(uid); err != nil {
-		t.Fatalf("KillUID(%d) before the test: %v", uid, err)
+	if _, err := KillSlot(uid); err != nil {
+		t.Fatalf("KillSlot(%d) before the test: %v", uid, err)
 	}
-	t.Cleanup(func() { _, _ = KillUID(uid) })
+	t.Cleanup(func() { _, _ = KillSlot(uid) })
 }
 
 // A background process that moved to a session of its own outlives Run (the group kill misses it);
-// KillUID ends it, and only the processes of that uid.
-func TestKillUIDEndsStrayProcesses(t *testing.T) {
+// KillSlot ends it, and only the processes of that uid.
+func TestKillSlotEndsStrayProcesses(t *testing.T) {
 	needRoot(t)
 	dir := newDir(t)
 	exe := compileC(t, dir, "stray", strayFixture)
@@ -1825,9 +1832,9 @@ func TestKillUIDEndsStrayProcesses(t *testing.T) {
 		}
 	}
 
-	killed, err := KillUID(uidCode)
+	killed, err := KillSlot(uidCode)
 	if err != nil || killed != 1 {
-		t.Fatalf("KillUID(%d) = %d, %v; want 1, nil", uidCode, killed, err)
+		t.Fatalf("KillSlot(%d) = %d, %v; want 1, nil", uidCode, killed, err)
 	}
 	if got := uidProcesses(uidCode); len(got) != 0 {
 		t.Fatalf("processes of uid %d after the sweep: %q", uidCode, got)
@@ -1835,17 +1842,61 @@ func TestKillUIDEndsStrayProcesses(t *testing.T) {
 	if got := uidProcesses(uidCompiler); len(got) != 1 {
 		t.Fatalf("a sweep of uid %d must leave uid %d alone, its processes = %q", uidCode, uidCompiler, got)
 	}
-	if killed, err := KillUID(uidCompiler); err != nil || killed != 1 {
-		t.Fatalf("KillUID(%d) = %d, %v; want 1, nil", uidCompiler, killed, err)
+	if killed, err := KillSlot(uidCompiler); err != nil || killed != 1 {
+		t.Fatalf("KillSlot(%d) = %d, %v; want 1, nil", uidCompiler, killed, err)
 	}
-	if killed, err := KillUID(uidCode); err != nil || killed != 0 {
+	if killed, err := KillSlot(uidCode); err != nil || killed != 0 {
 		t.Fatalf("a second sweep = %d, %v; want 0, nil", killed, err)
+	}
+}
+
+// A compile runs as the shared user "compiler" and a checker as "spj", both with the slot's gid. A stray of
+// theirs that moved to a session of its own is swept with the slot, whatever its uid, and only with its own
+// slot: the gid is what ties it to the job directory it could still read.
+func TestKillSlotEndsStraysOfTheSharedUsers(t *testing.T) {
+	needRoot(t)
+	dir := newDir(t)
+	exe := compileC(t, dir, "stray", strayFixture)
+	const slotA, slotB = 12100, 12101 // code0, code1: uid = gid
+	for _, id := range []uint32{slotA, slotB, uidCompiler, uidSPJ} {
+		sweepClean(t, id)
+	}
+	for _, c := range []struct{ uid, gid uint32 }{
+		{uidCompiler, slotA}, {uidSPJ, slotA}, {uidCompiler, slotB}, {slotA, slotA},
+	} {
+		s := execSpec(dir, exe, SeccompNone)
+		s.UID, s.GID = c.uid, c.gid
+		if c.uid == uidSPJ {
+			s.Groups = []uint32{uidSPJ}
+		}
+		if res := run(t, s); res.ExitCode != 0 || res.Signal != 0 || res.Error != 0 {
+			t.Fatalf("stray fixture as %d/%d: %+v", c.uid, c.gid, res)
+		}
+	}
+	if got := gidProcesses(slotA); len(got) != 3 {
+		t.Fatalf("before the sweep, processes with gid %d = %q, want 3 (compiler, spj, slot user)", slotA, got)
+	}
+	killed, err := KillSlot(slotA)
+	if err != nil || killed != 3 {
+		t.Fatalf("KillSlot(%d) = %d, %v; want 3, nil", slotA, killed, err)
+	}
+	if got := gidProcesses(slotA); len(got) != 0 {
+		t.Fatalf("processes with gid %d after the sweep: %q", slotA, got)
+	}
+	if got := uidProcesses(uidSPJ); len(got) != 0 {
+		t.Fatalf("the checker's stray survived a sweep of its slot: %q", got)
+	}
+	if got := uidProcesses(uidCompiler); len(got) != 1 {
+		t.Fatalf("a sweep of slot %d must leave the other slot's compile stray alone, uid %d has %q", slotA, uidCompiler, got)
+	}
+	if killed, err := KillSlot(slotB); err != nil || killed != 1 {
+		t.Fatalf("KillSlot(%d) = %d, %v; want 1, nil", slotB, killed, err)
 	}
 }
 
 // A run still going is not a stray: a sweep of its uid, started while it sleeps, ends only what a
 // finished run left behind, and the live run completes as if nothing happened.
-func TestKillUIDSparesLiveRuns(t *testing.T) {
+func TestKillSlotSparesLiveRuns(t *testing.T) {
 	needRoot(t)
 	needTool(t, "/bin/sleep")
 	dir := newDir(t)
@@ -1884,9 +1935,9 @@ func TestKillUIDSparesLiveRuns(t *testing.T) {
 		t.Fatalf("processes of uid %d = %q, want the live sleeper and the stray", uidCode, got)
 	}
 
-	killed, err := KillUID(uidCode)
+	killed, err := KillSlot(uidCode)
 	if err != nil || killed != 1 {
-		t.Fatalf("KillUID(%d) = %d, %v; want 1 (the stray), nil", uidCode, killed, err)
+		t.Fatalf("KillSlot(%d) = %d, %v; want 1 (the stray), nil", uidCode, killed, err)
 	}
 	if got := uidProcesses(uidCode); len(got) != 1 || !strings.Contains(got[0], "3.500123") {
 		t.Fatalf("after the sweep, processes of uid %d = %q, want only the live sleeper", uidCode, got)
@@ -1901,7 +1952,7 @@ func TestKillUIDSparesLiveRuns(t *testing.T) {
 		t.Fatal("the live run did not finish")
 	}
 	// Run is over: whatever is left of its session now is fair game, and nothing is registered.
-	if killed, err := KillUID(uidCode); err != nil || killed != 0 {
+	if killed, err := KillSlot(uidCode); err != nil || killed != 0 {
 		t.Fatalf("a sweep after the run = %d, %v; want 0, nil", killed, err)
 	}
 	live.Lock()

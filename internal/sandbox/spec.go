@@ -4,17 +4,21 @@
 // A run goes through the C shim (runner.c, installed as judge-runner). The Go
 // side in runner.go only starts the shim, enforces the wall-clock limit and
 // turns the shim's report into a Result; sweep.go keeps the registry of runs in
-// progress and kills what a run left behind (KillUID). See seccomp_rules.md for
+// progress and kills what a run left behind (KillSlot). See seccomp_rules.md for
 // the syscall filters the shim loads.
 package sandbox
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 )
+
+// waitFD is the shim's fd for the start barrier (--wait-fd): after fd 3, the report.
+const waitFD = 4
 
 // DefaultRunnerPath is where the image installs the C shim.
 const DefaultRunnerPath = "/usr/local/bin/judge-runner"
@@ -49,7 +53,7 @@ type Spec struct {
 	Env  []string // the program's whole environment (KEY=VALUE); the server's own is never inherited
 	Dir  string   // working directory, "" = leave as is
 
-	UID, GID uint32 // the identity the program runs as, never 0; KillUID(UID) ends what a run leaves behind
+	UID, GID uint32 // the identity the program runs as, never 0; KillSlot(GID) ends what a run leaves behind (the slot's uid and gid are one number)
 
 	// Groups are the program's supplementary groups, besides GID (at most 8, never
 	// 0); nil drops them all, the server's own included. The checker gets the spj
@@ -78,6 +82,15 @@ type Spec struct {
 	// Seccomp is the syscall filter: SeccompCCpp ("c_cpp"), SeccompGen
 	// ("general") or "" for none.
 	Seccomp string
+
+	// Cgroup, when set, is an open cgroup v2 directory the shim is moved into
+	// before it forks the program (Run writes its pid to cgroup.procs and then releases
+	// it, --wait-fd), so the program and everything it starts count against that
+	// cgroup's limits and die with it. The caller owns the file and keeps it open for
+	// the run. nil leaves the shim in the server's own cgroup. (CLONE_INTO_CGROUP would
+	// do it atomically, but the container runtimes' default seccomp profiles answer
+	// clone3 with ENOSYS.)
+	Cgroup *os.File
 
 	// ExePath is the path the shim passes to execve and the filters allow as
 	// the one permitted execve. "" means Argv[0].
@@ -120,7 +133,7 @@ func (s Spec) validate() error {
 // shimArgs builds the judge-runner command line for a validated Spec:
 //
 //	--uid U --gid G [--groups G1,G2...] --cpu-ms N --real-ms N --as N --stack N --fsize N --nproc N
-//	[--seccomp RULE] --exe PATH [--chdir DIR] --stdin P --stdout P --stderr P -- argv...
+//	[--seccomp RULE] [--wait-fd 4] --exe PATH [--chdir DIR] --stdin P --stdout P --stderr P -- argv...
 func shimArgs(s Spec) []string {
 	exe := s.ExePath
 	if exe == "" {
@@ -147,6 +160,9 @@ func shimArgs(s Spec) []string {
 	)
 	if s.Seccomp != SeccompNone {
 		args = append(args, "--seccomp", s.Seccomp)
+	}
+	if s.Cgroup != nil {
+		args = append(args, "--wait-fd", strconv.Itoa(waitFD))
 	}
 	args = append(args, "--exe", exe)
 	if s.Dir != "" {

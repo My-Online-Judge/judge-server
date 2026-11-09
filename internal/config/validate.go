@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"unicode"
@@ -61,6 +62,31 @@ func Validate(c Config) error {
 	// certificate, so the probe would fail on every run with a message about the certificate.
 	if strings.ContainsFunc(c.HealthcheckServerName, unicode.IsSpace) {
 		errs = append(errs, fmt.Errorf("HEALTHCHECK_SERVER_NAME must not contain whitespace, got %q", c.HealthcheckServerName))
+	}
+
+	// CGROUP_MODE needs a delegated cgroup v2 subtree to mean anything; off needs nothing.
+	switch c.CgroupMode {
+	case "off", "auto", "required":
+	default:
+		errs = append(errs, fmt.Errorf("CGROUP_MODE must be off, auto or required, got %q", c.CgroupMode))
+	}
+	if !filepath.IsAbs(c.CgroupRoot) {
+		errs = append(errs, fmt.Errorf("CGROUP_ROOT must be an absolute path, got %q", c.CgroupRoot))
+	}
+	if math.IsNaN(c.CgroupJobCPUs) || c.CgroupJobCPUs < 0 || c.CgroupJobCPUs > 1024 {
+		errs = append(errs, fmt.Errorf("CGROUP_JOB_CPUS must be a number from 0 (no per-job cpu.max) to 1024, got %v", c.CgroupJobCPUs))
+	} else if c.CgroupJobCPUs > 0 && c.CgroupJobCPUs < MinCgroupJobCPUs {
+		errs = append(errs, fmt.Errorf("CGROUP_JOB_CPUS must be 0 or at least %v, got %v: a quota of about one CPU throttles a single-threaded "+
+			"program that uses a whole CPU and distorts its measured CPU time", MinCgroupJobCPUs, c.CgroupJobCPUs))
+	}
+
+	for _, l := range []struct {
+		env string
+		v   int64
+	}{{"CGROUP_ROOT_MEMORY_MAX_BYTES", c.CgroupRootMemoryMax}, {"CGROUP_ROOT_PIDS_MAX", c.CgroupRootPidsMax}, {"CGROUP_ROOT_CPU_MILLIS", c.CgroupRootCPUMillis}} {
+		if l.v < 0 {
+			errs = append(errs, fmt.Errorf("%s must not be negative (0 leaves the host's limit), got %d", l.env, l.v))
+		}
 	}
 
 	if len(c.AllowedClients) == 0 {

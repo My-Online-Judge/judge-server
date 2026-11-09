@@ -1,13 +1,16 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"math"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -478,4 +481,81 @@ func TestRunGRPCGracefulStop(t *testing.T) {
 			t.Fatalf("stopped after %v, want about the 200 ms grace", took)
 		}
 	})
+}
+
+// CGROUP_MODE=required never falls back: a root that is not a cgroup v2 filesystem stops Serve before
+// the port opens, and the error says which setting asked for it.
+func TestServeRequiredCgroupsRefusesAHostWithoutThem(t *testing.T) {
+	quietLogs(t)
+	cfg := testConfig(t, testutil.TLS(t))
+	cfg.CgroupMode, cfg.CgroupRoot = "required", t.TempDir()
+	cfg.Listen = freeListen(t)
+	err := Serve(context.Background(), cfg, "v")
+	if err == nil {
+		t.Fatal("Serve started with CGROUP_MODE=required on a directory that is not a cgroup v2 filesystem")
+	}
+	for _, want := range []string{"CGROUP_MODE=required", cfg.CgroupRoot} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if l, lerr := net.Listen("tcp", cfg.Listen); lerr != nil {
+		t.Errorf("the port %s is taken: Serve listened although it refused", cfg.Listen)
+	} else {
+		l.Close()
+	}
+}
+
+// CGROUP_MODE=auto on the same host starts without cgroups and says so, once, with the reason.
+func TestServeAutoCgroupsFallsBackAndSaysWhy(t *testing.T) {
+	var logs syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	cfg := testConfig(t, testutil.TLS(t))
+	cfg.CgroupMode, cfg.CgroupRoot = "auto", t.TempDir()
+	cfg.Listen = freeListen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, cfg, "v-auto") }()
+	waitFor(t, "the server to pass its healthcheck", func() bool {
+		select {
+		case err := <-done:
+			t.Fatalf("Serve returned early: %v", err)
+		default:
+		}
+		return Healthcheck(cfg) == nil
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve = %v", err)
+	}
+	out := logs.String()
+	if n := strings.Count(out, "cgroup isolation is off"); n != 1 {
+		t.Errorf("the fallback warning appeared %d times, want once:\n%s", n, out)
+	}
+	for _, want := range []string{"level=WARN", "reason=", "is not a cgroup v2 filesystem", "cgroup_isolation=false"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log does not contain %q:\n%s", want, out)
+		}
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the server's goroutines and the test to share.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
