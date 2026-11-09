@@ -1,0 +1,481 @@
+package api
+
+import (
+	"context"
+	"math"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/My-Online-Judge/judge-server/internal/config"
+	"github.com/My-Online-Judge/judge-server/internal/judge"
+	"github.com/My-Online-Judge/judge-server/internal/testutil"
+)
+
+// freeListen returns a 127.0.0.1:port that was free a moment ago.
+func freeListen(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	return l.Addr().String()
+}
+
+func TestServeRefusesBadConfigBeforeTouchingDisk(t *testing.T) {
+	quietLogs(t)
+	mat := testutil.TLS(t)
+	work := filepath.Join(t.TempDir(), "work")
+
+	tests := map[string]func(*config.Config){
+		"empty allow-list": func(c *config.Config) { c.AllowedClients = nil },
+		"zero jobs":        func(c *config.Config) { c.MaxJobs = 0 },
+		"relative workdir": func(c *config.Config) { c.WorkDir = "work-should-not-exist" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := testConfig(t, mat)
+			cfg.WorkDir = work
+			mutate(&cfg)
+			if err := Serve(context.Background(), cfg, "v"); err == nil {
+				t.Fatal("Serve accepted the config")
+			}
+			for _, path := range []string{work, "work-should-not-exist"} {
+				if _, err := os.Stat(path); err == nil {
+					t.Fatalf("Serve created %s before it validated the config", path)
+				}
+			}
+		})
+	}
+}
+
+// The disk bound of spec 5.1a: MAX_JOBS x 8 cases at once x OUTPUT_FILE_CAP_BYTES + GOCACHE_CAP_BYTES
+// must fit in the work filesystem.
+func TestCheckWorkCapacity(t *testing.T) {
+	const mib = 1 << 20
+	cfg := func(jobs int, fileCap, goCache int64) config.Config {
+		return config.Config{WorkDir: "/work", MaxJobs: jobs, OutputFileCap: fileCap, GoCacheCap: goCache}
+	}
+	tests := []struct {
+		name  string
+		cfg   config.Config
+		total uint64
+		need  uint64 // what the check must compute
+		ok    bool
+	}{
+		{"the defaults fit the 512 MiB tmpfs", cfg(2, 16*mib, 128*mib), 512 * mib, 384 * mib, true},
+		{"the old 32 MiB cap would not", cfg(2, 32*mib, 128*mib), 512 * mib, 640 * mib, false},
+		{"exactly full is allowed", cfg(2, 16*mib, 128*mib), 384 * mib, 384 * mib, true},
+		{"one byte short is refused", cfg(2, 16*mib, 128*mib), 384*mib - 1, 384 * mib, false},
+		{"all eight jobs", cfg(8, 16*mib, 128*mib), 512 * mib, 1152 * mib, false},
+		{"one job", cfg(1, 16*mib, 128*mib), 512 * mib, 256 * mib, true},
+		{"the arithmetic does not wrap", cfg(8, math.MaxInt64, 128*mib), math.MaxUint64, math.MaxUint64, true},
+		{"nor does the sum", cfg(1, math.MaxInt64/8, math.MaxInt64), math.MaxUint64 - 1, uint64(math.MaxInt64/8)*8 + math.MaxInt64, true},
+		{"a carry in the sum saturates", cfg(1, 1<<61-1, 100*mib), math.MaxUint64, math.MaxUint64, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workBytesNeeded(tc.cfg); got != tc.need {
+				t.Errorf("workBytesNeeded = %d, want %d", got, tc.need)
+			}
+			err := checkWorkCapacity(tc.cfg, tc.total)
+			if tc.ok && err != nil {
+				t.Fatalf("checkWorkCapacity = %v, want it to fit", err)
+			}
+			if !tc.ok {
+				if err == nil {
+					t.Fatal("checkWorkCapacity accepted a configuration that does not fit")
+				}
+				// The message names the filesystem, its size, the size needed and every setting.
+				for _, want := range []string{"/work", "MAX_JOBS", "OUTPUT_FILE_CAP_BYTES", "GOCACHE_CAP_BYTES", itoa(tc.total), itoa(tc.need)} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not mention %q", err, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func itoa(n uint64) string { return strconv.FormatUint(n, 10) }
+
+// Serve checks the work filesystem after it has prepared it and before it opens the port.
+func TestServeRefusesAWorkDirThatCannotHoldTheOutputs(t *testing.T) {
+	quietLogs(t)
+	prev := fsTotal
+	t.Cleanup(func() { fsTotal = prev })
+	fsTotal = func(string) (uint64, error) { return 100 << 20, nil } // 100 MiB: far under 2 x 8 x 16 MiB + 128 MiB
+
+	cfg := testConfig(t, testutil.TLS(t))
+	cfg.OutputFileCap, cfg.GoCacheCap = 16<<20, 128<<20
+	cfg.Listen = freeListen(t)
+	err := Serve(context.Background(), cfg, "v")
+	if err == nil {
+		t.Fatal("Serve started on a work dir that is too small")
+	}
+	for _, want := range []string{cfg.WorkDir, "104857600", "402653184", "MAX_JOBS", "OUTPUT_FILE_CAP_BYTES"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if l, lerr := net.Listen("tcp", cfg.Listen); lerr != nil {
+		t.Errorf("the port %s is taken: Serve listened although it refused", cfg.Listen)
+	} else {
+		l.Close()
+	}
+
+	t.Run("a failing statfs stops it too", func(t *testing.T) {
+		fsTotal = func(string) (uint64, error) { return 0, os.ErrPermission }
+		if err := Serve(context.Background(), cfg, "v"); err == nil {
+			t.Fatal("Serve started although the filesystem size is unknown")
+		}
+	})
+}
+
+func TestServeRefusesMissingTLS(t *testing.T) {
+	quietLogs(t)
+	cfg := testConfig(t, testutil.TLS(t))
+	cfg.TLSDir = t.TempDir() // empty: no tls.crt, tls.key, ca.crt
+	cfg.WorkDir = filepath.Join(t.TempDir(), "work")
+	if err := Serve(context.Background(), cfg, "v"); err == nil {
+		t.Fatal("Serve started without TLS material")
+	}
+	if _, err := os.Stat(cfg.WorkDir); err == nil {
+		t.Fatal("Serve touched the work dir before it had TLS material")
+	}
+}
+
+// Serve and Healthcheck together: the server starts, answers its own probe over
+// mutual TLS with the token, refuses a wrong token, and stops on cancel.
+func TestServeAndHealthcheck(t *testing.T) {
+	quietLogs(t)
+	cfg := testConfig(t, testutil.TLS(t))
+	cfg.Listen = freeListen(t)
+
+	// Leftovers of a crashed run, which start-up must wipe.
+	for _, stale := range []string{"jobs/dead-job/src", "spj/v1"} {
+		if err := os.MkdirAll(filepath.Join(cfg.WorkDir, stale), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, cfg, "v-serve") }()
+
+	waitFor(t, "the server to pass its healthcheck", func() bool {
+		select {
+		case err := <-done:
+			t.Fatalf("Serve returned early: %v", err)
+		default:
+		}
+		return Healthcheck(cfg) == nil
+	})
+
+	wrong := cfg
+	wrong.Token = "not-the-token"
+	if err := Healthcheck(wrong); err == nil {
+		t.Error("Healthcheck passed with the wrong token")
+	}
+
+	for _, d := range []struct {
+		name string
+		mode os.FileMode
+	}{{"jobs", 0o711}, {"spj", 0o755}} {
+		entries, err := os.ReadDir(filepath.Join(cfg.WorkDir, d.name))
+		if err != nil || len(entries) != 0 {
+			t.Errorf("%s: entries %v, err %v; want an empty dir", d.name, entries, err)
+		}
+		if fi, err := os.Stat(filepath.Join(cfg.WorkDir, d.name)); err == nil && fi.Mode().Perm() != d.mode {
+			t.Errorf("%s mode = %v, want %v", d.name, fi.Mode().Perm(), d.mode)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve after cancel: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not stop after its context was cancelled")
+	}
+	if err := Healthcheck(cfg); err == nil {
+		t.Error("Healthcheck passed after the server stopped")
+	}
+}
+
+func TestHealthcheckFailures(t *testing.T) {
+	quietLogs(t)
+	mat := testutil.TLS(t)
+
+	t.Run("nothing listens", func(t *testing.T) {
+		cfg := testConfig(t, mat)
+		cfg.Listen = freeListen(t)
+		start := time.Now()
+		if err := Healthcheck(cfg); err == nil {
+			t.Fatal("Healthcheck passed with no server")
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Fatalf("Healthcheck took %v, want an answer within its 3 s deadline", d)
+		}
+	})
+	t.Run("bad listen address", func(t *testing.T) {
+		for _, listen := range []string{"garbage", ":", ":0", ":notaport", ":70000"} {
+			cfg := testConfig(t, mat)
+			cfg.Listen = listen
+			if err := Healthcheck(cfg); err == nil {
+				t.Errorf("Healthcheck accepted LISTEN=%q", listen)
+			}
+		}
+	})
+	t.Run("no TLS material", func(t *testing.T) {
+		cfg := testConfig(t, mat)
+		cfg.TLSDir = t.TempDir()
+		if err := Healthcheck(cfg); err == nil {
+			t.Fatal("Healthcheck passed without client certificate")
+		}
+	})
+}
+
+// On k3s the host name is the pod's, which is in no certificate SAN: HEALTHCHECK_SERVER_NAME names the
+// SAN to verify instead. The certificate has the SAN judge-server and not the (stood-in) host name.
+func TestHealthcheckServerName(t *testing.T) {
+	r := startRig(t, rigOptions{})
+	cfg := r.cfg // TLS dir and token of the rig
+	cfg.Listen = r.addr
+
+	prev := hostName
+	t.Cleanup(func() { hostName = prev })
+	hostName = func() (string, error) { return "judge-server-7d9f8b6c5-xk2lq", nil }
+
+	t.Run("by default the host name is verified, and it is in no SAN", func(t *testing.T) {
+		wantNameMismatch(t, Healthcheck(cfg))
+	})
+	t.Run("the configured name is verified instead", func(t *testing.T) {
+		cfg := cfg
+		cfg.HealthcheckServerName = testutil.ServerName // "judge-server", a SAN
+		if err := Healthcheck(cfg); err != nil {
+			t.Fatalf("Healthcheck with HEALTHCHECK_SERVER_NAME=%s: %v", cfg.HealthcheckServerName, err)
+		}
+	})
+	t.Run("the configured name wins over a host name that would pass", func(t *testing.T) {
+		hostName = func() (string, error) { return testutil.ServerName, nil }
+		cfg := cfg
+		cfg.HealthcheckServerName = "not-in-the-certificate"
+		wantNameMismatch(t, Healthcheck(cfg))
+	})
+	t.Run("the host name is not looked up when the name is configured", func(t *testing.T) {
+		hostName = func() (string, error) { return "", os.ErrNotExist }
+		cfg := cfg
+		cfg.HealthcheckServerName = testutil.ServerName
+		if err := Healthcheck(cfg); err != nil {
+			t.Fatalf("Healthcheck failed on the host name lookup although the name is configured: %v", err)
+		}
+		cfg.HealthcheckServerName = ""
+		if err := Healthcheck(cfg); err == nil {
+			t.Fatal("Healthcheck passed although the host name could not be read")
+		}
+	})
+}
+
+// wantNameMismatch fails unless err is the TLS client's refusal of a server certificate that is not valid for the
+// name asked for (and not, say, a refused connection, which would make the passing cases above vacuous).
+func wantNameMismatch(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Healthcheck passed for a name that is not in the certificate")
+	}
+	if !strings.Contains(err.Error(), "certificate is valid for") {
+		t.Fatalf("Healthcheck failed, but not on the certificate name: %v", err)
+	}
+}
+
+func TestHealthcheckPort(t *testing.T) {
+	for listen, want := range map[string]string{":8080": "8080", "0.0.0.0:9": "9", "[::]:443": "443", "127.0.0.1:65535": "65535"} {
+		got, err := healthcheckPort(listen)
+		if err != nil || got != want {
+			t.Errorf("healthcheckPort(%q) = %q, %v; want %q", listen, got, err, want)
+		}
+	}
+}
+
+func TestPrepareWorkDir(t *testing.T) {
+	t.Run("creates the layout", func(t *testing.T) {
+		work := filepath.Join(t.TempDir(), "a", "work")
+		if err := PrepareWorkDir(work); err != nil {
+			t.Fatalf("PrepareWorkDir: %v", err)
+		}
+		for name, mode := range map[string]os.FileMode{"": 0o755, "jobs": 0o711, "spj": 0o755} {
+			fi, err := os.Stat(filepath.Join(work, name))
+			if err != nil || !fi.IsDir() || fi.Mode().Perm() != mode {
+				t.Errorf("%q: %v, %v; want a dir with mode %v", name, fi, err, mode)
+			}
+		}
+	})
+	t.Run("wipes stale state, keeps the Go cache, tightens the root", func(t *testing.T) {
+		work := t.TempDir()
+		for _, p := range []string{"jobs/j1/src/main.c", "spj/v1/spj", "gocache/entry"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(work, p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(work, p), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chmod(work, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := PrepareWorkDir(work); err != nil {
+			t.Fatalf("PrepareWorkDir: %v", err)
+		}
+		for _, p := range []string{"jobs/j1", "spj/v1"} {
+			if _, err := os.Stat(filepath.Join(work, p)); err == nil {
+				t.Errorf("%s survived the start-up wipe", p)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(work, "gocache", "entry")); err != nil {
+			t.Errorf("the Go cache was wiped: %v", err)
+		}
+		if fi, _ := os.Stat(work); fi.Mode().Perm() != 0o755 {
+			t.Errorf("work dir mode = %v, want 0755 (not writable by the run users)", fi.Mode().Perm())
+		}
+	})
+	t.Run("never follows a symlink out of the work dir", func(t *testing.T) {
+		work, outside := t.TempDir(), t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "keep"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(work, "jobs")); err != nil {
+			t.Fatal(err)
+		}
+		if err := PrepareWorkDir(work); err != nil {
+			t.Fatalf("PrepareWorkDir: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
+			t.Errorf("the symlink target was wiped: %v", err)
+		}
+		if fi, err := os.Lstat(filepath.Join(work, "jobs")); err != nil || !fi.IsDir() {
+			t.Errorf("jobs = %v, %v; want a real directory", fi, err)
+		}
+	})
+}
+
+func TestPrepareTmpDir(t *testing.T) {
+	t.Run("creates the layout", func(t *testing.T) {
+		tmp := filepath.Join(t.TempDir(), "a", "tmp")
+		if err := PrepareTmpDir(tmp); err != nil {
+			t.Fatalf("PrepareTmpDir: %v", err)
+		}
+		for name, mode := range map[string]os.FileMode{"": 0o711, "jobs": 0o711} {
+			fi, err := os.Stat(filepath.Join(tmp, name))
+			if err != nil || !fi.IsDir() || fi.Mode().Perm() != mode {
+				t.Errorf("%q: %v, %v; want a dir with mode %v", name, fi, err, mode)
+			}
+		}
+	})
+	t.Run("wipes stale jobs, keeps the rest, tightens a 0777 root", func(t *testing.T) {
+		tmp := t.TempDir()
+		for _, p := range []string{"jobs/j1/scratch", "other/file"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(tmp, p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tmp, p), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chmod(tmp, 0o777); err != nil { // what a k3s emptyDir starts as
+			t.Fatal(err)
+		}
+		if err := PrepareTmpDir(tmp); err != nil {
+			t.Fatalf("PrepareTmpDir: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(tmp, "jobs", "j1")); err == nil {
+			t.Error("jobs/j1 survived the start-up wipe")
+		}
+		if _, err := os.Stat(filepath.Join(tmp, "other", "file")); err != nil {
+			t.Errorf("a file outside jobs/ was wiped: %v", err)
+		}
+		if fi, _ := os.Stat(tmp); fi.Mode().Perm() != 0o711 {
+			t.Errorf("tmp dir mode = %v, want 0711 (only root writes there)", fi.Mode().Perm())
+		}
+	})
+	t.Run("never follows a symlink out of the tmp dir", func(t *testing.T) {
+		tmp, outside := t.TempDir(), t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "keep"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(tmp, "jobs")); err != nil {
+			t.Fatal(err)
+		}
+		if err := PrepareTmpDir(tmp); err != nil {
+			t.Fatalf("PrepareTmpDir: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
+			t.Errorf("the symlink target was wiped: %v", err)
+		}
+		if fi, err := os.Lstat(filepath.Join(tmp, "jobs")); err != nil || !fi.IsDir() {
+			t.Errorf("jobs = %v, %v; want a real directory", fi, err)
+		}
+	})
+}
+
+// A bounded graceful stop: a call that finishes in time is answered, one that
+// does not is cut when the grace ends.
+func TestRunGRPCGracefulStop(t *testing.T) {
+	run := func(t *testing.T, grace time.Duration, finishAfter time.Duration) (rpcErr error, stopped time.Duration) {
+		t.Helper()
+		entered, unblock := make(chan struct{}, 1), make(chan struct{})
+		r := newRig(t, rigOptions{judger: judgerFunc(func(ctx context.Context, _ string, _ judge.Request) (judge.Outcome, error) {
+			entered <- struct{}{}
+			select {
+			case <-unblock:
+			case <-ctx.Done():
+				return judge.Outcome{}, ctx.Err()
+			}
+			return judge.Outcome{Cases: []judge.CaseResult{{Name: "1"}}}, nil
+		})})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		served := make(chan error, 1)
+		go func() { served <- RunGRPC(ctx, r.gs, r.lis, grace) }()
+
+		rpc := make(chan error, 1)
+		go func() { _, err := r.judge(t, validRequest()); rpc <- err }()
+		<-entered
+
+		start := time.Now()
+		cancel()
+		if finishAfter > 0 {
+			time.AfterFunc(finishAfter, func() { close(unblock) })
+		}
+		if err := <-served; err != nil {
+			t.Fatalf("RunGRPC: %v", err)
+		}
+		return <-rpc, time.Since(start)
+	}
+
+	t.Run("a call that finishes inside the grace is answered", func(t *testing.T) {
+		err, took := run(t, 5*time.Second, 100*time.Millisecond)
+		if err != nil {
+			t.Fatalf("in-flight call: %v", err)
+		}
+		if took > 3*time.Second {
+			t.Fatalf("stopped after %v, want soon after the call ended", took)
+		}
+	})
+	t.Run("a call that outlasts the grace is cut", func(t *testing.T) {
+		err, took := run(t, 200*time.Millisecond, 0)
+		if err == nil {
+			t.Fatal("the stuck call was answered")
+		}
+		if took < 150*time.Millisecond || took > 5*time.Second {
+			t.Fatalf("stopped after %v, want about the 200 ms grace", took)
+		}
+	})
+}
