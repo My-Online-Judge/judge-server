@@ -1,5 +1,7 @@
 # E2E Runbook — Kafka Judge Microservice (Task 12)
 
+> **Legacy:** this runbook was written for the qduoj stack and its `docker-compose.yml`, which has been removed from this repo. For the current stack use `judge-deployment/docker-compose.yml`. The `docker compose` commands below no longer run as written.
+
 Kiểm chứng end-to-end luồng mới: `submit → submission.requested (Kafka) → judge-worker → judge-server → submission.judged (Kafka) → judge-api cập nhật DB → SSE đẩy verdict`.
 
 Chạy thủ công khi bạn có: Docker, một Postgres cho judge-api, và một JWT hợp lệ. Đánh dấu **[ENV]** ở những bước phụ thuộc môi trường của bạn.

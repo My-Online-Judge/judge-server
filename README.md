@@ -225,5 +225,5 @@ nothing. `:main` is the image the compose file pulls (`OJ_SANDBOX_TAG`, default 
 
 ## Legacy files
 
-`docker-compose.yml` and `generate_info.py` at the repository root are artefacts of the qduoj container this server
-replaces; they are kept here for the owner to remove.
+`generate_info.py` at the repository root is an artefact of the qduoj container this server replaces; it is kept
+here for the owner to remove. The old qduoj `docker-compose.yml` is gone: use `judge-deployment/docker-compose.yml`.
