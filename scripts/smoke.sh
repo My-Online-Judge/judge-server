@@ -48,8 +48,9 @@ docker image ls "$IMAGE" --format 'image {{.Repository}}:{{.Tag}}  {{.ID}}  size
 step "throw-away PKI (server names: judge-server, localhost, $NAME)"
 docker run --rm -v "$ROOT":/src -v judge-server-gomod:/go/pkg/mod -v "$tls":/tls -w /src \
   -e GOFLAGS=-mod=mod -e GOCACHE=/tmp/gocache "$GO_IMAGE" \
-  go run ./internal/testutil/cmd/mktls /tls "$NAME"
-chmod a+r "$tls"/*   # the grpcurl container runs as another user than the one that wrote them
+  sh -c 'go run ./internal/testutil/cmd/mktls /tls "$1" && chmod a+rx /tls && chmod a+r /tls/*' sh "$NAME"
+# The chmod is done there, as root, because the files are root's: on a Linux host the user running this script cannot
+# chmod them, and mktemp made $tls 0700. The grpcurl container runs as another user (uid 100) and has to read them.
 
 step "start $NAME"
 docker network create "$NET" >/dev/null
