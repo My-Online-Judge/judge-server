@@ -1,0 +1,13 @@
+// CI copy of judge-deployment/sandbox/java.policy, the Java security-manager policy that docker compose mounts at
+// /opt/oj/java.policy. scripts/sandbox-test.sh needs it for TestEngineJavaWithPolicy (the CI job `sandbox` passes this file as
+// JAVA_POLICY). Everything below this comment block is the original, byte for byte: update this copy whenever the original changes.
+
+// What a Java submission may do under the security manager (the java row's run command names this file). The image's
+// own /etc/java_policy grants less: it breaks fast I/O on FileDescriptor.in and any System.getProperty. These three
+// add no reach: only the standard streams exist as FileDescriptors without reflection, and properties name the JVM.
+// Keep this file to that: no file, socket, process, reflection or class loader permission.
+grant {
+    permission java.lang.RuntimePermission "readFileDescriptor";
+    permission java.lang.RuntimePermission "writeFileDescriptor";
+    permission java.util.PropertyPermission "*", "read";
+};

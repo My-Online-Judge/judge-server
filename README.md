@@ -188,8 +188,37 @@ headers). `judge-server:test` adds about 35 MB (`strace`, `procps`, `libseccomp-
 Everything above was run on arm64 (Docker Desktop on Apple Silicon, kernel 7.0 `linuxkit`). **x86_64 is not verified**:
 the seccomp filters resolve syscalls by name for the native architecture, so one source serves both, but the x86_64 build
 has only been checked by name resolution, not by running it, and an amd64 image under emulation on an Apple Silicon Mac
-cannot load an x86_64 filter (it is judged against the host kernel's numbers). The first real x86_64 check is the VPS:
-run `scripts/sandbox-test.sh` there.
+cannot load an x86_64 filter (it is judged against the host kernel's numbers). The first real x86_64 check is the `sandbox`
+job of the CI below (an x86_64 GitHub runner), or `scripts/sandbox-test.sh` on the VPS.
+
+## CI
+
+`.github/workflows/ci.yml` (GitHub Actions) runs on every pull request and on every push to `main`. A newer push to a pull
+request cancels the run in flight; a push to `main` never does.
+
+| Job | Runs | What it proves |
+|---|---|---|
+| `unit` | `gofmt -l cmd internal`, `go vet ./...` and `go test ./...` in `golang:1.23` | the code is formatted and vets clean; the unit tests pass (fake runner, nothing needs root) |
+| `sandbox` | `scripts/sandbox-test.sh` on an `ubuntu-latest` (x86_64) runner | every `sandbox`-tagged test (shim, engine, corpus) passes in the test image with the production privileges and no skip. This is the first x86_64 run of the seccomp filters: they were only ever run on arm64 before |
+| `smoke` | `scripts/smoke.sh` | the runtime image starts the way compose starts it, over mutual TLS, and answers Ping, a C++ and a Java `Judge`, the healthcheck, and ends with exit status 0 on `docker stop` |
+| `image` | needs the three jobs above: builds `--target release`, checks the entrypoint and that every toolchain and `judge-runner` exist, scans with Trivy (a CRITICAL vulnerability with a fix fails the build), then publishes | the image that ships is the one that was built, checked and scanned |
+
+Two fixtures are copies of files that live in other repositories, because CI checks out this repository alone. A copy is
+updated in the same change as its source:
+
+| Copy | Source | Used by |
+|---|---|---|
+| `testdata/java.policy` | `judge-deployment/sandbox/java.policy` (compose mounts it at `/opt/oj/java.policy`) | `sandbox`, as `JAVA_POLICY` (`TestEngineJavaWithPolicy`) |
+| `testdata/proto/judge_server.proto` | `oj-common/src/main/proto/judge_server.proto` | `smoke`, as `PROTO_DIR` (grpcurl) |
+
+Each copy starts with a `//` comment block that says so and then holds the original unchanged. `internal/pb` is generated from
+the original with `make proto`; CI does not check it against the copy.
+
+Publishing happens only on a push to `main`, after the four jobs pass. It needs two repository secrets, `DOCKERHUB_USERNAME`
+and `DOCKERHUB_TOKEN` (used by the login step only). It pushes `docker.io/thanhtuanle/judge-server:<commit sha>` and
+`docker.io/thanhtuanle/judge-server:main`, both multi-arch (`linux/amd64` and `linux/arm64`). A pull request builds, checks and
+scans the image and pushes nothing. `:main` is the image the compose file pulls (`OJ_SANDBOX_TAG`, default `main`) and the
+k3s manifests pull.
 
 ## Legacy files
 

@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes the run in flight; a push to main is never cancelled, so every
+# commit on main is built and published.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: docker.io/thanhtuanle/judge-server
+
+jobs:
+  # Unit tests of the packages: the fake runner, nothing needs root or the toolchains.
+  unit:
+    runs-on: ubuntu-latest
+    container: golang:1.23
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Not `gofmt -l .`: testdata/ holds the programs the engine tests judge, one of them (corpus/go/ce.go) is invalid
+      # Go on purpose, and gofmt exits 2 on it (the step runs under `bash -e`). go vet and go test skip testdata/ too.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt: these files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  # Every sandbox-tagged test in the test image, with the production privileges and no skips. This is the first
+  # run of the seccomp filters on x86_64 (everything before was arm64).
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Sandbox tests (testdata/java.policy is the CI copy of judge-deployment's)
+        run: JAVA_POLICY="$PWD/testdata/java.policy" scripts/sandbox-test.sh
+
+  # The runtime image started the way compose starts it, over mutual TLS: Ping, Judge, healthcheck, `docker stop`.
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Smoke test (testdata/proto is the CI copy of oj-common's proto, for grpcurl)
+        run: PROTO_DIR="$PWD/testdata/proto" scripts/smoke.sh
+
+  image:
+    needs: [unit, sandbox, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        run: >-
+          docker build --target release
+          --label org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:main" .
+
+      # Deliberately no "runs as uid 10001" step (the judge-worker has one): the sandbox runs as root by design. The
+      # server chowns each job's directories, and the shim switches to the slot's uid (12100-12107) before it runs a
+      # submission. The container is confined by its six capabilities, no-new-privileges and a read-only root, not by its uid.
+      - name: Entrypoint is tini, then judge-server
+        run: >-
+          test "$(docker inspect -f '{{json .Config.Entrypoint}}' "$IMAGE:${{ github.sha }}")"
+          = '["/usr/bin/tini","-s","--","/usr/local/bin/judge-server"]'
+
+      - name: Toolchains and the runner exist
+        run: |
+          docker run --rm --entrypoint sh "$IMAGE:${{ github.sha }}" -c '
+            for f in /usr/bin/gcc /usr/bin/g++ /usr/bin/javac /usr/bin/java /usr/bin/python /usr/bin/python3 /usr/bin/go /usr/bin/node /usr/bin/php /usr/local/bin/judge-runner /usr/local/bin/judge-server; do
+              test -x "$f" || { echo "missing $f"; exit 1; }
+            done'
+
+      - name: Trivy (CRITICAL with a fix fails the build)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The image above (amd64) is the one tested and scanned. What is pushed is built again for amd64 and arm64, so the
+      # same tag runs on the server and on an Apple-silicon laptop. Unlike the judge-worker's, this Dockerfile has no
+      # native build stage: the arm64 half (apt, the Go build, gcc) runs under QEMU and is slow.
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        name: Push the multi-arch image
+        run: >-
+          docker buildx build --platform linux/amd64,linux/arm64
+          --label org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          --push -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:main" --target release .

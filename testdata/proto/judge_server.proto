@@ -1,0 +1,149 @@
+// CI copy of oj-common/src/main/proto/judge_server.proto (oj-common 6d2b881), for scripts/smoke.sh, whose grpcurl needs the proto
+// (the CI job `smoke` passes this directory as PROTO_DIR). Everything below this comment block is the original, byte for byte:
+// it must track oj-common's proto, so update this copy whenever that file changes. The Go stubs in internal/pb are generated
+// from the original with `make proto` (it reads ../oj-common, not this copy).
+
+// Internal API of the judge sandbox (Go judge-server), called by the Python judge-worker and run-worker.
+// Port 8080, sandbox-net only. Callers are authenticated by mutual TLS: the server requires a CA-signed client certificate and
+// admits only the peer CNs in JUDGE_ALLOWED_CLIENTS (PERMISSION_DENIED otherwise). `Ping` is exempt from the CN allow-list
+// (any certificate signed by the CA may call it) but still requires the token; `Judge` requires both.
+// The service token (metadata `x-judge-server-token`, whose value is the sha256 hex digest of the shared TOKEN, not the token
+// itself) is optional and additive: when TOKEN is set, every call must carry it too.
+syntax = "proto3";
+
+package oj.judge.v1;
+
+option go_package = "github.com/My-Online-Judge/judge-server/internal/pb/judgev1;judgev1";
+option java_package = "vn.thanhtuanle.oj.common.grpc.judge.v1";
+option java_multiple_files = true;
+
+service JudgeServer {
+  // Compiles and runs one submission against a test-case set. Judge outcomes are payload (see JudgeResponse); the server
+  // returns these gRPC status codes only for the failures below.
+  // UNAUTHENTICATED: token metadata missing or wrong.
+  // PERMISSION_DENIED: client CN not in the allow-list.
+  // INVALID_ARGUMENT: malformed request: unknown seccomp rule, src_name/exe_name absolute, containing `..`, or resolving
+  // outside the job dir (a relative sub-path such as `__pycache__/x.pyc` is fine), test_case_id not `<slug>__<hash>`,
+  // empty command, inline input over the cap.
+  // NOT_FOUND: the bundle directory or its `info` does not exist.
+  // RESOURCE_EXHAUSTED: running_jobs == MAX_JOBS and the wait queue (MAX_QUEUE) is full; the client should try the next
+  // sandbox and not mark this one down.
+  // UNAVAILABLE, INTERNAL: server not up, TLS handshake failed, judger failure before any case ran.
+  // DEADLINE_EXCEEDED (client-side): the client's deadline passed while the sandbox judges. The server observes the call's
+  // context: when the client goes away it kills the running children, frees the slot and discards the job.
+  rpc Judge(JudgeRequest) returns (JudgeResponse);
+  // Judge, streamed: the same request, the same checks and the same status codes, but each case's result is sent as it
+  // is judged (JudgeEvent.case, in finishing order, not bundle order), then exactly one JudgeEvent.done carrying the
+  // whole JudgeResponse the unary call would have returned (its cases in bundle order). A compile error sends only
+  // `done`. A call that fails sends no `done`: the stream ends with the status code instead, and the client must not
+  // use the cases it has seen (the next sandbox judges from scratch). Added 2026-11-08 so the portal can show the test
+  // ladder fill live; `Judge` stays for callers that do not need it (the run lane).
+  rpc JudgeStream(JudgeRequest) returns (stream JudgeEvent);
+  // Health and load probe for the worker's sandbox registry.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+// One message of a JudgeStream: a case as it finishes, or the final answer.
+message JudgeEvent {
+  oneof event {
+    CaseResult case = 1; // a case just judged; `output` is empty here (it travels once, in `done`)
+    JudgeResponse done = 2; // the last message of the stream
+  }
+}
+
+message JudgeRequest {
+  string src = 1;
+  LanguageConfig language_config = 2;
+  int32 max_cpu_time_ms = 3;
+  int64 max_memory_bytes = 4;
+  bool output = 5; // include each case's (capped) output in the response
+  oneof cases {
+    string test_case_id = 6; // "<slug>__<hash>": a bundle under /test_case
+    InlineTestCases test_case = 7; // a Run: cases carried in the request
+  }
+  Checker spj = 8; // absent when the problem has no checker
+}
+
+message LanguageConfig {
+  CompileConfig compile = 1;
+  RunConfig run = 2;
+}
+
+message CompileConfig {
+  string src_name = 1;
+  string exe_name = 2;
+  int32 max_cpu_time_ms = 3;
+  int32 max_real_time_ms = 4;
+  int64 max_memory_bytes = 5;
+  string compile_command = 6;
+  repeated string env = 7;
+}
+
+message RunConfig {
+  string command = 1;
+  string seccomp_rule = 2;
+  repeated string env = 3;
+  bool memory_limit_check_only = 4;
+}
+
+message InlineTestCases {
+  repeated InlineTestCase cases = 1;
+}
+
+message InlineTestCase {
+  string input = 1;
+  string output = 2;
+}
+
+message Checker {
+  string version = 1;
+  string src = 2;
+  CompileConfig compile = 3;
+  string exe_name = 4;
+  string command = 5;
+  string seccomp_rule = 6;
+}
+
+// Judge outcomes are payload, never gRPC errors: a compile error, a wrong answer and a crashed program are results of the
+// submission, so they travel here. gRPC status codes are reserved for failures of the call itself (see JudgeServer.Judge).
+message JudgeResponse {
+  oneof outcome {
+    CaseResults results = 1; // one CaseResult per case, in bundle order
+    CompileError compile_error = 2; // the submission does not compile
+    CompileError spj_compile_error = 3; // the problem's checker does not compile
+  }
+}
+
+message CaseResults {
+  repeated CaseResult cases = 1;
+}
+
+message CaseResult {
+  string test_case = 1; // the case name: "1", "2", ...
+  int32 result = 2; // -1 WA, 0 AC, 1 CPU TLE, 2 real TLE, 3 MLE, 4 RE, 5 SE
+  int32 error = 3; // 0, or a judger error code (e.g. -11 when the checker fails)
+  int64 cpu_time_ms = 4;
+  int64 real_time_ms = 5;
+  int64 memory_bytes = 6;
+  int32 signal = 7;
+  int32 exit_code = 8;
+  string output_md5 = 9; // md5 of the stripped output the judge compared
+  bytes output = 10; // first `OUTPUT_RESPONSE_CAP_BYTES` (server config), default 64 KiB, of the program's stdout; empty when !output
+  bool output_truncated = 11;
+}
+
+message CompileError {
+  string message = 1; // compiler output, capped
+}
+
+message PingRequest {}
+
+message PingResponse {
+  string hostname = 1;
+  string judger_version = 2;
+  int32 cpu_core = 3;
+  double cpu = 4; // usage percentage
+  double memory = 5; // usage percentage
+  int32 running_jobs = 6; // load signal for the registry
+  int32 max_jobs = 7;
+}
