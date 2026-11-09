@@ -66,14 +66,17 @@ jobs:
   image:
     needs: [unit, sandbox, smoke]
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # VERSION is stamped into the binary (main.version, reported by Ping as judger_version): the commit.
       - name: Build image
         run: >-
           docker build --target release
+          --build-arg VERSION=${{ github.sha }}
           --label org.opencontainers.image.source=https://github.com/${{ github.repository }}
           -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:main" .
 
@@ -114,10 +117,11 @@ jobs:
 
       # The image above (amd64) is the one tested and scanned. What is pushed is built again for amd64 and arm64, so the
       # same tag runs on the server and on an Apple-silicon laptop. Unlike the judge-worker's, this Dockerfile has no
-      # native build stage: the arm64 half (apt, the Go build, gcc) runs under QEMU and is slow.
+      # native build stage: the arm64 half (apt, the Go build, gcc) runs under QEMU and is slow (the job's timeout-minutes).
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         name: Push the multi-arch image
         run: >-
           docker buildx build --platform linux/amd64,linux/arm64
+          --build-arg VERSION=${{ github.sha }}
           --label org.opencontainers.image.source=https://github.com/${{ github.repository }}
           --push -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:main" --target release .

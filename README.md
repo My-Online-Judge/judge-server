@@ -216,8 +216,9 @@ the original with `make proto`; CI does not check it against the copy.
 
 Publishing happens only on a push to `main`, after the four jobs pass. It needs two repository secrets, `DOCKERHUB_USERNAME`
 and `DOCKERHUB_TOKEN` (used by the login step only). It pushes `docker.io/thanhtuanle/judge-server:<commit sha>` and
-`docker.io/thanhtuanle/judge-server:main`, both multi-arch (`linux/amd64` and `linux/arm64`). A pull request builds, checks and
-scans the image and pushes nothing. `:main` is the image the compose file pulls (`OJ_SANDBOX_TAG`, default `main`) and the
+`docker.io/thanhtuanle/judge-server:main`, both multi-arch (`linux/amd64` and `linux/arm64`). Both builds pass
+`--build-arg VERSION=<commit sha>`, so `Ping` reports the commit as `judger_version`. The `image` job is bounded at 90 minutes
+(the arm64 half runs under QEMU). A pull request builds, checks and scans the image and pushes nothing. `:main` is the image the compose file pulls (`OJ_SANDBOX_TAG`, default `main`) and the
 k3s manifests pull.
 
 ## Legacy files
