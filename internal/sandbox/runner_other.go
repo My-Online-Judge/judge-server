@@ -14,5 +14,5 @@ func Run(_ context.Context, _ string, _ Spec) (Result, error) {
 	return Result{}, fmt.Errorf("sandbox: running programs is not supported on %s", runtime.GOOS)
 }
 
-// KillUID has nothing to do where Run starts no program.
-func KillUID(uint32) (int, error) { return 0, nil }
+// KillSlot has nothing to do where Run starts no program.
+func KillSlot(uint32) (int, error) { return 0, nil }

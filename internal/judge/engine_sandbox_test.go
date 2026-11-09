@@ -1160,7 +1160,7 @@ func TestEngineCleanupDetached(t *testing.T) {
 
 		t.Run(tc.lang+"/control without the sweep", func(t *testing.T) {
 			noSweep := env.engineWith(func(d *judge.Deps) { d.Sweep = func(uint32) (int, error) { return 0, nil } })
-			t.Cleanup(func() { _, _ = sandbox.KillUID(uint32(slot0UID)) })
+			t.Cleanup(func() { _, _ = sandbox.KillSlot(uint32(slot0UID)) })
 			ctx, cancel := context.WithTimeout(context.Background(), judgeTimeout)
 			defer cancel()
 			out, err := noSweep.Judge(ctx, env.jobID(), env.request(row, src, env.bundle(t, ""), nil))
@@ -1172,8 +1172,8 @@ func TestEngineCleanupDetached(t *testing.T) {
 				t.Fatal("the program left no process behind, so the test above proves nothing")
 			}
 			t.Logf("without the sweep: %s outlived the job", describeProcs(left))
-			if _, err := sandbox.KillUID(uint32(slot0UID)); err != nil {
-				t.Errorf("KillUID: %v", err)
+			if _, err := sandbox.KillSlot(uint32(slot0UID)); err != nil {
+				t.Errorf("KillSlot: %v", err)
 			}
 		})
 

@@ -41,8 +41,9 @@ What a job owns is closed to every other slot, with the slot's gid as the key (`
   into HotSpot, `TMPDIR` does not move it) and runs without it; `TestEngineJavaTmpRootClosed` and the smoke test judge
   Java under exactly that.
 - After every compile, run and checker run, and when a job ends or is cancelled (before its directories are removed), the
-  server kills every process whose uid is the slot's (`sandbox.KillUID`, a `/proc` sweep): a child that left its run's
-  session with `setsid` dies with the job, and `RLIMIT_NPROC` is per slot. The sweep spares the sessions of runs still in
+  server kills every process whose uid or gid is the slot's (`sandbox.KillSlot`, a `/proc` sweep; a compile and a checker run as
+  the shared users `compiler` and `spj` but with the slot's gid): a child that left its run's
+  session with `setsid` dies with the job, and `RLIMIT_NPROC` is per slot for runs. The sweep spares the sessions of runs still in
   progress. What it kills is reaped by the image's own init (`tini` is PID 1, see Image), so no `init: true` or
   `docker run --init` is needed.
 - Disk: a run's stderr goes to `/dev/null` (it never affects the verdict; a compile's and a checker's stderr are still

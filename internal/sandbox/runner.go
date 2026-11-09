@@ -52,7 +52,7 @@ const resultGrace = 250 * time.Millisecond
 // child still starting up, never reports), when ctx is done, and once more when
 // the shim has exited, to take along anything the program left behind. While
 // the run is in progress the shim's pid is in the live-session registry that
-// KillUID consults, so a sweep leaves alone whatever is still in the session of
+// KillSlot consults, so a sweep leaves alone whatever is still in the session of
 // a run in progress; a process that left the session with setsid is outside it
 // and is swept. A run the backstop killed has RealTimeMs = max(measured,
 // MaxRealTimeMs+1), Signal = SIGKILL and no CPU time or memory: the program died
@@ -78,7 +78,7 @@ func Run(ctx context.Context, runnerPath string, s Spec) (Result, error) {
 	cmd.ExtraFiles = []*os.File{pw} // fd 3 in the shim: the report
 	// A session leader is also a process group leader, so -pid is the group the
 	// kills below reach, and the pid is the session id of everything the run
-	// starts (see KillUID). Setpgid must not be set as well: setpgid fails for a
+	// starts (see KillSlot). Setpgid must not be set as well: setpgid fails for a
 	// session leader.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 

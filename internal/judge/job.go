@@ -148,12 +148,12 @@ type Outcome struct {
 
 // Deps is what an Engine needs. A zero Runner runs sandbox.Run through
 // RunnerPath (default sandbox.DefaultRunnerPath), a zero Sweep is
-// sandbox.KillUID, a zero Now is time.Now and a nil Budget is a new one of
+// sandbox.KillSlot, a zero Now is time.Now and a nil Budget is a new one of
 // Cfg.RunPoolBudget, which is only right when this Engine is the one judging: the
 // budget must be shared by every job. GoCache may be nil (no shared Go build
 // cache). Cfg.TmpDir is where each job's run TMPDIR is made.
 //
-// Sweep kills the processes of a uid that no live run owns (see sandbox.KillUID)
+// Sweep kills the processes of a uid that no live run owns (see sandbox.KillSlot)
 // and says how many it killed. The engine calls it with the slot's uid after
 // every run, compile and checker and when a job ends. A test that must not touch
 // the real processes of the machine passes its own.
@@ -193,7 +193,7 @@ func NewEngine(d Deps) *Engine {
 		}
 	}
 	if d.Sweep == nil {
-		d.Sweep = sandbox.KillUID
+		d.Sweep = sandbox.KillSlot
 	}
 	if d.Budget == nil {
 		d.Budget = NewBudget(d.Cfg.RunPoolBudget)
@@ -391,10 +391,11 @@ func (j *job) bundleName() string {
 // slotID is the uid and the gid of the slot's user (code<slot>).
 func (j *job) slotID() uint32 { return SlotUIDBase + uint32(j.req.Slot) }
 
-// sweep kills what the job left running under its slot's uid (a process that
-// moved out of its run's session, which the run's own group kill cannot reach,
+// sweep kills what the job left running under its slot's id, as a uid or a gid (the
+// compile and the checker run as the shared users compiler and spj, but with the
+// slot's gid): a process that moved out of its run's session, which the run's own group kill cannot reach,
 // or a grandchild of the run that the group kill signalled and that had not
-// finished dying yet) and logs it, at Info, when it killed any. The sweep cannot
+// finished dying yet, and logs it, at Info, when it killed any. The sweep cannot
 // tell the two apart, so the line is no sign of an escape by itself. what says
 // after which step it ran.
 func (j *job) sweep(what string) {

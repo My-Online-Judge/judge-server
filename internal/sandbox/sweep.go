@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// sweepBound is how long KillUID keeps sweeping until no process of the uid is
+// sweepBound is how long KillSlot keeps sweeping until no process of the slot is
 // left; sweepPause is the wait between two passes.
 const (
 	sweepBound = time.Second
@@ -54,28 +54,35 @@ func endLive(pid int) {
 	delete(live.pids, pid)
 }
 
-// KillUID kills, with SIGKILL, every process whose real uid is uid and that is
-// not in the session of a live run (see live), and sweeps again until none is
-// left, zombies included, or until about a second has passed (then the error
-// says how many are still there). It returns how many distinct processes it
-// signalled (a zombie is not counted: there is nothing left to kill). It
-// refuses uid 0. The judge engine calls it with a job slot's run uid after every
-// compile, run and checker run, and when the job ends or is cancelled (spec 5.1a): a
-// process that moved to a session of its own (setsid) escaped the run's group kill,
-// and this is what ends it.
+// KillSlot kills, with SIGKILL, every process whose real uid is id or whose
+// real gid is id and that is not in the session of a live run (see live), and
+// sweeps again until none is left, zombies included, or until about a second has
+// passed (then the error says how many are still there). It returns how many
+// distinct processes it signalled (a zombie is not counted: there is nothing left
+// to kill). It refuses id 0. The judge engine calls it with a job slot's id (the
+// slot's uid and gid are the same number, SlotUIDBase+slot) after every compile,
+// run and checker run, and when the job ends or is cancelled (spec 5.1a). A
+// process that moved to a session of its own (setsid) escaped the run's group
+// kill, and this is what ends it. The gid is matched as well as the uid because a
+// compile runs as the shared user "compiler" and a checker as "spj", but both with
+// the slot's gid: a stray of theirs has the slot's gid, and with it the group
+// access to the next job's directory on that slot. A process cannot change its
+// real gid without CAP_SETGID, so the gid is a mark it cannot shed.
 //
 // A process is signalled through a descriptor of its /proc directory
 // (pidfd_send_signal), opened before its status is read, so a pid that is
-// reused in between is never signalled. On a kernel or seccomp profile without
-// pidfd_send_signal it falls back to kill(2).
-func KillUID(uid uint32) (killed int, err error) {
-	if uid == 0 {
+// reused in between is never signalled. Where the kernel does not take that
+// descriptor, signalProc asks for a pidfd of the pid and checks the process is
+// still the one read; on a kernel or seccomp profile without pidfds at all it
+// falls back to kill(2).
+func KillSlot(id uint32) (killed int, err error) {
+	if id == 0 {
 		return 0, errors.New("sandbox: refusing to sweep uid 0")
 	}
 	deadline := time.Now().Add(sweepBound)
 	signalled := map[int]struct{}{} // a process that takes a moment to die is signalled again, counted once
 	for {
-		left, sweepErr := sweepOnce(uid, signalled)
+		left, sweepErr := sweepOnce(id, signalled)
 		killed = len(signalled)
 		if sweepErr != nil {
 			return killed, sweepErr
@@ -84,18 +91,18 @@ func KillUID(uid uint32) (killed int, err error) {
 			return killed, nil
 		}
 		if time.Now().After(deadline) {
-			return killed, fmt.Errorf("sandbox: %d processes of uid %d still there after %v", left, uid, sweepBound)
+			return killed, fmt.Errorf("sandbox: %d processes of slot id %d still there after %v", left, id, sweepBound)
 		}
 		time.Sleep(sweepPause)
 	}
 }
 
 // sweepOnce is one pass over /proc, holding the registry lock. It signals every
-// process of uid outside a live session (a zombie too: a zombie group leader can
+// process of uid or gid id outside a live session (a zombie too: a zombie group leader can
 // still have running threads, and a signal to a true zombie is a no-op), adds
 // the pid of each non-zombie it signalled to signalled, and returns how many
-// processes of uid outside a live session it found at all (left).
-func sweepOnce(uid uint32, signalled map[int]struct{}) (left int, err error) {
+// processes of the slot outside a live session it found at all (left).
+func sweepOnce(id uint32, signalled map[int]struct{}) (left int, err error) {
 	live.Lock()
 	defer live.Unlock()
 	entries, err := os.ReadDir("/proc")
@@ -113,7 +120,7 @@ func sweepOnce(uid uint32, signalled map[int]struct{}) (left int, err error) {
 			continue // gone already
 		}
 		p, ok := readProc(dirfd)
-		if ok && p.uid == uid {
+		if ok && (p.uid == id || p.gid == id) {
 			if _, inRun := live.pids[p.sid]; !inRun {
 				left++
 				if signalProc(dirfd, pid) == nil && !p.zombie {
@@ -129,12 +136,13 @@ func sweepOnce(uid uint32, signalled map[int]struct{}) (left int, err error) {
 // procInfo is what a sweep needs to know about one process.
 type procInfo struct {
 	uid    uint32 // real uid (what RLIMIT_NPROC counts)
+	gid    uint32 // real gid (the mark of a job slot, whatever uid its compiler or checker has)
 	sid    int    // session id, in the server's pid namespace
 	zombie bool
 }
 
 // readProc reads the process behind dirfd (an open /proc/<pid> directory): the
-// real uid from status, the state and session from stat. ok is false when the
+// real uid and gid from status, the state and session from stat. ok is false when the
 // process went away or a file could not be parsed.
 func readProc(dirfd int) (procInfo, bool) {
 	status, err := readAt(dirfd, "status")
@@ -142,22 +150,23 @@ func readProc(dirfd int) (procInfo, bool) {
 		return procInfo{}, false
 	}
 	var p procInfo
-	haveUID := false
+	haveUID, haveGID := false, false
 	for _, line := range bytes.Split(status, []byte("\n")) {
 		if rest, ok := bytes.CutPrefix(line, []byte("Uid:")); ok {
-			f := bytes.Fields(rest)
-			if len(f) == 0 {
+			u, ok := firstID(rest)
+			if !ok {
 				return procInfo{}, false
 			}
-			u, err := strconv.ParseUint(string(f[0]), 10, 32)
-			if err != nil {
+			p.uid, haveUID = u, true
+		} else if rest, ok := bytes.CutPrefix(line, []byte("Gid:")); ok {
+			g, ok := firstID(rest)
+			if !ok {
 				return procInfo{}, false
 			}
-			p.uid, haveUID = uint32(u), true
-			break
+			p.gid, haveGID = g, true
 		}
 	}
-	if !haveUID {
+	if !haveUID || !haveGID {
 		return procInfo{}, false
 	}
 	stat, err := readAt(dirfd, "stat")
@@ -183,6 +192,19 @@ func readProc(dirfd int) (procInfo, bool) {
 	return p, true
 }
 
+// firstID parses the first number of a Uid: or Gid: line (the real id).
+func firstID(rest []byte) (uint32, bool) {
+	f := bytes.Fields(rest)
+	if len(f) == 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(string(f[0]), 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(n), true
+}
+
 // readAt reads a small /proc file relative to dirfd.
 func readAt(dirfd int, name string) ([]byte, error) {
 	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_CLOEXEC, 0)
@@ -194,14 +216,55 @@ func readAt(dirfd int, name string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, 64<<10))
 }
 
-// signalProc sends SIGKILL to the process behind dirfd. A /proc/<pid> directory
-// descriptor is a pidfd for pidfd_send_signal (Linux 5.1+); where that call is
-// missing or refused by the container's seccomp profile, kill(2) by pid is the
-// fallback.
+// The calls signalProc makes, as variables so a test can make the kernel refuse them.
+var (
+	pidfdSend = unix.PidfdSendSignal
+	pidfdOpen = unix.PidfdOpen
+	killPid   = syscall.Kill
+)
+
+// signalProc sends SIGKILL to the process behind dirfd, an open /proc/<pid>
+// directory. pidfd_send_signal takes that descriptor (pidfd_send_signal(2) lists
+// opening /proc/<pid> as a way to get a pid descriptor). Where it does not (EBADF),
+// or where the call is missing or refused by the container's seccomp profile
+// (ENOSYS, EPERM), signalProc opens a real pidfd with pidfd_open(pid); pid reuse
+// cannot have slipped in, because the process dirfd names is still readable after
+// the pidfd was opened, and a pid is not reused while its process exists, a
+// zombie included. Where pidfds are missing altogether, kill(2) by pid is the
+// last resort, after the same check; its window between the check and the kill is
+// the one thing this path cannot close.
 func signalProc(dirfd, pid int) error {
-	err := unix.PidfdSendSignal(dirfd, unix.SIGKILL, nil, 0)
-	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) {
-		return syscall.Kill(pid, syscall.SIGKILL)
+	err := pidfdSend(dirfd, unix.SIGKILL, nil, 0)
+	if !pidfdRefused(err) {
+		return err
 	}
-	return err
+	pidfd, err := pidfdOpen(pid, 0)
+	if err == nil {
+		defer unix.Close(pidfd)
+		if !sameProcess(dirfd) {
+			return unix.ESRCH
+		}
+		err = pidfdSend(pidfd, unix.SIGKILL, nil, 0)
+		if !pidfdRefused(err) {
+			return err
+		}
+	} else if !pidfdRefused(err) {
+		return err
+	}
+	if !sameProcess(dirfd) {
+		return unix.ESRCH
+	}
+	return killPid(pid, syscall.SIGKILL)
+}
+
+// pidfdRefused is whether err says this kernel, or this container's seccomp
+// profile, does not take the pidfd call or that descriptor.
+func pidfdRefused(err error) bool {
+	return errors.Is(err, unix.EBADF) || errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM)
+}
+
+// sameProcess is whether the process behind dirfd still exists (a zombie does).
+func sameProcess(dirfd int) bool {
+	_, err := readAt(dirfd, "stat")
+	return err == nil
 }

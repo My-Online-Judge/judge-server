@@ -4,7 +4,7 @@
 // A run goes through the C shim (runner.c, installed as judge-runner). The Go
 // side in runner.go only starts the shim, enforces the wall-clock limit and
 // turns the shim's report into a Result; sweep.go keeps the registry of runs in
-// progress and kills what a run left behind (KillUID). See seccomp_rules.md for
+// progress and kills what a run left behind (KillSlot). See seccomp_rules.md for
 // the syscall filters the shim loads.
 package sandbox
 
@@ -49,7 +49,7 @@ type Spec struct {
 	Env  []string // the program's whole environment (KEY=VALUE); the server's own is never inherited
 	Dir  string   // working directory, "" = leave as is
 
-	UID, GID uint32 // the identity the program runs as, never 0; KillUID(UID) ends what a run leaves behind
+	UID, GID uint32 // the identity the program runs as, never 0; KillSlot(GID) ends what a run leaves behind (the slot's uid and gid are one number)
 
 	// Groups are the program's supplementary groups, besides GID (at most 8, never
 	// 0); nil drops them all, the server's own included. The checker gets the spj

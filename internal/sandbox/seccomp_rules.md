@@ -169,15 +169,17 @@ Not seccomp, but part of the same boundary, each with a test:
   pid is the session and process group id of everything the program starts without calling `setsid` itself. When a run
   ends `Run` kills that group. A process that did call `setsid` is outside the group and the session of its shim: it
   survives the run (under `""`, and a `fork` the filter does not deny), counts against `RLIMIT_NPROC` of its uid and
-  may keep working. `KillUID(uid)` in `sweep.go` is the answer: it walks `/proc` and SIGKILLs, through a descriptor
-  of the process's `/proc` directory (`pidfd_send_signal`, `kill` where that is refused), every process whose real
-  uid is `uid` and whose session is not the pid of a live shim (`Run` keeps that registry; a pass holds its lock, so a
+  may keep working. `KillSlot(id)` in `sweep.go` is the answer: it walks `/proc` and SIGKILLs, through a descriptor
+  of the process's `/proc` directory (`pidfd_send_signal`; where that is refused, through a `pidfd_open` pidfd after checking the
+  process is the one read; `kill` where pidfds are missing), every process whose real
+  uid or real gid is `id` (a compile and a checker run as the shared users `compiler` and `spj` with the slot's gid, which is what
+  ties a stray of theirs to the job directory it could still read) and whose session is not the pid of a live shim (`Run` keeps that registry; a pass holds its lock, so a
   process of a run that is just starting is never seen unregistered), and repeats until none is left, zombies
-  included, or about a second has passed. It refuses uid 0. The judge engine calls it with a job slot's uid after every
+  included, or about a second has passed. It refuses id 0. The judge engine calls it with a job slot's id after every
   compile, run and checker run and when the job ends or is cancelled (spec section 5.1a); a run of the same uid still going
   is not touched, so two concurrent runs of one uid are protected from each other's sweep, not from each other's processes.
-  Every job has a uid of its own (`code0`..`code7`), so in practice only the cases of one job share one. `TestKillUIDEndsStrayProcesses`,
-  `TestKillUIDSparesLiveRuns`, `TestKillUIDRefusesRoot`, `TestReadProc`.
+  Every job has a uid of its own (`code0`..`code7`), so in practice only the cases of one job share one. `TestKillSlotEndsStrayProcesses`,
+  `TestKillSlotEndsStraysOfTheSharedUsers`, `TestKillSlotSparesLiveRuns`, `TestKillSlotRefusesRoot`, `TestReadProc`, `TestSignalProcFallbacks`.
 - **The program dies with the runner** (`PR_SET_PDEATHSIG` SIGKILL, set after `setuid` because a credential change
   clears it, before the filter is loaded, with a `getppid()` check against the race). Under `""` a program may leave the
   runner's process group with `setsid`/`setpgid`, which the server's group kill (cancellation, and the backstop below)
