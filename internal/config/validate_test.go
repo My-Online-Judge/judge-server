@@ -37,6 +37,21 @@ func TestValidateAcceptsZeroQueue(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsCgroupModes(t *testing.T) {
+	for _, mode := range []string{"off", "auto", "required"} {
+		cfg := validConfig(t)
+		cfg.CgroupMode = mode
+		if err := Validate(cfg); err != nil {
+			t.Errorf("Validate(CgroupMode=%q) = %v", mode, err)
+		}
+	}
+	cfg := validConfig(t)
+	cfg.CgroupJobCPUs = 0 // no cpu.max
+	if err := Validate(cfg); err != nil {
+		t.Errorf("Validate(CgroupJobCPUs=0) = %v", err)
+	}
+}
+
 func TestValidateAcceptsHealthcheckServerName(t *testing.T) {
 	for _, name := range []string{"", "judge-server", "judge-server.oj.svc.cluster.local"} {
 		cfg := validConfig(t)
@@ -76,6 +91,12 @@ func TestValidateRejects(t *testing.T) {
 		{"test case dir with a tab", func(c *Config) { c.TestCaseDir = "/test\tcase" }, "TEST_CASE_DIR"},
 		{"healthcheck server name with a space", func(c *Config) { c.HealthcheckServerName = "judge server" }, "HEALTHCHECK_SERVER_NAME"},
 		{"healthcheck server name with a tab", func(c *Config) { c.HealthcheckServerName = "judge-server\t" }, "HEALTHCHECK_SERVER_NAME"},
+		{"unknown cgroup mode", func(c *Config) { c.CgroupMode = "on" }, "CGROUP_MODE"},
+		{"relative cgroup root", func(c *Config) { c.CgroupRoot = "oj-cgroup" }, "CGROUP_ROOT"},
+		{"negative cgroup cpus", func(c *Config) { c.CgroupJobCPUs = -1 }, "CGROUP_JOB_CPUS"},
+		{"a one-CPU job quota", func(c *Config) { c.CgroupJobCPUs = 1 }, "CGROUP_JOB_CPUS"},
+		{"a tiny job quota", func(c *Config) { c.CgroupJobCPUs = 0.5 }, "CGROUP_JOB_CPUS"},
+		{"huge cgroup cpus", func(c *Config) { c.CgroupJobCPUs = 5000 }, "CGROUP_JOB_CPUS"},
 		{"no allowed clients", func(c *Config) { c.AllowedClients = []string{} }, "JUDGE_ALLOWED_CLIENTS"},
 		{"nil allowed clients", func(c *Config) { c.AllowedClients = nil }, "JUDGE_ALLOWED_CLIENTS"},
 		{"blank allowed client", func(c *Config) { c.AllowedClients = []string{"judge-worker", " "} }, "JUDGE_ALLOWED_CLIENTS"},

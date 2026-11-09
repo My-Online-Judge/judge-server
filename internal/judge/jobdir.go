@@ -3,6 +3,7 @@ package judge
 import (
 	"errors"
 	"fmt"
+	"github.com/My-Online-Judge/judge-server/internal/cgroup"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -55,6 +56,8 @@ type job struct {
 	runTmp                             string // <TMP_DIR>/jobs/<id>
 	srcPath, exePath                   string
 
+	cg *cgroup.Job // the job's cgroup, nil without Deps.Cgroups
+
 	pool int // cases run at once, set by runCases
 
 	spjDir, spjExe string // set by ensureChecker
@@ -92,10 +95,19 @@ func (e *Engine) newJob(id string, r *Request) (*job, error) {
 	j.srcPath = filepath.Join(j.srcDir, r.Lang.Compile.SrcName)
 	j.exePath = filepath.Join(j.srcDir, r.Lang.Compile.ExeName)
 
+	if e.d.Cgroups != nil {
+		cg, err := e.d.Cgroups.NewJob(id, e.cgroupLimits(r))
+		if err != nil {
+			return nil, fmt.Errorf("create the job's cgroup (is job id %q in use?): %w", id, err)
+		}
+		j.cg = cg
+	}
 	if err := os.Mkdir(j.dir, 0o710); err != nil {
+		j.closeCgroup()
 		return nil, fmt.Errorf("create job dir (is job id %q in use?): %w", id, err)
 	}
 	if err := j.prepareDirs(); err != nil {
+		j.closeCgroup()
 		j.remove()
 		return nil, err
 	}
@@ -168,6 +180,7 @@ func (j *job) remove() {
 // another job.
 func (j *job) finish() {
 	j.sweep("job end")
+	j.closeCgroup() // everything the job's cgroup still holds, a compiler's or a checker's stray included
 	j.remove()
 }
 

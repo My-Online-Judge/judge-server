@@ -246,6 +246,7 @@ func (j *job) runChecker(ctx context.Context, n, name, in, userOut string) (resu
 	chkOut, chkErr := filepath.Join(j.outDir, n+".chk.out"), filepath.Join(j.outDir, n+".chk.err")
 	defer removeFile(chkOut)
 	defer removeFile(chkErr)
+	oomBefore := j.oomKills()
 	res, err := j.e.d.Runner(ctx, sandbox.Spec{
 		Argv:            argv,
 		Env:             []string{"TMPDIR=" + j.runTmp, envPath},
@@ -260,10 +261,12 @@ func (j *job) runChecker(ctx context.Context, n, name, in, userOut string) (resu
 		MaxAddressSpace: spjMemory,
 		MaxStack:        maxStack,
 		MaxOutputBytes:  cfg.OutputFileCap,
-		MaxProcs:        maxProcs,
+		MaxProcs:        j.procsOfSharedUID(),
 		Seccomp:         ck.SeccompRule,
+		Cgroup:          j.cgFile(),
 	})
 	j.sweep("checker of case " + name)
+	res, err, _ = j.oomEnded(ctx, res, err, oomBefore) // a checker the job's memory.max ended is a checker killed by SIGKILL: a system error
 	if err != nil {
 		return 0, 0, runnerFailure(ctx, "run checker for case "+name, err)
 	}

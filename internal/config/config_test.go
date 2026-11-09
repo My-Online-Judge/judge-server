@@ -33,6 +33,9 @@ func TestLoadDefaults(t *testing.T) {
 		CompileMessageCap: 65536,
 		InlineInputCap:    1048576,
 		LogFormat:         "json",
+		CgroupMode:        "off",
+		CgroupRoot:        "/oj-cgroup",
+		CgroupJobCPUs:     1.5,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("defaults mismatch\n got: %+v\nwant: %+v", got, want)
@@ -82,5 +85,22 @@ func TestLoadRejectsBadInt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "MAX_JOBS") {
 		t.Errorf("error %q does not name MAX_JOBS", err)
+	}
+}
+
+func TestLoadCgroupSettings(t *testing.T) {
+	got, err := Load(envOf(map[string]string{"CGROUP_MODE": "required", "CGROUP_ROOT": "/sys/fs/cgroup/oj", "CGROUP_JOB_CPUS": "1.5"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.CgroupMode != "required" || got.CgroupRoot != "/sys/fs/cgroup/oj" || got.CgroupJobCPUs != 1.5 {
+		t.Errorf("cgroup settings = %q %q %v", got.CgroupMode, got.CgroupRoot, got.CgroupJobCPUs)
+	}
+	got, err = Load(envOf(map[string]string{"CGROUP_JOB_CPUS": "0"}))
+	if err != nil || got.CgroupJobCPUs != 0 {
+		t.Errorf("CGROUP_JOB_CPUS=0: %v, %v; want 0 (no cpu.max)", got.CgroupJobCPUs, err)
+	}
+	if _, err := Load(envOf(map[string]string{"CGROUP_JOB_CPUS": "lots"})); err == nil || !strings.Contains(err.Error(), "CGROUP_JOB_CPUS") {
+		t.Errorf("Load(CGROUP_JOB_CPUS=lots) = %v; want an error naming it", err)
 	}
 }

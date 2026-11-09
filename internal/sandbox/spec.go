@@ -11,10 +11,14 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 )
+
+// waitFD is the shim's fd for the start barrier (--wait-fd): after fd 3, the report.
+const waitFD = 4
 
 // DefaultRunnerPath is where the image installs the C shim.
 const DefaultRunnerPath = "/usr/local/bin/judge-runner"
@@ -79,6 +83,15 @@ type Spec struct {
 	// ("general") or "" for none.
 	Seccomp string
 
+	// Cgroup, when set, is an open cgroup v2 directory the shim is moved into
+	// before it forks the program (Run writes its pid to cgroup.procs and then releases
+	// it, --wait-fd), so the program and everything it starts count against that
+	// cgroup's limits and die with it. The caller owns the file and keeps it open for
+	// the run. nil leaves the shim in the server's own cgroup. (CLONE_INTO_CGROUP would
+	// do it atomically, but the container runtimes' default seccomp profiles answer
+	// clone3 with ENOSYS.)
+	Cgroup *os.File
+
 	// ExePath is the path the shim passes to execve and the filters allow as
 	// the one permitted execve. "" means Argv[0].
 	ExePath string
@@ -120,7 +133,7 @@ func (s Spec) validate() error {
 // shimArgs builds the judge-runner command line for a validated Spec:
 //
 //	--uid U --gid G [--groups G1,G2...] --cpu-ms N --real-ms N --as N --stack N --fsize N --nproc N
-//	[--seccomp RULE] --exe PATH [--chdir DIR] --stdin P --stdout P --stderr P -- argv...
+//	[--seccomp RULE] [--wait-fd 4] --exe PATH [--chdir DIR] --stdin P --stdout P --stderr P -- argv...
 func shimArgs(s Spec) []string {
 	exe := s.ExePath
 	if exe == "" {
@@ -147,6 +160,9 @@ func shimArgs(s Spec) []string {
 	)
 	if s.Seccomp != SeccompNone {
 		args = append(args, "--seccomp", s.Seccomp)
+	}
+	if s.Cgroup != nil {
+		args = append(args, "--wait-fd", strconv.Itoa(waitFD))
 	}
 	args = append(args, "--exe", exe)
 	if s.Dir != "" {

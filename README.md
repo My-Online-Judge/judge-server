@@ -92,9 +92,39 @@ the three TLS files, or with an empty client list; it never listens in plaintext
 | `OUTPUT_RESPONSE_CAP_BYTES` | `65536` (64 KiB) | output per case returned when the request asks for it |
 | `COMPILE_MESSAGE_CAP_BYTES` | `65536` (64 KiB) | compiler output returned in a compile error |
 | `INLINE_INPUT_CAP_BYTES` | `1048576` (1 MiB) | total input of a Run's inline cases |
+| `CGROUP_MODE` | `off` | job cgroups (spec 14): `off`; `auto` uses them when the host delegated a usable cgroup v2 subtree and otherwise runs as `off` with one WARN line that says why; `required` refuses to start without them and never falls back |
+| `CGROUP_ROOT` | `/oj-cgroup` | the delegated cgroup v2 subtree, mounted read-write (see Job cgroups); absolute |
+| `CGROUP_JOB_CPUS` | `1.5` | `cpu.max` of a job's cgroup, in CPUs; `0` sets none; below `1.25` is refused (see Job cgroups) |
 | `LOG_FORMAT` | `json` | `json` or text (any other value) |
 
 The `mock` subcommand also reads `MOCK_SLOW_SECONDS` (default `3`).
+
+## Job cgroups
+
+With `CGROUP_MODE` `auto` or `required` every job gets a cgroup v2 of its own, `<CGROUP_ROOT>/job-<id>`, and every program of the job
+(its compile, the checker's compile and runs, and the submission's runs) starts in it: the runner shim is moved in by the server and
+only then released to fork the program (`--wait-fd`), so the program counts against the job's limits from its first instruction. The
+kernel then enforces, over everything the job runs together:
+
+| File | Value |
+|---|---|
+| `memory.max` | the most the job can hold from the shared budget at once (its compile, or a full pool of runs with a checker beside them), never above `RUN_POOL_BUDGET_BYTES`, plus room for what its programs write to tmpfs |
+| `memory.oom.group` | `1`: an OOM kill ends every program of this job, and no other job's. The runner dies with them, so the engine reads the kill from `memory.events` and reports a memory limit exceeded for the runs that were going |
+| `pids.max` | `512`, for the compile, checker and runs together. The compiler and checker users are shared by all slots, so their `RLIMIT_NPROC` is raised out of reach and this is their bound |
+| `cpu.max` | `CGROUP_JOB_CPUS` CPUs. Never about one CPU or less: a single-threaded program that uses a whole CPU would be throttled every period and its measured CPU time cut by 7 to 10 % and made noisy (measured on `tle_wait.cpp`) |
+
+When the job ends, is cancelled or times out, `cgroup.kill` ends whatever is left in the cgroup (a `setsid` stray of a compiler or a
+checker included) and the cgroup is removed. Nothing ever ends or removes a cgroup that is not `job-<its own id>` under the root.
+
+**The host must delegate the subtree and carry the limits.** The jobs run in `CGROUP_ROOT`, not in the container's cgroup, so the container's
+own `mem_limit`, `cpus` and `pids_limit` no longer bound them: the delegated cgroup must set `memory.max`, `pids.max` and `cpu.max` itself
+(`MemoryMax`, `TasksMax`, `CPUQuota` on a systemd slice with `Delegate=`), and the server refuses a root that does not. Before it opens its
+port the server checks: the root is a cgroup v2 filesystem; `memory`, `pids` and `cpu` are delegated; the three limits are set; the
+controllers can be enabled for the root's children (no process sits in the root itself); no job cgroup has live processes (that is another
+server's: the server refuses the root and ends nothing; empty ones, a crash's leftovers, are removed); and a throw-away cgroup takes a process
+and every limit. `required` turns any failure into a refusal to start; `auto` logs it and runs without cgroups. One server per root.
+`judge-deployment` has the slices (`host/systemd/`) and the compose overlay (`docker-compose.cgroup.yml`); `CLONE_INTO_CGROUP` is not
+used because the container runtimes' default seccomp profile answers `clone3` with `ENOSYS`.
 
 ## Build and test
 
@@ -114,7 +144,11 @@ Everything runs in Docker: there is no Go toolchain on the development machine.
 --memory 1536m --cpus 2 -e JUDGE_REQUIRE_SANDBOX=1` on `judge-server:test` (the runtime image plus the test binaries, `strace`,
 `pgrep`), mounts `judge-deployment/sandbox/java.policy` at `/opt/oj/java.policy`, and runs `/tests/run-all.sh`, which runs
 `sandbox.test` (the shim and its seccomp filters, `internal/sandbox`) and `judge.test` (the engine, `internal/judge`, its unit
-tests too) with `-test.v`. With `JUDGE_REQUIRE_SANDBOX=1` a missing compiler, shim or policy file fails a test instead of skipping it, and
+tests too) with `-test.v`, `cgroup.test` (`internal/cgroup`, against a real delegated subtree), and `judge.test` a second time with every
+engine test under job cgroups (`JUDGE_ENGINE_CGROUPS=1`). The script makes the subtree the way the host does: a throw-away privileged container
+creates a cgroup at the top of the host's hierarchy with the limits of `host/systemd/*.slice`, the test container mounts it read-write at
+`/oj-cgroup` with the same six capabilities and nothing more, and the subtree is removed afterwards. `JUDGE_CGROUP=0` runs without it (the
+cgroup tests then skip, which `JUDGE_REQUIRE_SANDBOX=1` turns into failures). With `JUDGE_REQUIRE_SANDBOX=1` a missing compiler, shim or policy file fails a test instead of skipping it, and
 `run-all.sh` fails when any test skipped. `scripts/sandbox-test-dev.sh` is the older throwaway harness for `internal/sandbox`
 only (it builds a smaller image and can pick the base with `BASE=`); it is kept.
 

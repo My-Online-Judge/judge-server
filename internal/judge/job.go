@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/My-Online-Judge/judge-server/internal/bundle"
+	"github.com/My-Online-Judge/judge-server/internal/cgroup"
 	"github.com/My-Online-Judge/judge-server/internal/config"
 	"github.com/My-Online-Judge/judge-server/internal/sandbox"
 )
@@ -166,6 +167,10 @@ type Deps struct {
 	Cfg        config.Config
 	GoCache    *GoCache
 	Now        func() time.Time
+
+	// Cgroups gives every job a cgroup of its own for its programs (spec 14); nil runs
+	// them in the server's cgroup, limited by setrlimit and the container alone.
+	Cgroups *cgroup.Manager
 }
 
 // Engine judges requests. It is safe for concurrent use: jobs share the memory

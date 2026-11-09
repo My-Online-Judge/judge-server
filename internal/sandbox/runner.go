@@ -8,10 +8,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // Linux constants for waitid(2) that package syscall does not export.
@@ -81,12 +84,43 @@ func Run(ctx context.Context, runnerPath string, s Spec) (Result, error) {
 	// starts (see KillSlot). Setpgid must not be set as well: setpgid fails for a
 	// session leader.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	var gateR, gateW *os.File // the start barrier of a run in a cgroup: fd 4 in the shim
+	if s.Cgroup != nil {
+		if gateR, gateW, err = os.Pipe(); err != nil {
+			return Result{}, fmt.Errorf("sandbox: start pipe: %w", err)
+		}
+		defer gateW.Close()
+		cmd.ExtraFiles = append(cmd.ExtraFiles, gateR) // fd 4
+	}
 
 	start := time.Now()
 	pid, err := startLive(cmd)
 	_ = pw.Close() // the shim holds the only write end now
+	if gateR != nil {
+		_ = gateR.Close() // and the only read end of the barrier
+	}
 	if err != nil {
 		return Result{}, fmt.Errorf("sandbox: start %s: %w", runnerPath, err)
+	}
+	// Into the job's cgroup, and only then the go-ahead: the shim forks the program after it. A shim that cannot be
+	// moved is killed without a byte, so that nothing runs outside the limits the job was given.
+	if s.Cgroup != nil {
+		if err := attachCgroup(s.Cgroup, pid); err != nil {
+			_ = gateW.Close()
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = waitExited(pid)
+			endLive(pid)
+			_ = cmd.Wait()
+			return Result{}, fmt.Errorf("sandbox: put the runner into its cgroup: %w", err)
+		}
+		if _, err := gateW.Write([]byte{1}); err != nil {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = waitExited(pid)
+			endLive(pid)
+			_ = cmd.Wait()
+			return Result{}, fmt.Errorf("sandbox: release the runner: %w", err)
+		}
+		_ = gateW.Close()
 	}
 
 	// kill may fire from the backstop timer, from ctx, or both. It never signals once
@@ -172,4 +206,19 @@ func waitExited(pid int) error {
 			return e
 		}
 	}
+}
+
+// attachCgroup moves the process pid (and so all its threads) into the cgroup v2 directory dir, through
+// the directory descriptor: there is no path to race.
+func attachCgroup(dir *os.File, pid int) error {
+	fd, err := unix.Openat(int(dir.Fd()), "cgroup.procs", unix.O_WRONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open cgroup.procs: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "cgroup.procs")
+	defer f.Close()
+	if _, err := f.WriteString(strconv.Itoa(pid)); err != nil {
+		return fmt.Errorf("move %d: %w", pid, err)
+	}
+	return nil
 }
