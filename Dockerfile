@@ -13,7 +13,7 @@
 # produce the test image (strace, test binaries) by accident.
 ARG VERSION=dev
 
-FROM golang:1.23-bookworm AS builder-go
+FROM golang:1.24-bookworm AS builder-go
 WORKDIR /src
 ENV CGO_ENABLED=0 GOFLAGS=-buildvcs=false
 COPY go.mod go.sum ./

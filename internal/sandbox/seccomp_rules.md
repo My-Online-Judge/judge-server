@@ -224,7 +224,7 @@ in it, so the corpus waits (`testdata/corpus/cpp/rtle.cpp`) with a timed `futex`
 ## Reproducing
 
 `scripts/sandbox-test.sh` builds the image and runs everything the way the server runs (it is what Task 13 used).
-`scripts/sandbox-test-dev.sh` builds a throwaway image (Ubuntu 22.04, or `BASE=golang:1.23` for bookworm), compiles the
+`scripts/sandbox-test-dev.sh` builds a throwaway image (Ubuntu 22.04, or `BASE=golang:1.24` for bookworm), compiles the
 shim and runs the `sandbox`-tagged tests under the container's six capabilities. To see what a program calls:
 
 ```sh

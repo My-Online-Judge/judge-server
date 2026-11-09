@@ -6,11 +6,11 @@
 #
 #   scripts/sandbox-test-dev.sh                 # build image, compile shim, run the tests
 #   scripts/sandbox-test-dev.sh -run TestRunHelloC   # extra args go to `go test`
-#   BASE=golang:1.23 scripts/sandbox-test-dev.sh     # same on Debian bookworm (glibc 2.36)
+#   BASE=golang:1.24 scripts/sandbox-test-dev.sh     # same on Debian bookworm (glibc 2.36)
 #   PLATFORM=linux/amd64 scripts/sandbox-test-dev.sh # another architecture (see note below)
 #
 # BASE defaults to ubuntu:22.04 (glibc 2.35, what the runtime image uses). Go comes
-# from golang:1.23 either way. The container drops every capability except the six
+# from golang:1.24 either way. The container drops every capability except the six
 # the judge-server container has, sets no-new-privileges and mounts /work as an
 # exec tmpfs and runs under an init (--init, so the processes a sweep kills are reaped), like the real
 # deployment. The image has the users compiler, code and spj and the per-slot users code0..code7
@@ -32,7 +32,7 @@ if [ -n "$PLATFORM" ]; then platform_args=(--platform "$PLATFORM"); fi
 
 docker build -q ${platform_args[@]+"${platform_args[@]}"} -t "$IMAGE" --build-arg "BASE=$BASE" - <<'DOCKERFILE'
 ARG BASE=ubuntu:22.04
-FROM golang:1.23 AS go
+FROM golang:1.24 AS go
 FROM ${BASE}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

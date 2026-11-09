@@ -1,5 +1,5 @@
 # All Go tooling runs inside Docker: there is no local Go toolchain.
-GO_IMAGE  ?= golang:1.23
+GO_IMAGE  ?= golang:1.24
 BUF_IMAGE ?= bufbuild/buf:1.47.2
 GO_RUN     = docker run --rm -v "$(CURDIR)":/src -v judge-server-gomod:/go/pkg/mod -w /src -e GOFLAGS=-mod=mod -e GOCACHE=/tmp/gocache $(GO_IMAGE)
 VERSION   ?= dev

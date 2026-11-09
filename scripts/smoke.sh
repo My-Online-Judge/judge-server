@@ -27,7 +27,7 @@ CLIENT_CN=judge-worker
 # Pinned: the client the smoke test talks with must not move under it. The Go image only runs mktls;
 # the Makefile passes its GO_IMAGE so that both use one toolchain tag.
 GRPCURL=fullstorydev/grpcurl:v1.9.3
-GO_IMAGE="${GO_IMAGE:-golang:1.23}"
+GO_IMAGE="${GO_IMAGE:-golang:1.24}"
 
 [ -f "$PROTO_DIR/judge_server.proto" ] || { echo "judge_server.proto not found in $PROTO_DIR (set PROTO_DIR)" >&2; exit 2; }
 

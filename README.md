@@ -101,7 +101,7 @@ Everything runs in Docker: there is no Go toolchain on the development machine.
 
 | Command | What it does |
 |---|---|
-| `make test` | `go test ./...` in a `golang:1.23` container: the unit tests (fake runner; nothing needs root) |
+| `make test` | `go test ./...` in a `golang:1.24` container: the unit tests (fake runner; nothing needs root) |
 | `make vet` | `go vet ./...` |
 | `make image` | the image that ships (`--target runtime`), tagged `judge-server:$(VERSION)` (default `dev`) |
 | `make sandbox-test` | `scripts/sandbox-test.sh`: builds the test image and runs every `sandbox`-tagged test in it, with the server's privileges |
@@ -198,7 +198,7 @@ request cancels the run in flight; a push to `main` never does.
 
 | Job | Runs | What it proves |
 |---|---|---|
-| `unit` | `gofmt -l cmd internal`, `go vet ./...` and `go test ./...` in `golang:1.23` | the code is formatted and vets clean; the unit tests pass (fake runner, nothing needs root) |
+| `unit` | `gofmt -l cmd internal`, `go vet ./...` and `go test ./...` in `golang:1.24` | the code is formatted and vets clean; the unit tests pass (fake runner, nothing needs root) |
 | `sandbox` | `scripts/sandbox-test.sh` on an `ubuntu-latest` (x86_64) runner | every `sandbox`-tagged test (shim, engine, corpus) passes in the test image with the production privileges and no skip. This is the first x86_64 run of the seccomp filters: they were only ever run on arm64 before |
 | `smoke` | `scripts/smoke.sh` | the runtime image starts the way compose starts it, over mutual TLS, and answers Ping, a C++ and a Java `Judge`, the healthcheck, and ends with exit status 0 on `docker stop` |
 | `image` | needs the three jobs above: builds `--target release`, checks the entrypoint and that every toolchain and `judge-runner` exist, scans with Trivy (a CRITICAL vulnerability with a fix fails the build), then publishes | the image that ships is the one that was built, checked and scanned |
