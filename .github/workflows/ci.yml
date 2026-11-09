@@ -8,8 +8,9 @@ on:
 permissions:
   contents: read
 
-# A newer push to a pull request supersedes the run in flight; a push to main is never cancelled, so every
-# commit on main is built and published.
+# A newer push to a pull request supersedes the run in flight. A push to main never cancels a run in flight, but a run
+# still queued behind it is replaced by the newer push: a commit merged while another main build is queued may get no CI
+# run and no :<sha> tag (:main still converges on the newest).
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -21,6 +22,7 @@ jobs:
   # Unit tests of the packages: the fake runner, nothing needs root or the toolchains.
   unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     container: golang:1.24
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

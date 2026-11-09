@@ -194,14 +194,16 @@ job of the CI below (an x86_64 GitHub runner), or `scripts/sandbox-test.sh` on t
 ## CI
 
 `.github/workflows/ci.yml` (GitHub Actions) runs on every pull request and on every push to `main`. A newer push to a pull
-request cancels the run in flight; a push to `main` never does.
+request cancels the run in flight. A push to `main` never cancels a run in flight, but a run still queued behind it is
+replaced by the newer push: a commit merged while another `main` build is queued may get no CI run and no `:<sha>` tag
+(`:main` still converges on the newest).
 
 | Job | Runs | What it proves |
 |---|---|---|
 | `unit` | `gofmt -l cmd internal`, `go vet ./...` and `go test ./...` in `golang:1.24` | the code is formatted and vets clean; the unit tests pass (fake runner, nothing needs root) |
 | `sandbox` | `scripts/sandbox-test.sh` on an `ubuntu-latest` (x86_64) runner | every `sandbox`-tagged test (shim, engine, corpus) passes in the test image with the production privileges and no skip. This is the first x86_64 run of the seccomp filters: they were only ever run on arm64 before |
 | `smoke` | `scripts/smoke.sh` | the runtime image starts the way compose starts it, over mutual TLS, and answers Ping, a C++ and a Java `Judge`, the healthcheck, and ends with exit status 0 on `docker stop` |
-| `image` | needs the three jobs above: builds `--target release`, checks the entrypoint and that every toolchain and `judge-runner` exist, scans with Trivy (a CRITICAL vulnerability with a fix fails the build), then publishes | the image that ships is the one that was built, checked and scanned |
+| `image` | needs the three jobs above: builds `--target release`, checks the entrypoint and that every toolchain and `judge-runner` exist, scans with Trivy (a CRITICAL vulnerability with a fix fails the build), then publishes | the amd64 image built from this commit is tested and scanned; the pushed multi-arch image is rebuilt from the same commit (the arm64 half is neither run nor scanned in CI) |
 
 Two fixtures are copies of files that live in other repositories, because CI checks out this repository alone. A copy is
 updated in the same change as its source:
@@ -218,8 +220,8 @@ Publishing happens only on a push to `main`, after the four jobs pass. It needs 
 and `DOCKERHUB_TOKEN` (used by the login step only). It pushes `docker.io/thanhtuanle/judge-server:<commit sha>` and
 `docker.io/thanhtuanle/judge-server:main`, both multi-arch (`linux/amd64` and `linux/arm64`). Both builds pass
 `--build-arg VERSION=<commit sha>`, so `Ping` reports the commit as `judger_version`. The `image` job is bounded at 90 minutes
-(the arm64 half runs under QEMU). A pull request builds, checks and scans the image and pushes nothing. `:main` is the image the compose file pulls (`OJ_SANDBOX_TAG`, default `main`) and the
-k3s manifests pull.
+(the arm64 half runs under QEMU) and the `unit` job at 15. A pull request builds, checks and scans the image and pushes
+nothing. `:main` is the image the compose file pulls (`OJ_SANDBOX_TAG`, default `main`) and the k3s manifests pull.
 
 ## Legacy files
 
