@@ -44,11 +44,11 @@ func TestEventValue(t *testing.T) {
 func TestSetupModesOnAHostWithoutCgroups(t *testing.T) {
 	root := t.TempDir()
 
-	if m, err := Setup(Off, root, 1); m != nil || err != nil {
+	if m, err := Setup(Off, root, Options{JobCPUs: 1}); m != nil || err != nil {
 		t.Errorf("Setup(Off) = %v, %v; want nil, nil", m, err)
 	}
 
-	m, err := Setup(Required, root, 1)
+	m, err := Setup(Required, root, Options{JobCPUs: 1})
 	if m != nil || err == nil {
 		t.Fatalf("Setup(Required) = %v, %v; want an error", m, err)
 	}
@@ -62,7 +62,7 @@ func TestSetupModesOnAHostWithoutCgroups(t *testing.T) {
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	defer slog.SetDefault(prev)
-	m, err = Setup(Auto, root, 1)
+	m, err = Setup(Auto, root, Options{JobCPUs: 1})
 	if m != nil || err != nil {
 		t.Fatalf("Setup(Auto) = %v, %v; want nil, nil", m, err)
 	}
@@ -73,10 +73,10 @@ func TestSetupModesOnAHostWithoutCgroups(t *testing.T) {
 }
 
 func TestOpenRefusesWhatItCannotUse(t *testing.T) {
-	if _, err := Open(filepath.Join(t.TempDir(), "missing"), 1); err == nil {
+	if _, err := Open(filepath.Join(t.TempDir(), "missing"), Options{JobCPUs: 1}); err == nil {
 		t.Error("Open of a directory that does not exist succeeded")
 	}
-	if _, err := Open(t.TempDir(), -1); err == nil {
+	if _, err := Open(t.TempDir(), Options{JobCPUs: -1}); err == nil {
 		t.Error("Open accepted a negative cpus")
 	}
 }
@@ -179,5 +179,48 @@ func TestCheckRootLimits(t *testing.T) {
 		if err := (&Manager{root: dir}).checkRootLimits(); err == nil || !strings.Contains(err.Error(), file) {
 			t.Errorf("no %s: err %v; want a refusal naming the file", file, err)
 		}
+	}
+}
+
+// A root nobody set limits on (a directory a kubelet made under a slice) gets the sandbox's own: applyRootLimits writes
+// the options that are above 0, as the text the kernel wants, and leaves the others as the host set them.
+func TestApplyRootLimits(t *testing.T) {
+	dir := t.TempDir()
+	read := func(f string) string {
+		b, err := os.ReadFile(filepath.Join(dir, f))
+		if err != nil {
+			return "<none>"
+		}
+		return string(b)
+	}
+	m := &Manager{root: dir}
+	if err := m.applyRootLimits(Options{RootMemoryMax: 1536 << 20, RootPidsMax: 1024, RootCPUMillis: 2000}); err != nil {
+		t.Fatal(err)
+	}
+	for f, want := range map[string]string{"memory.max": "1610612736", "pids.max": "1024", "cpu.max": "200000 100000"} {
+		if got := read(f); got != want {
+			t.Errorf("%s = %q, want %q", f, got, want)
+		}
+	}
+	// 1500 millis is 1.5 CPUs; an option left at 0 is not written.
+	dir2 := t.TempDir()
+	if err := (&Manager{root: dir2}).applyRootLimits(Options{RootCPUMillis: 1500}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir2, "cpu.max")); string(b) != "150000 100000" {
+		t.Errorf("cpu.max = %q, want 150000 100000", b)
+	}
+	for _, f := range []string{"memory.max", "pids.max"} {
+		if _, err := os.Stat(filepath.Join(dir2, f)); err == nil {
+			t.Errorf("%s was written although its option is 0", f)
+		}
+	}
+	// Nothing set: nothing written, and no error.
+	if err := (&Manager{root: t.TempDir()}).applyRootLimits(Options{}); err != nil {
+		t.Errorf("no options: %v", err)
+	}
+	// A write that fails names the file and the root.
+	if err := (&Manager{root: filepath.Join(dir, "missing")}).applyRootLimits(Options{RootPidsMax: 8}); err == nil || !strings.Contains(err.Error(), "pids.max") {
+		t.Errorf("a failing write = %v; want an error naming pids.max", err)
 	}
 }

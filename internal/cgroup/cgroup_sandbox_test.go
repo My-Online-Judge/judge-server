@@ -52,7 +52,7 @@ func manager(t *testing.T) *Manager {
 	t.Helper()
 	r := root(t)
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	sharedOnce.Do(func() { sharedMgr, sharedErr = Open(r, 1) })
+	sharedOnce.Do(func() { sharedMgr, sharedErr = Open(r, Options{JobCPUs: 1}) })
 	if sharedErr != nil {
 		t.Fatalf("Open(%s): %v", r, sharedErr)
 	}
@@ -303,13 +303,13 @@ func TestRealARootWithoutLimitsIsRefused(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(r, missing), []byte("max"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Open(r, 1); err == nil || !strings.Contains(err.Error(), missing) {
+		if _, err := Open(r, Options{JobCPUs: 1}); err == nil || !strings.Contains(err.Error(), missing) {
 			t.Errorf("Open with %s unset = %v; want a refusal naming it", missing, err)
 		}
-		if m, err := Setup(Required, r, 1); m != nil || err == nil || !strings.Contains(err.Error(), "CGROUP_MODE=required") {
+		if m, err := Setup(Required, r, Options{JobCPUs: 1}); m != nil || err == nil || !strings.Contains(err.Error(), "CGROUP_MODE=required") {
 			t.Errorf("Setup(Required) with %s unset = %v, %v; want an error", missing, m, err)
 		}
-		if m, err := Setup(Auto, r, 1); m != nil || err != nil {
+		if m, err := Setup(Auto, r, Options{JobCPUs: 1}); m != nil || err != nil {
 			t.Errorf("Setup(Auto) with %s unset = %v, %v; want it to fall back (nil, nil)", missing, m, err)
 		}
 	}
@@ -323,7 +323,7 @@ func TestRealARootWithoutLimitsIsRefused(t *testing.T) {
 // so, and ends nothing; once the processes are gone, the same Open clears the empty cgroup.
 func TestRealALiveJobCgroupAtStartIsAnotherServersAndIsNotEnded(t *testing.T) {
 	r := subRoot(t, "shared-root", true)
-	other, err := Open(r, 1) // "the other server"
+	other, err := Open(r, Options{JobCPUs: 1}) // "the other server"
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +336,7 @@ func TestRealALiveJobCgroupAtStartIsAnotherServersAndIsNotEnded(t *testing.T) {
 	old := staleWait
 	staleWait = 300 * time.Millisecond
 	defer func() { staleWait = old }()
-	_, err = Open(r, 1) // "this server", same root
+	_, err = Open(r, Options{JobCPUs: 1}) // "this server", same root
 	if err == nil || !strings.Contains(err.Error(), "another judge-server") || !strings.Contains(err.Error(), "job-theirs") {
 		t.Fatalf("Open of a root with a live job cgroup = %v; want a refusal naming the cgroup and another server", err)
 	}
@@ -350,7 +350,7 @@ func TestRealALiveJobCgroupAtStartIsAnotherServersAndIsNotEnded(t *testing.T) {
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
 	waitUntil(t, "the other server's process to be gone", 3*time.Second, func() bool { return !populated(j.Path()) })
-	if _, err := Open(r, 1); err != nil {
+	if _, err := Open(r, Options{JobCPUs: 1}); err != nil {
 		t.Fatalf("Open after the processes were gone: %v", err)
 	}
 	if _, err := os.Stat(j.Path()); !errors.Is(err, os.ErrNotExist) {
@@ -362,7 +362,7 @@ func TestRealALiveJobCgroupAtStartIsAnotherServersAndIsNotEnded(t *testing.T) {
 // still alive) and clears them, and only them: a directory that is not a job's stays.
 func TestRealStaleEmptyJobCgroupsAreClearedOnOpen(t *testing.T) {
 	r := subRoot(t, "restart-root", true)
-	first, err := Open(r, 1)
+	first, err := Open(r, Options{JobCPUs: 1})
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestRealStaleEmptyJobCgroupsAreClearedOnOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open(r, 1); err != nil { // the restart
+	if _, err := Open(r, Options{JobCPUs: 1}); err != nil { // the restart
 		t.Fatalf("Open after the crash: %v", err)
 	}
 	entries, _ := os.ReadDir(r)
@@ -400,7 +400,7 @@ func TestRealStaleEmptyJobCgroupsAreClearedOnOpen(t *testing.T) {
 func TestRealSetupAutoAndRequiredGiveAManager(t *testing.T) {
 	m := manager(t)
 	for _, mode := range []Mode{Auto, Required} {
-		got, err := Setup(mode, m.Root(), 1)
+		got, err := Setup(mode, m.Root(), Options{JobCPUs: 1})
 		if err != nil || got == nil {
 			t.Errorf("Setup(%s) = %v, %v; want a manager", mode, got, err)
 		}
@@ -423,4 +423,31 @@ func killTree(dir string) error {
 		}
 	}
 	return first
+}
+
+// A root with no limits of its own, as a kubelet creates under a slice, is usable once the sandbox declares its own budget: Open
+// writes memory.max, pids.max and cpu.max to the root from the options (a pod's resource limits), and jobs then run.
+func TestRealRootLimitsFromTheOptions(t *testing.T) {
+	r := subRoot(t, "declared-limits", false)
+	if _, err := Open(r, Options{JobCPUs: 1.5}); err == nil {
+		t.Fatal("Open of a root with no limits and no declared budget succeeded")
+	}
+	m, err := Open(r, Options{JobCPUs: 1.5, RootMemoryMax: 1536 << 20, RootPidsMax: 1024, RootCPUMillis: 2000})
+	if err != nil {
+		t.Fatalf("Open with a declared budget: %v", err)
+	}
+	for file, want := range map[string]string{"memory.max": "1610612736", "pids.max": "1024", "cpu.max": "200000 100000"} {
+		if got := readFile(t, filepath.Join(r, file)); got != want {
+			t.Errorf("%s = %q, want %q", file, got, want)
+		}
+	}
+	j, err := m.NewJob("declared", roomy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	startIn(t, j, "/bin/sleep", "30")
+	if got := procsOf(t, j.Path()); len(got) != 1 {
+		t.Errorf("processes of the job = %v, want one", got)
+	}
 }

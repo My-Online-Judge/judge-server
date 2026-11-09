@@ -66,6 +66,17 @@ type Limits struct {
 	PidsMax   int64 // pids.max, the processes and threads of the job together; > 0
 }
 
+// Options configures Setup and Open.
+type Options struct {
+	// JobCPUs is cpu.max of every job's cgroup in CPUs; 0 sets none.
+	JobCPUs float64
+	// RootMemoryMax, RootPidsMax and RootCPUMillis, when above 0, are written to the delegated root's own memory.max,
+	// pids.max and cpu.max (millis of a CPU) at start: for a root nobody set the limits on (a directory a pod's kubelet
+	// created under a slice), the sandbox declares its own budget there, from its pod's resource limits. 0 leaves
+	// what the host set; either way the three must end up set, or Open refuses the root.
+	RootMemoryMax, RootPidsMax, RootCPUMillis int64
+}
+
 // Manager creates and removes job cgroups under one delegated root.
 type Manager struct {
 	root string
@@ -76,11 +87,11 @@ type Manager struct {
 // after logging the reason when the subtree cannot be used. Required returns the
 // reason as an error. With a manager, the root is checked, prepared and free of the
 // job cgroups of an earlier run.
-func Setup(mode Mode, root string, cpus float64) (*Manager, error) {
+func Setup(mode Mode, root string, o Options) (*Manager, error) {
 	if mode == Off {
 		return nil, nil
 	}
-	m, err := Open(root, cpus)
+	m, err := Open(root, o)
 	if err == nil {
 		return m, nil
 	}
@@ -94,11 +105,11 @@ func Setup(mode Mode, root string, cpus float64) (*Manager, error) {
 
 // Open checks the delegated subtree at root and prepares it (see the package
 // comment). Every failure names the step that failed.
-func Open(root string, cpus float64) (*Manager, error) {
-	if cpus < 0 {
-		return nil, errors.New("cpus must be >= 0")
+func Open(root string, o Options) (*Manager, error) {
+	if o.JobCPUs < 0 || o.RootMemoryMax < 0 || o.RootPidsMax < 0 || o.RootCPUMillis < 0 {
+		return nil, errors.New("the options must not be negative")
 	}
-	m := &Manager{root: filepath.Clean(root), cpus: cpus}
+	m := &Manager{root: filepath.Clean(root), cpus: o.JobCPUs}
 
 	var st unix.Statfs_t
 	if err := unix.Statfs(m.root, &st); err != nil {
@@ -118,6 +129,9 @@ func Open(root string, cpus float64) (*Manager, error) {
 	}
 
 	// The programs of a job leave the container's cgroup, and its limits with it: the root must have its own.
+	if err := m.applyRootLimits(o); err != nil {
+		return nil, err
+	}
 	if err := m.checkRootLimits(); err != nil {
 		return nil, err
 	}
@@ -135,6 +149,27 @@ func Open(root string, cpus float64) (*Manager, error) {
 		return nil, fmt.Errorf("probe: %w", err)
 	}
 	return m, nil
+}
+
+// applyRootLimits writes the limits the options declare to the root's own files.
+func (m *Manager) applyRootLimits(o Options) error {
+	for _, l := range []struct {
+		file  string
+		value string
+		set   bool
+	}{
+		{"memory.max", strconv.FormatInt(o.RootMemoryMax, 10), o.RootMemoryMax > 0},
+		{"pids.max", strconv.FormatInt(o.RootPidsMax, 10), o.RootPidsMax > 0},
+		{"cpu.max", fmt.Sprintf("%d %d", o.RootCPUMillis*cpuPeriodUs/1000, cpuPeriodUs), o.RootCPUMillis > 0},
+	} {
+		if !l.set {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(m.root, l.file), []byte(l.value), 0o644); err != nil {
+			return fmt.Errorf("set %s of the delegated root %s: %w", l.file, m.root, err)
+		}
+	}
+	return nil
 }
 
 // checkRootLimits requires memory.max, pids.max and cpu.max on the root. The jobs run here and not in the

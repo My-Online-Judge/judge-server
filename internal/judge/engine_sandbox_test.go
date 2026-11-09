@@ -331,7 +331,7 @@ func buildEnv() (env *sandboxEnv, skip, fail string) {
 		}
 	}
 	if root := os.Getenv("JUDGE_CGROUP_ROOT"); root != "" {
-		if cg, err = cgroup.Open(root, cfg.CgroupJobCPUs); err != nil {
+		if cg, err = cgroup.Open(root, cgroup.Options{JobCPUs: cfg.CgroupJobCPUs}); err != nil {
 			return nil, "", "cgroup.Open(" + root + "): " + err.Error()
 		}
 		if os.Getenv("JUDGE_ENGINE_CGROUPS") == "1" {

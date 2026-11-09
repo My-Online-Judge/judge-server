@@ -80,6 +80,15 @@ func Validate(c Config) error {
 			"program that uses a whole CPU and distorts its measured CPU time", MinCgroupJobCPUs, c.CgroupJobCPUs))
 	}
 
+	for _, l := range []struct {
+		env string
+		v   int64
+	}{{"CGROUP_ROOT_MEMORY_MAX_BYTES", c.CgroupRootMemoryMax}, {"CGROUP_ROOT_PIDS_MAX", c.CgroupRootPidsMax}, {"CGROUP_ROOT_CPU_MILLIS", c.CgroupRootCPUMillis}} {
+		if l.v < 0 {
+			errs = append(errs, fmt.Errorf("%s must not be negative (0 leaves the host's limit), got %d", l.env, l.v))
+		}
+	}
+
 	if len(c.AllowedClients) == 0 {
 		errs = append(errs, errors.New("JUDGE_ALLOWED_CLIENTS must name at least one client CN"))
 	}

@@ -56,6 +56,12 @@ type Config struct {
 	CgroupRoot    string
 	CgroupJobCPUs float64
 
+	// CgroupRootMemoryMax, CgroupRootPidsMax and CgroupRootCPUMillis (CGROUP_ROOT_MEMORY_MAX_BYTES, CGROUP_ROOT_PIDS_MAX,
+	// CGROUP_ROOT_CPU_MILLIS) are the limits the server writes on the delegated root itself at start; 0 leaves what the host
+	// set (a systemd slice with MemoryMax, TasksMax, CPUQuota). Needed where nobody sets them, as in a pod, whose limits
+	// they mirror.
+	CgroupRootMemoryMax, CgroupRootPidsMax, CgroupRootCPUMillis int64
+
 	LogFormat string
 }
 
@@ -79,7 +85,7 @@ func Load(getenv func(string) string) (Config, error) {
 		WorkDir:        str("WORK_DIR", "/work"),
 		TmpDir:         str("TMP_DIR", "/tmp"),
 		LogFormat:      str("LOG_FORMAT", "json"),
-		CgroupMode:     str("CGROUP_MODE", "off"),
+		CgroupMode:     str("CGROUP_MODE", "auto"),
 		CgroupRoot:     str("CGROUP_ROOT", "/oj-cgroup"),
 
 		HealthcheckServerName: getenv("HEALTHCHECK_SERVER_NAME"),
@@ -98,6 +104,9 @@ func Load(getenv func(string) string) (Config, error) {
 		{"OUTPUT_RESPONSE_CAP_BYTES", 65536, &cfg.OutputResponseCap},
 		{"COMPILE_MESSAGE_CAP_BYTES", 65536, &cfg.CompileMessageCap},
 		{"INLINE_INPUT_CAP_BYTES", 1048576, &cfg.InlineInputCap},
+		{"CGROUP_ROOT_MEMORY_MAX_BYTES", 0, &cfg.CgroupRootMemoryMax},
+		{"CGROUP_ROOT_PIDS_MAX", 0, &cfg.CgroupRootPidsMax},
+		{"CGROUP_ROOT_CPU_MILLIS", 0, &cfg.CgroupRootCPUMillis},
 	}
 	for _, f := range ints {
 		if *f.dst, err = parseInt(getenv, f.name, f.def); err != nil {

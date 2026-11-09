@@ -18,8 +18,14 @@ type Manager struct{}
 // Job is not available off Linux.
 type Job struct{}
 
+// Options configures Setup and Open.
+type Options struct {
+	JobCPUs                                   float64
+	RootMemoryMax, RootPidsMax, RootCPUMillis int64
+}
+
 // Setup returns (nil, nil) for Off and an error for any other mode.
-func Setup(mode Mode, root string, cpus float64) (*Manager, error) {
+func Setup(mode Mode, root string, o Options) (*Manager, error) {
 	if mode == Off {
 		return nil, nil
 	}
@@ -27,7 +33,7 @@ func Setup(mode Mode, root string, cpus float64) (*Manager, error) {
 }
 
 // Open always fails off Linux.
-func Open(root string, cpus float64) (*Manager, error) { return nil, errUnsupported }
+func Open(root string, o Options) (*Manager, error) { return nil, errUnsupported }
 
 // Root is empty off Linux.
 func (m *Manager) Root() string { return "" }

@@ -73,7 +73,9 @@ func Serve(ctx context.Context, cfg config.Config, version string) error {
 	if err != nil {
 		return err
 	}
-	cgroups, err := cgroup.Setup(cgMode, cfg.CgroupRoot, cfg.CgroupJobCPUs)
+	cgroups, err := cgroup.Setup(cgMode, cfg.CgroupRoot, cgroup.Options{
+		JobCPUs: cfg.CgroupJobCPUs, RootMemoryMax: cfg.CgroupRootMemoryMax, RootPidsMax: cfg.CgroupRootPidsMax, RootCPUMillis: cfg.CgroupRootCPUMillis,
+	})
 	if err != nil {
 		return err
 	}

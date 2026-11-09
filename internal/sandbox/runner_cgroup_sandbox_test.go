@@ -38,7 +38,7 @@ func cgroupManager(t *testing.T) *cgroup.Manager {
 		t.Skip("JUDGE_CGROUP_ROOT is not set: no delegated cgroup subtree")
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	cgOnce.Do(func() { cgMgr, cgErr = cgroup.Open(root, 1) })
+	cgOnce.Do(func() { cgMgr, cgErr = cgroup.Open(root, cgroup.Options{JobCPUs: 1}) })
 	if cgErr != nil {
 		t.Fatalf("cgroup.Open(%s): %v", root, cgErr)
 	}

@@ -92,8 +92,9 @@ the three TLS files, or with an empty client list; it never listens in plaintext
 | `OUTPUT_RESPONSE_CAP_BYTES` | `65536` (64 KiB) | output per case returned when the request asks for it |
 | `COMPILE_MESSAGE_CAP_BYTES` | `65536` (64 KiB) | compiler output returned in a compile error |
 | `INLINE_INPUT_CAP_BYTES` | `1048576` (1 MiB) | total input of a Run's inline cases |
-| `CGROUP_MODE` | `off` | job cgroups (spec 14): `off`; `auto` uses them when the host delegated a usable cgroup v2 subtree and otherwise runs as `off` with one WARN line that says why; `required` refuses to start without them and never falls back |
+| `CGROUP_MODE` | `auto` | job cgroups (spec 14): `auto` uses them when the host delegated a usable cgroup v2 subtree and otherwise runs without, with one WARN line that says why; `required` refuses to start without them and never falls back (for hosts where the delegation is confirmed); `off` ignores them |
 | `CGROUP_ROOT` | `/oj-cgroup` | the delegated cgroup v2 subtree, mounted read-write (see Job cgroups); absolute |
+| `CGROUP_ROOT_MEMORY_MAX_BYTES`, `CGROUP_ROOT_PIDS_MAX`, `CGROUP_ROOT_CPU_MILLIS` | `0` | limits the server writes on the delegated root itself at start (0 leaves what the host set): for a root nobody set limits on, as a pod's directory under a slice, where they mirror the pod's resource limits |
 | `CGROUP_JOB_CPUS` | `1.5` | `cpu.max` of a job's cgroup, in CPUs; `0` sets none; below `1.25` is refused (see Job cgroups) |
 | `LOG_FORMAT` | `json` | `json` or text (any other value) |
 
@@ -116,14 +117,14 @@ kernel then enforces, over everything the job runs together:
 When the job ends, is cancelled or times out, `cgroup.kill` ends whatever is left in the cgroup (a `setsid` stray of a compiler or a
 checker included) and the cgroup is removed. Nothing ever ends or removes a cgroup that is not `job-<its own id>` under the root.
 
-**The host must delegate the subtree and carry the limits.** The jobs run in `CGROUP_ROOT`, not in the container's cgroup, so the container's
+**The host must delegate the subtree, and the root must carry the limits.** The jobs run in `CGROUP_ROOT`, not in the container's cgroup, so the container's
 own `mem_limit`, `cpus` and `pids_limit` no longer bound them: the delegated cgroup must set `memory.max`, `pids.max` and `cpu.max` itself
-(`MemoryMax`, `TasksMax`, `CPUQuota` on a systemd slice with `Delegate=`), and the server refuses a root that does not. Before it opens its
+(`MemoryMax`, `TasksMax`, `CPUQuota` on a systemd slice with `Delegate=`; or, for a directory a kubelet made, the `CGROUP_ROOT_*` variables), and the server refuses a root that does not. Before it opens its
 port the server checks: the root is a cgroup v2 filesystem; `memory`, `pids` and `cpu` are delegated; the three limits are set; the
 controllers can be enabled for the root's children (no process sits in the root itself); no job cgroup has live processes (that is another
 server's: the server refuses the root and ends nothing; empty ones, a crash's leftovers, are removed); and a throw-away cgroup takes a process
 and every limit. `required` turns any failure into a refusal to start; `auto` logs it and runs without cgroups. One server per root.
-`judge-deployment` has the slices (`host/systemd/`) and the compose overlay (`docker-compose.cgroup.yml`); `CLONE_INTO_CGROUP` is not
+`judge-deployment` has the slices (`host/systemd/`, `k3s/host/`), the compose overlay (`docker-compose.cgroup.yml`) and the K3s component (`k3s/components/cgroup`); `CLONE_INTO_CGROUP` is not
 used because the container runtimes' default seccomp profile answers `clone3` with `ENOSYS`.
 
 ## Build and test
